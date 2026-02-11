@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(pip --version:*)",
+      "Bash(conda --version:*)",
+      "Bash(nvidia-smi:*)",
+      "mcp__sequential-thinking__sequentialthinking",
+      "Bash(for dir in /c/src/Qunat_trading/{data,models,models/autoencoder,models/transformer,models/gan,models/rl,indicators,strategy,backtest,pipeline,utils,tests})",
+      "Bash(do touch \"$dir/__init__.py\")",
+      "Bash(done)",
+      "Bash(find:*)",
+      "Bash(git init:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nInitial implementation: Alpha Signal Discovery Engine\n\nComplete quant trading system with VAE, Transformer, GAN, PPO RL\nfor discovering novel market indicators from KOSPI/NASDAQ data.\n\n47 files, 5,610 lines Python + 267 lines YAML config.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\nEOF\n\\)\")"
+    ]
+  }
+}

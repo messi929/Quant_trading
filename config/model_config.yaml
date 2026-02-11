@@ -1,0 +1,96 @@
+# Model-specific hyperparameters
+
+vae:
+  # Encoder
+  input_dim: null  # Set dynamically based on features
+  hidden_dims: [256, 128, 64]
+  latent_dim: 32  # Number of "discovered indicators"
+  # Training
+  learning_rate: 1.0e-4
+  batch_size: 32
+  epochs: 100
+  kl_weight: 0.001  # KL divergence weight (beta-VAE)
+  kl_annealing: true
+  kl_annealing_epochs: 20
+  reconstruction_loss: "mse"
+  dropout: 0.2
+  activation: "leaky_relu"
+  # Regularization
+  l2_weight: 1.0e-5
+
+transformer:
+  # Architecture
+  d_model: 128
+  n_heads: 8
+  n_encoder_layers: 4
+  d_ff: 512
+  dropout: 0.1
+  max_seq_length: 60
+  # Input
+  input_dim: null  # Set from VAE latent_dim + features
+  # Output
+  output_dim: 1  # Future return prediction
+  prediction_horizon: 5  # 5-day ahead prediction
+  # Training
+  learning_rate: 5.0e-5
+  batch_size: 32
+  epochs: 80
+  warmup_steps: 1000
+  # Sector attention
+  use_sector_attention: true
+  n_sectors: 11
+  sector_embed_dim: 32
+
+gan:
+  # Generator
+  generator_hidden_dims: [128, 256, 128]
+  noise_dim: 64
+  condition_dim: 4  # Number of market regimes
+  # Discriminator
+  discriminator_hidden_dims: [128, 256, 128]
+  # Training (WGAN-GP)
+  learning_rate_g: 1.0e-4
+  learning_rate_d: 1.0e-4
+  batch_size: 64
+  epochs: 200
+  n_critic: 5  # Discriminator updates per generator update
+  gradient_penalty_weight: 10.0
+  # Output
+  output_dim: null  # Same as VAE input_dim
+  sequence_length: 60
+
+rl:
+  # PPO
+  learning_rate: 3.0e-4
+  gamma: 0.99  # Discount factor
+  gae_lambda: 0.95  # GAE lambda
+  clip_epsilon: 0.2  # PPO clip range
+  value_coef: 0.5
+  entropy_coef: 0.01
+  max_grad_norm: 0.5
+  # Network
+  hidden_dims: [256, 128]
+  # Training
+  n_steps: 2048  # Steps per update
+  n_epochs: 10  # PPO epochs per update
+  batch_size: 64
+  total_timesteps: 1_000_000
+  # Environment
+  n_sectors: 11
+  max_position: 1.0  # Max position per sector (-1 to 1)
+  transaction_cost: 0.002
+  # Reward
+  reward_type: "sharpe"  # sharpe, sortino, returns
+  risk_penalty: 0.1
+  drawdown_penalty: 0.5
+
+ensemble:
+  # Model weights for signal combination
+  vae_weight: 0.25
+  transformer_weight: 0.35
+  gan_weight: 0.15
+  rl_weight: 0.25
+  # Combination method
+  method: "attention"  # attention, weighted_avg, stacking
+  # Retraining
+  retrain_frequency: "monthly"

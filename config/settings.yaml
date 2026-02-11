@@ -1,0 +1,59 @@
+# Global settings for Quant Trading System
+project:
+  name: "Alpha Signal Discovery Engine"
+  version: "1.0.0"
+  root_dir: "C:/src/Qunat_trading"
+
+paths:
+  raw_data: "data/raw"
+  processed_data: "data/processed"
+  models: "saved_models"
+  logs: "logs"
+  results: "results"
+  indicators: "saved_indicators"
+
+gpu:
+  device: "cuda"
+  mixed_precision: true
+  gradient_checkpointing: true
+  memory_fraction: 0.9
+  compile_model: true  # torch.compile for PyTorch 2.x
+
+training:
+  default_epochs: 100
+  early_stopping_patience: 15
+  gradient_accumulation_steps: 8
+  physical_batch_size: 32
+  effective_batch_size: 256  # physical * accumulation
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  scheduler: "cosine_warmup"
+  warmup_ratio: 0.1
+  seed: 42
+  num_workers: 4
+  pin_memory: true
+
+data:
+  markets:
+    - "KOSPI"
+    - "NASDAQ"
+  history_years: 20
+  min_history_days: 500  # Minimum trading days for a stock
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  chunk_size: 10000  # For memory-mapped processing
+  sequence_length: 60  # 60 trading days lookback
+
+backtest:
+  initial_capital: 100_000_000  # 1억원
+  commission_rate: 0.00015  # 0.015% (한국 수수료)
+  slippage_rate: 0.001  # 0.1%
+  max_position_pct: 0.1  # 섹터당 최대 10%
+  rebalance_frequency: "weekly"
+
+logging:
+  level: "INFO"
+  console: true
+  file: true
+  tensorboard: true
