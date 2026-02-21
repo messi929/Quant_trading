@@ -55,21 +55,38 @@ class RiskManager:
         self.peak_value = max(self.peak_value, portfolio_value)
         current_dd = (self.peak_value - portfolio_value) / self.peak_value
 
-        # Check drawdown limit
-        if current_dd > self.max_drawdown:
-            scale = 0.5  # Cut positions in half
-            weights = weights * scale
-            report["adjustments"].append(
-                f"Drawdown limit ({current_dd:.1%} > {self.max_drawdown:.1%}): "
-                f"positions scaled to {scale:.0%}"
-            )
+        # Multi-tier circuit breaker
+        if current_dd > 0.30:
+            scale = 0.0   # Full liquidation - crisis
+            report["risk_level"] = "crisis"
+            self.is_risk_off = True
+        elif current_dd > 0.20:
+            scale = 0.25  # 75% reduction - high risk
             report["risk_level"] = "high"
             self.is_risk_off = True
+        elif current_dd > 0.10:
+            scale = 0.50  # 50% reduction - warning
+            report["risk_level"] = "warning"
+            self.is_risk_off = True
+        elif current_dd > 0.05:
+            scale = 0.75  # 25% reduction - caution
+            report["risk_level"] = "caution"
+        else:
+            scale = 1.0
+            report["risk_level"] = "normal"
 
-        # Gradual recovery from risk-off
-        if self.is_risk_off and current_dd < self.max_drawdown * 0.5:
-            self.is_risk_off = False
-            report["adjustments"].append("Exiting risk-off mode")
+        if scale < 1.0:
+            weights = weights * scale
+            report["adjustments"].append(
+                f"Drawdown circuit breaker ({current_dd:.1%}): "
+                f"positions scaled to {scale:.0%}"
+            )
+
+        # Recovery: exit risk-off only when DD drops below each tier threshold
+        if self.is_risk_off:
+            if current_dd <= 0.05:
+                self.is_risk_off = False
+                report["adjustments"].append("Exiting risk-off mode (DD recovered below 5%)")
 
         # Position limits
         clipped = np.clip(weights, -self.max_position, self.max_position)

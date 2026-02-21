@@ -107,9 +107,11 @@ class StorageManager:
         if epoch is not None:
             filepath = path / f"{name}_epoch{epoch}.pt"
         else:
-            checkpoints = sorted(path.glob(f"{name}_epoch*.pt"))
+            checkpoints = list(path.glob(f"{name}_epoch*.pt"))
             if not checkpoints:
                 raise FileNotFoundError(f"No checkpoints found for {name}")
+            # Sort by epoch number numerically (not lexicographically)
+            checkpoints.sort(key=lambda p: int(p.stem.split("epoch")[-1]))
             filepath = checkpoints[-1]
         checkpoint = torch.load(filepath, map_location="cpu", weights_only=False)
         logger.info(f"Loaded checkpoint: {filepath} (epoch {checkpoint['epoch']})")

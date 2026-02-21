@@ -1,13 +1,23 @@
 """Data collection from Yahoo Finance for KOSPI and NASDAQ markets."""
 
 from datetime import datetime, timedelta
+from io import StringIO
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+import requests
 import yfinance as yf
 from loguru import logger
 from pykrx import stock as krx
+
+_HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+}
 
 
 class MarketDataCollector:
@@ -65,7 +75,9 @@ class MarketDataCollector:
                 "https://en.wikipedia.org/wiki/"
                 "List_of_S%26P_500_companies"
             )
-            tables = pd.read_html(sp500_url)
+            resp = requests.get(sp500_url, headers=_HTTP_HEADERS, timeout=30)
+            resp.raise_for_status()
+            tables = pd.read_html(StringIO(resp.text))
             sp500 = tables[0]
             tickers_sp500 = sp500["Symbol"].str.replace(".", "-", regex=False).tolist()
 
@@ -74,13 +86,19 @@ class MarketDataCollector:
                 "https://en.wikipedia.org/wiki/"
                 "Nasdaq-100#Components"
             )
-            tables_nq = pd.read_html(nq100_url)
+            resp_nq = requests.get(nq100_url, headers=_HTTP_HEADERS, timeout=30)
+            resp_nq.raise_for_status()
+            tables_nq = pd.read_html(StringIO(resp_nq.text))
             # Find table with Ticker column
             nq100_tickers = []
             for t in tables_nq:
-                for col in t.columns:
+                cols = [str(c) for c in t.columns]
+                for col in cols:
                     if "ticker" in col.lower() or "symbol" in col.lower():
-                        nq100_tickers = t[col].str.replace(".", "-", regex=False).tolist()
+                        nq100_tickers = (
+                            t[col].dropna().astype(str)
+                            .str.replace(".", "-", regex=False).tolist()
+                        )
                         break
                 if nq100_tickers:
                     break

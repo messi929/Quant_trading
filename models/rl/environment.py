@@ -36,9 +36,10 @@ class SectorTradingEnv(gym.Env):
         transaction_cost: float = 0.002,
         max_position: float = 1.0,
         reward_type: str = "sharpe",
-        risk_penalty: float = 0.1,
-        drawdown_penalty: float = 0.5,
-        window_size: int = 20,
+        risk_penalty: float = 1.0,
+        drawdown_penalty: float = 5.0,
+        window_size: int = 60,
+        vol_target: float = 0.15,
     ):
         """
         Args:
@@ -49,9 +50,10 @@ class SectorTradingEnv(gym.Env):
             transaction_cost: Cost per trade as fraction
             max_position: Max absolute position per sector
             reward_type: "sharpe", "sortino", or "returns"
-            risk_penalty: Penalty weight for portfolio risk
-            drawdown_penalty: Penalty weight for drawdown
+            risk_penalty: Penalty weight for excess volatility
+            drawdown_penalty: Penalty weight for drawdown (non-linear)
             window_size: Window for rolling Sharpe computation
+            vol_target: Annual volatility target (excess vol is penalized)
         """
         super().__init__()
 
@@ -66,6 +68,7 @@ class SectorTradingEnv(gym.Env):
         self.risk_penalty = risk_penalty
         self.drawdown_penalty = drawdown_penalty
         self.window_size = window_size
+        self.vol_target = vol_target
 
         feature_dim = features.shape[1]
         # State: features + current positions + portfolio value ratio + step ratio
@@ -112,6 +115,14 @@ class SectorTradingEnv(gym.Env):
             observation, reward, terminated, truncated, info
         """
         action = np.clip(action, -self.max_position, self.max_position)
+
+        # Project action onto simplex: long-only, weights sum to 1 (no leverage)
+        action = np.clip(action, 0, None)
+        action_sum = action.sum()
+        if action_sum > 1e-8:
+            action = action / action_sum
+        else:
+            action = np.ones(self.n_sectors, dtype=np.float32) / self.n_sectors
 
         # Compute trading costs
         position_change = np.abs(action - self.positions)
@@ -195,11 +206,25 @@ class SectorTradingEnv(gym.Env):
         else:  # returns
             reward = daily_return * 100
 
-        # Penalties
-        reward -= self.risk_penalty * np.std(self.returns_history[-self.window_size:]) if len(self.returns_history) >= self.window_size else 0
-        reward -= self.drawdown_penalty * drawdown
+        # Excess volatility penalty (only penalize vol above target)
+        if len(self.returns_history) >= self.window_size:
+            recent = np.array(self.returns_history[-self.window_size:])
+            port_vol = np.std(recent) * np.sqrt(252)
+            vol_excess = max(0.0, port_vol - self.vol_target)
+            reward -= self.risk_penalty * vol_excess
 
-        return float(reward)
+        # Non-linear drawdown penalty (multi-tier)
+        if drawdown > 0.30:
+            reward -= self.drawdown_penalty * drawdown * 10  # Crisis
+        elif drawdown > 0.20:
+            reward -= self.drawdown_penalty * drawdown * 5   # High risk
+        elif drawdown > 0.10:
+            reward -= self.drawdown_penalty * drawdown * 2   # Warning
+        else:
+            reward -= self.drawdown_penalty * drawdown        # Normal
+
+        # Clip reward to prevent exploding value loss
+        return float(np.clip(reward, -10.0, 10.0))
 
     def _get_info(self) -> dict:
         return {

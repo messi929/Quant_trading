@@ -22,7 +22,7 @@ class DeviceManager:
             torch.cuda.set_per_process_memory_fraction(memory_fraction)
             device = torch.device("cuda")
             gpu_name = torch.cuda.get_device_name(0)
-            total_mem = torch.cuda.get_device_properties(0).total_mem / 1e9
+            total_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
             logger.info(f"GPU: {gpu_name} ({total_mem:.1f} GB)")
             # Enable TF32 for Ampere+ GPUs
             torch.backends.cuda.matmul.allow_tf32 = True

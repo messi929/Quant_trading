@@ -1,0 +1,67 @@
+# Fast training settings for first run on RTX 4060 Ti (8GB VRAM)
+# Reduced epochs, smaller batches, 5-year history
+# Estimated training time: ~2-4 hours
+
+project:
+  name: "Alpha Signal Discovery Engine"
+  version: "1.0.0"
+  root_dir: "C:/src/Qunat_trading"
+
+paths:
+  raw_data: "data/raw"
+  processed_data: "data/processed"
+  models: "saved_models"
+  logs: "logs"
+  results: "results"
+  indicators: "saved_indicators"
+
+# Points to the matching fast model config
+model_config_path: "config/model_config_fast.yaml"
+
+gpu:
+  device: "cuda"
+  mixed_precision: true
+  gradient_checkpointing: true
+  memory_fraction: 0.85  # Safety margin for 8GB VRAM
+  compile_model: false   # Disable torch.compile for first run stability
+
+training:
+  default_epochs: 30
+  early_stopping_patience: 15
+  gradient_accumulation_steps: 1  # No accumulation - large batch already
+  physical_batch_size: 256        # Increased from 32 (mixed precision fits 8GB)
+  effective_batch_size: 256
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  scheduler: "cosine_warmup"
+  warmup_ratio: 0.1
+  seed: 42
+  num_workers: 0   # 0 for Windows shared memory compatibility
+  pin_memory: true
+  max_tickers: 200  # Limit tickers per market for fast training
+
+data:
+  markets:
+    - "KOSPI"
+    - "NASDAQ"
+  history_years: 5       # 5 years instead of 20
+  min_history_days: 250  # ~1 year minimum
+  filter_unknown_sectors: true  # Remove tickers with unknown sector classification
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  chunk_size: 10000
+  sequence_length: 60
+
+backtest:
+  initial_capital: 100_000_000
+  commission_rate: 0.00015
+  slippage_rate: 0.001
+  max_position_pct: 0.1
+  rebalance_frequency: "weekly"
+
+logging:
+  level: "INFO"
+  console: true
+  file: true
+  tensorboard: true

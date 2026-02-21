@@ -173,6 +173,7 @@ class GANTrainer:
         val_loader: DataLoader,
         epochs: int = 200,
         save_name: str = "gan",
+        early_stop_patience: float = 5.0,
     ) -> dict:
         best_w_dist = float("inf")
         history = {"train": [], "val": []}
@@ -186,6 +187,8 @@ class GANTrainer:
             history["train"].append(train_metrics)
             history["val"].append(val_metrics)
 
+            w_dist = abs(val_metrics["wasserstein_distance"])
+
             if epoch % 10 == 0:
                 logger.info(
                     f"Epoch {epoch}/{epochs} | "
@@ -195,7 +198,6 @@ class GANTrainer:
                     f"W-dist: {val_metrics['wasserstein_distance']:.4f}"
                 )
 
-            w_dist = abs(val_metrics["wasserstein_distance"])
             if w_dist < best_w_dist:
                 best_w_dist = w_dist
                 self.storage.save_model_checkpoint(
@@ -207,6 +209,14 @@ class GANTrainer:
                     epoch,
                     metrics=val_metrics,
                 )
+
+            # Early stopping: W-dist diverged too far from best
+            if epoch > 5 and w_dist > best_w_dist + early_stop_patience:
+                logger.info(
+                    f"GAN early stopping at epoch {epoch}: "
+                    f"W-dist {w_dist:.2f} > best {best_w_dist:.2f} + {early_stop_patience}"
+                )
+                break
 
             if epoch % 50 == 0:
                 self.dm.log_memory(f"GAN Epoch {epoch}: ")

@@ -19,6 +19,7 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
+import numpy as np
 import yaml
 from loguru import logger
 
@@ -37,6 +38,10 @@ def parse_args():
     train_parser.add_argument(
         "--skip-data", action="store_true",
         help="Skip data collection (use existing data)",
+    )
+    train_parser.add_argument(
+        "--start-phase", type=int, default=1, choices=range(1, 7),
+        help="Phase to start from (1-6). Earlier phases load from checkpoints.",
     )
     train_parser.add_argument(
         "--config", default="config/settings.yaml",
@@ -73,7 +78,10 @@ def cmd_train(args):
     from pipeline.train_pipeline import TrainPipeline
 
     pipeline = TrainPipeline(config_path=args.config)
-    results = pipeline.run(skip_collection=args.skip_data)
+    results = pipeline.run(
+        skip_collection=args.skip_data or args.start_phase > 1,
+        start_phase=args.start_phase,
+    )
 
     logger.info("Training Results Summary:")
     for phase, metrics in results.items():
@@ -101,12 +109,23 @@ def cmd_infer(args):
 
 
 def cmd_backtest(args):
-    """Execute backtesting."""
+    """Execute backtesting with trained ensemble model signals."""
+    import pandas as pd
+    import torch
     from backtest.engine import BacktestEngine
     from backtest.visualizer import BacktestVisualizer
 
-    with open(args.config, "r") as f:
+    with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
+
+    # Resolve model_config path relative to settings config
+    config_dir = Path(args.config).parent
+    model_config_path = config.get("model_config_path", str(config_dir / "model_config.yaml"))
+    # If settings_fast.yaml is used, try model_config_fast.yaml
+    if "fast" in Path(args.config).stem and not Path(model_config_path).exists():
+        model_config_path = str(config_dir / "model_config_fast.yaml")
+    if not Path(model_config_path).exists():
+        model_config_path = "config/model_config.yaml"
 
     # Load processed data
     processed_path = Path(config["paths"]["processed_data"]) / "processed_data.parquet"
@@ -117,12 +136,11 @@ def cmd_backtest(args):
         )
         return
 
-    import pandas as pd
     df = pd.read_parquet(processed_path)
 
     # Build sector returns
     sector_returns_list = []
-    sectors = df["sector"].unique()
+    sectors = sorted(df["sector"].unique())
     for sector in sectors:
         sector_data = df[df["sector"] == sector]
         if "return_1d" in sector_data.columns:
@@ -149,12 +167,167 @@ def cmd_backtest(args):
         rebalance_frequency=config["backtest"]["rebalance_frequency"],
     )
 
-    # Simple equal-weight signals for baseline
-    n_sectors = test_returns.shape[1]
-    equal_signals = np.ones((len(test_returns), n_sectors)) / n_sectors
+    # --- Try to load trained ensemble for model-based signals ---
+    ensemble_path = Path(config["paths"]["models"]) / "ensemble.pt"
+    model_signals = None
+
+    if ensemble_path.exists():
+        logger.info(f"Loading trained ensemble from {ensemble_path}")
+        try:
+            from models.autoencoder.model import MarketVAE
+            from models.transformer.model import TemporalTransformer
+            from models.gan.model import ConditionalWGAN
+            from models.rl.agent import PPOAgent
+            from models.ensemble import ModelEnsemble
+            from utils.device import DeviceManager
+
+            with open(model_config_path, "r", encoding="utf-8") as f:
+                model_config = yaml.safe_load(f)
+
+            dm = DeviceManager(
+                memory_fraction=config["gpu"]["memory_fraction"],
+                compile_model=False,
+            )
+
+            # Derive feature columns from the already-loaded processed data,
+            # matching the same exclusion logic used in FeatureEngineer.compute_all()
+            _meta_cols = {"date", "open", "high", "low", "close", "volume", "ticker", "market", "sector"}
+            feature_cols = [c for c in df.columns if c not in _meta_cols]
+            n_features = len(feature_cols)
+            seq_len = config["data"]["sequence_length"]
+
+            vae_cfg = model_config["vae"]
+            tf_cfg = model_config["transformer"]
+            gan_cfg = model_config["gan"]
+            rl_cfg = model_config["rl"]
+
+            vae = MarketVAE(
+                input_dim=n_features,
+                hidden_dims=vae_cfg["hidden_dims"],
+                latent_dim=vae_cfg["latent_dim"],
+                dropout=vae_cfg.get("dropout", 0.2),
+                seq_length=seq_len,
+            )
+            transformer = TemporalTransformer(
+                input_dim=n_features,
+                d_model=tf_cfg["d_model"],
+                n_heads=tf_cfg["n_heads"],
+                n_layers=tf_cfg["n_encoder_layers"],
+                d_ff=tf_cfg["d_ff"],
+                dropout=tf_cfg.get("dropout", 0.1),
+                max_seq_length=tf_cfg["max_seq_length"],
+                output_dim=tf_cfg.get("output_dim", 1),
+                n_sectors=tf_cfg["n_sectors"],
+                use_sector_attention=tf_cfg.get("use_sector_attention", True),
+                sector_embed_dim=tf_cfg.get("sector_embed_dim", 32),
+            )
+            gan = ConditionalWGAN(
+                noise_dim=gan_cfg["noise_dim"],
+                hidden_dims=gan_cfg.get("generator_hidden_dims", [128, 256, 128]),
+                output_dim=n_features,
+                seq_length=gan_cfg["sequence_length"],
+            )
+
+            # state_dim must match training: n_features + n_sectors + 2 (portfolio state)
+            n_sectors_rl = len(sorted(df["sector"].unique()))
+            state_dim = n_features + n_sectors_rl + 2
+            agent = PPOAgent(
+                state_dim=state_dim,
+                n_sectors=n_sectors_rl,
+                hidden_dims=rl_cfg["hidden_dims"],
+                device=dm.device,
+            )
+
+            ensemble = ModelEnsemble(vae, transformer, gan, agent, device=dm.device)
+            ensemble.load_ensemble(str(ensemble_path))
+            logger.info("Ensemble loaded — generating model-based signals for backtest")
+
+            # Generate signals for each test day using rolling windows
+            n_test = len(test_returns)
+            n_sectors = test_returns.shape[1]
+            model_signals = np.zeros((n_test, n_sectors))
+
+            # For each sector, get predictions over the test period
+            for s_idx, sector in enumerate(test_returns.columns):
+                sector_data = df[df["sector"] == sector].sort_values("date")
+                if len(sector_data) < seq_len:
+                    continue
+
+                sector_features = sector_data[feature_cols].values
+                sector_dates = pd.to_datetime(sector_data["date"].values)
+
+                for t_idx, test_date in enumerate(test_returns.index):
+                    # Find the position of test_date in sector data
+                    mask = sector_dates <= test_date
+                    valid_count = mask.sum()
+                    if valid_count < seq_len:
+                        continue
+
+                    window = sector_features[valid_count - seq_len : valid_count]
+                    seq_tensor = torch.FloatTensor(window).unsqueeze(0).to(dm.device)
+                    sector_id = torch.tensor([0], dtype=torch.long).to(dm.device)
+
+                    with torch.no_grad():
+                        signals_out = ensemble.get_signals(seq_tensor, sector_id)
+                        model_signals[t_idx, s_idx] = signals_out["prediction"].cpu().item()
+
+            # Normalize signals: top-K sectors long, rest neutral
+            # Avoids always-100%-long problem; negative signals treated as neutral
+            top_k = 3
+            for t_idx in range(n_test):
+                row = model_signals[t_idx]
+                weights = np.zeros_like(row)
+                if np.any(row != 0):
+                    # Select top-K sectors by signal strength
+                    top_indices = np.argsort(row)[-top_k:]
+                    weights[top_indices] = row[top_indices]
+                    # Only keep positive signals (negative = no conviction)
+                    weights = np.clip(weights, 0, None)
+                    if weights.sum() > 0:
+                        weights = weights / weights.sum()
+                    else:
+                        # All top-K signals were negative → equal weight
+                        weights = np.ones(n_sectors) / n_sectors
+                else:
+                    weights = np.ones(n_sectors) / n_sectors
+                model_signals[t_idx] = weights
+
+            # Apply daily risk management pre-filter to signals
+            # This complements the weekly-rebalancing engine's own RiskManager
+            # by providing daily circuit-breaker protection
+            from strategy.risk import RiskManager as _RM
+            pre_risk = _RM(max_position_pct=1.0)  # No per-sector clipping here
+            sim_portfolio = float(config["backtest"]["initial_capital"])
+            for t_idx in range(n_test):
+                weights = model_signals[t_idx].copy()
+                recent_ret = (
+                    test_returns.iloc[max(0, t_idx - 20) : t_idx + 1]
+                    if t_idx > 0 else None
+                )
+                adj_weights, _ = pre_risk.check_and_adjust(
+                    weights, sim_portfolio, recent_ret
+                )
+                model_signals[t_idx] = adj_weights
+                # Simulate one-day return to track portfolio value
+                day_ret = float(np.dot(adj_weights, test_returns.iloc[t_idx].values))
+                sim_portfolio *= (1.0 + day_ret)
+
+            dm.clear_memory()
+            logger.info("Model signal generation complete")
+
+        except Exception as e:
+            logger.warning(f"Failed to load ensemble model: {e}")
+            logger.warning("Falling back to equal-weight baseline signals")
+            model_signals = None
+
+    # Fallback: equal-weight signals
+    if model_signals is None:
+        logger.info("Using equal-weight baseline signals")
+        n_sectors = test_returns.shape[1]
+        model_signals = np.ones((len(test_returns), n_sectors)) / n_sectors
 
     if args.walk_forward:
-        results = engine.walk_forward(test_returns, equal_signals)
+        results = engine.walk_forward(test_returns, model_signals)
         logger.info(f"Walk-forward: {len(results)} periods")
         for i, r in enumerate(results):
             logger.info(
@@ -162,7 +335,7 @@ def cmd_backtest(args):
                 f"Sharpe={r['metrics']['sharpe_ratio']:.2f}"
             )
     else:
-        result = engine.run(test_returns, equal_signals)
+        result = engine.run(test_returns, model_signals)
         viz = BacktestVisualizer(save_dir=config["paths"].get("results", "results"))
         viz.generate_report(result, sector_names=list(test_returns.columns))
 
@@ -172,6 +345,18 @@ def cmd_backtest(args):
                 logger.info(f"  {key}: {val:.4f}")
             else:
                 logger.info(f"  {key}: {val}")
+
+        # Also run equal-weight baseline for comparison
+        if ensemble_path.exists():
+            logger.info("\n--- Equal-Weight Baseline Comparison ---")
+            n_sectors = test_returns.shape[1]
+            baseline_signals = np.ones((len(test_returns), n_sectors)) / n_sectors
+            baseline_result = engine.run(test_returns, baseline_signals)
+            logger.info("Baseline Results:")
+            for key in ["total_return", "sharpe_ratio", "max_drawdown", "sortino_ratio"]:
+                val = baseline_result["metrics"].get(key)
+                if val is not None and isinstance(val, float):
+                    logger.info(f"  {key}: {val:.4f}")
 
 
 def main():
@@ -184,7 +369,7 @@ def main():
         logger.info("  python main.py backtest    # Run backtest")
         return
 
-    with open(getattr(args, "config", "config/settings.yaml"), "r") as f:
+    with open(getattr(args, "config", "config/settings.yaml"), "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
     setup_logger(

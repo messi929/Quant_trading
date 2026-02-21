@@ -6,10 +6,15 @@ Generates synthetic market sequences conditioned on market regime
 
 import torch
 import torch.nn as nn
+from torch.nn.utils import spectral_norm
 
 
 class Generator(nn.Module):
-    """Generates synthetic market sequences from noise + regime condition."""
+    """Generates synthetic market sequences from noise + regime condition.
+
+    Uses Spectral Normalization on all Linear layers to enforce Lipschitz
+    continuity, preventing mode collapse and training divergence.
+    """
 
     def __init__(
         self,
@@ -20,7 +25,7 @@ class Generator(nn.Module):
         seq_length: int = 60,
     ):
         super().__init__()
-        hidden_dims = hidden_dims or [128, 256, 128]
+        hidden_dims = hidden_dims or [64, 128, 64]
         self.seq_length = seq_length
         self.output_dim = output_dim
 
@@ -29,13 +34,13 @@ class Generator(nn.Module):
         in_dim = input_dim
         for h_dim in hidden_dims:
             layers.extend([
-                nn.Linear(in_dim, h_dim),
+                spectral_norm(nn.Linear(in_dim, h_dim)),
                 nn.LayerNorm(h_dim),
                 nn.LeakyReLU(0.2),
             ])
             in_dim = h_dim
 
-        layers.append(nn.Linear(hidden_dims[-1], seq_length * output_dim))
+        layers.append(spectral_norm(nn.Linear(hidden_dims[-1], seq_length * output_dim)))
         layers.append(nn.Tanh())
         self.network = nn.Sequential(*layers)
 

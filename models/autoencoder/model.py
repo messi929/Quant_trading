@@ -121,13 +121,13 @@ class MarketVAE(nn.Module):
             Dict with keys: reconstruction, mu, log_var, z
         """
         batch_size = x.size(0)
-        x_flat = x.view(batch_size, -1)
+        x_flat = x.reshape(batch_size, -1)
 
         mu, log_var = self.encoder(x_flat)
         z = self.reparameterize(mu, log_var)
         x_recon = self.decoder(z)
 
-        x_recon = x_recon.view(batch_size, self.seq_length, self.input_dim)
+        x_recon = x_recon.reshape(batch_size, self.seq_length, self.input_dim)
 
         return {
             "reconstruction": x_recon,
@@ -146,7 +146,7 @@ class MarketVAE(nn.Module):
             z: (batch, latent_dim) — the "discovered indicators"
         """
         batch_size = x.size(0)
-        x_flat = x.view(batch_size, -1)
+        x_flat = x.reshape(batch_size, -1)
         mu, _ = self.encoder(x_flat)
         return mu
 

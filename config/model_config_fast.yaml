@@ -1,0 +1,79 @@
+# Fast model config - reduced hyperparameters for quick first training run
+# Use with config/settings_fast.yaml
+
+vae:
+  input_dim: null
+  hidden_dims: [256, 128, 64]
+  latent_dim: 32
+  learning_rate: 1.0e-4
+  batch_size: 32
+  epochs: 30            # Reduced from 100
+  kl_weight: 0.01
+  kl_annealing: true
+  kl_annealing_epochs: 20
+  reconstruction_loss: "mse"
+  dropout: 0.2
+  activation: "leaky_relu"
+  l2_weight: 1.0e-5
+
+transformer:
+  d_model: 128
+  n_heads: 8
+  n_encoder_layers: 4
+  d_ff: 512
+  dropout: 0.1
+  max_seq_length: 60
+  input_dim: null
+  output_dim: 1
+  prediction_horizon: 5
+  learning_rate: 5.0e-5
+  batch_size: 32
+  epochs: 25            # Reduced from 80
+  warmup_steps: 500     # Reduced from 1000
+  use_sector_attention: true
+  n_sectors: 11
+  sector_embed_dim: 32
+
+gan:
+  generator_hidden_dims: [64, 128, 64]   # [128,256,128] → 축소 (mode collapse 방지)
+  noise_dim: 64
+  condition_dim: 4
+  discriminator_hidden_dims: [128, 256, 128]
+  learning_rate_g: 5.0e-5
+  learning_rate_d: 5.0e-5
+  batch_size: 32        # Reduced from 64 for VRAM safety
+  epochs: 50            # Reduced from 200
+  n_critic: 10          # 5 → 10 (Discriminator 더 많이 학습 → Generator 발산 억제)
+  gradient_penalty_weight: 10.0
+  output_dim: null
+  sequence_length: 60
+
+rl:
+  learning_rate: 3.0e-4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_epsilon: 0.2
+  value_coef: 0.5
+  entropy_coef: 0.001
+  max_grad_norm: 0.5
+  hidden_dims: [256, 128]
+  n_steps: 2048
+  n_epochs: 10
+  batch_size: 32        # Reduced from 64 for VRAM safety
+  total_timesteps: 200_000  # Reduced from 1,000,000
+  n_sectors: 11
+  max_position: 1.0
+  transaction_cost: 0.002
+  reward_type: "sharpe"
+  risk_penalty: 1.0
+  drawdown_penalty: 5.0
+  window_size: 60
+  vol_target: 0.15
+
+ensemble:
+  vae_weight: 0.25
+  transformer_weight: 0.35
+  gan_weight: 0.15
+  rl_weight: 0.25
+  method: "attention"
+  retrain_frequency: "monthly"

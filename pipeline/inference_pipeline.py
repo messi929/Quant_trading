@@ -41,9 +41,11 @@ class InferencePipeline:
         config_path: str = "config/settings.yaml",
         ensemble_path: str = "saved_models/ensemble.pt",
     ):
-        with open(config_path, "r") as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             self.config = yaml.safe_load(f)
-        with open("config/model_config.yaml", "r") as f:
+
+        model_config_path = self.config.get("model_config_path", "config/model_config.yaml")
+        with open(model_config_path, "r", encoding="utf-8") as f:
             self.model_config = yaml.safe_load(f)
 
         self.dm = DeviceManager(
