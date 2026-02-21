@@ -138,15 +138,20 @@ def cmd_backtest(args):
 
     df = pd.read_parquet(processed_path)
 
-    # Build sector returns
+    # Build sector returns from ACTUAL close prices (not normalized return_1d)
+    # return_1d in processed data is RobustScaler-normalized, so we must
+    # compute actual decimal returns from close prices instead.
     sector_returns_list = []
     sectors = sorted(df["sector"].unique())
     for sector in sectors:
         sector_data = df[df["sector"] == sector]
-        if "return_1d" in sector_data.columns:
-            avg_ret = sector_data.groupby("date")["return_1d"].mean()
-            avg_ret.name = sector
-            sector_returns_list.append(avg_ret)
+        # Pivot to (date x ticker) close price table, then compute pct_change per ticker
+        close_pivot = sector_data.pivot_table(index="date", columns="ticker", values="close")
+        stock_returns = close_pivot.pct_change()
+        # Equal-weight average actual return for the sector each day
+        avg_ret = stock_returns.mean(axis=1)
+        avg_ret.name = sector
+        sector_returns_list.append(avg_ret)
 
     if not sector_returns_list:
         logger.error("No sector returns available for backtesting")
@@ -327,13 +332,36 @@ def cmd_backtest(args):
         model_signals = np.ones((len(test_returns), n_sectors)) / n_sectors
 
     if args.walk_forward:
-        results = engine.walk_forward(test_returns, model_signals)
-        logger.info(f"Walk-forward: {len(results)} periods")
+        # Use 30-day burn-in + 30-day test windows to fit within the ~180-day test set
+        n_test_days = len(test_returns)
+        wf_train = min(30, n_test_days // 6)
+        wf_test = min(30, n_test_days // 6)
+        results = engine.walk_forward(test_returns, model_signals, train_window=wf_train, test_window=wf_test)
+        logger.info(f"Walk-forward: {len(results)} periods (train_window={wf_train}, test_window={wf_test})")
+
+        sharpes, returns, mdds = [], [], []
         for i, r in enumerate(results):
+            m = r["metrics"]
+            period = r.get("period", {})
+            s = m.get("sharpe_ratio", 0)
+            ret = m.get("total_return", 0)
+            mdd = m.get("max_drawdown", 0)
+            sharpes.append(s)
+            returns.append(ret)
+            mdds.append(mdd)
             logger.info(
-                f"  Period {i+1}: Return={r['metrics']['total_return']:.2%}, "
-                f"Sharpe={r['metrics']['sharpe_ratio']:.2f}"
+                f"  Period {i+1} [{period.get('test_start', '')} ~ {period.get('test_end', '')}]: "
+                f"Return={ret:.2%}, Sharpe={s:.2f}, MDD={mdd:.2%}"
             )
+
+        if results:
+            logger.info("\n--- Walk-forward Summary ---")
+            logger.info(f"  Mean Sharpe : {np.mean(sharpes):.2f}  (std={np.std(sharpes):.2f})")
+            logger.info(f"  Mean Return : {np.mean(returns):.2%} (std={np.std(returns):.2%})")
+            logger.info(f"  Mean MDD    : {np.mean(mdds):.2%}")
+            logger.info(f"  Profitable  : {sum(r > 0 for r in returns)}/{len(returns)} periods")
+            positive_sharpe = sum(s > 0 for s in sharpes)
+            logger.info(f"  Sharpe > 0  : {positive_sharpe}/{len(sharpes)} periods")
     else:
         result = engine.run(test_returns, model_signals)
         viz = BacktestVisualizer(save_dir=config["paths"].get("results", "results"))

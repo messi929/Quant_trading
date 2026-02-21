@@ -1,10 +1,20 @@
 # Next Steps - 다음 작업 로드맵
 
-**최종 업데이트**: 2026-02-21 (Phase 3 완료)
-**현재 성과**: Sharpe 1.94, MDD -1.26% (Phase 3 기준)
-**목표**: 달성됨. 다음 목표: Walk-forward 검증으로 과적합 여부 확인
+**최종 업데이트**: 2026-02-21 (Phase 5: 버그 수정 + Walk-forward)
+**실제 성과**: Sharpe 0.70, MDD -7.79%, Return +7.02% (기준선: Sharpe 1.69, +13.26%)
+**핵심 발견**: 이전 Sharpe 1.94는 return_1d 정규화 버그로 인한 허위 수치. 실제로는 기준선 대비 언더퍼폼.
+**다음 목표**: Transformer 신호 품질 개선 (dir_acc 52.4% → 55%+)
 
 ---
+
+## 완료된 작업 (Phase 3~5, 2026-02-21)
+
+### [x] Phase 5: 백테스트 버그 수정 + Walk-forward
+- `return_1d` 정규화 버그 수정 → 실제 close 가격에서 pct_change 계산
+- BacktestEngine max_position 0.10 → 0.50 (top-3 신호 30% → ~100% 투자)
+- Walk-forward 수정: train_window=252 → 30 (180일 테스트 데이터에 맞게)
+- **실제 성과**: Sharpe 0.70, MDD -7.79%, Return +7.02%
+- **결론**: 기준선(Sharpe 1.69) 대비 언더퍼폼, Transformer 신호 개선 필요
 
 ## 완료된 작업 (Phase 3~4, 2026-02-21 04:37)
 

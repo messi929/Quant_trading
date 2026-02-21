@@ -35,8 +35,9 @@ class BacktestEngine:
         self.rebalance_frequency = rebalance_frequency
 
         self.signal_gen = SignalGenerator()
-        self.portfolio_opt = PortfolioOptimizer()
-        self.risk_mgr = RiskManager()
+        # Allow up to 50% per sector so that top-3 signals (each ~33%) are not clipped
+        self.portfolio_opt = PortfolioOptimizer(max_position_pct=0.50)
+        self.risk_mgr = RiskManager(max_position_pct=0.50)
 
     def run(
         self,
