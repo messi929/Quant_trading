@@ -1,0 +1,35 @@
+# 자격증명 (절대 커밋 금지)
+.env
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+
+# 데이터 (대용량)
+data/raw/
+data/processed/
+
+# 모델 체크포인트 (대용량)
+saved_models/*.pt
+saved_models/backups/
+
+# 로그 및 결과
+logs/
+results/
+tracking/*.db
+tracking/.kis_token_cache.json
+tracking/.kis_token_*.json
+
+# 개발 환경
+.venv/
+venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp

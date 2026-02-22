@@ -244,3 +244,71 @@ class MarketDataCollector:
             logger.info(f"Saved ticker info: {ticker_path}")
 
         return results
+
+
+class DataCollector:
+    """Settings-aware wrapper for incremental market data collection.
+
+    Used by daily_runner for incremental updates with date range support.
+    """
+
+    def __init__(self, settings: dict):
+        self.settings = settings
+        self.save_dir = Path(settings["paths"]["raw_data"])
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+
+    def collect_all(
+        self,
+        start_date: str,
+        end_date: str,
+    ) -> pd.DataFrame:
+        """Collect incremental data for the given date range.
+
+        Args:
+            start_date: Start date string "YYYY-MM-DD"
+            end_date:   End date string "YYYY-MM-DD"
+
+        Returns:
+            Combined DataFrame with KOSPI + NASDAQ data, or None on failure
+        """
+        collector = MarketDataCollector(
+            save_dir=str(self.save_dir),
+            history_years=1,  # Placeholder — overridden below
+        )
+        # Override date range
+        collector.start_date = start_date
+        collector.end_date = end_date
+
+        results = []
+
+        try:
+            kospi_info = collector.get_kospi_tickers()
+            kospi_data = collector.download_ohlcv(
+                kospi_info["yf_ticker"].tolist(), "KOSPI"
+            )
+            if not kospi_data.empty:
+                kospi_data["market"] = "KOSPI"
+                results.append(kospi_data)
+        except Exception as e:
+            logger.warning(f"KOSPI 수집 실패 (계속 진행): {e}")
+
+        try:
+            nasdaq_info = collector.get_nasdaq_tickers()
+            nasdaq_data = collector.download_ohlcv(
+                nasdaq_info["yf_ticker"].tolist(), "NASDAQ"
+            )
+            if not nasdaq_data.empty:
+                nasdaq_data["market"] = "NASDAQ"
+                results.append(nasdaq_data)
+        except Exception as e:
+            logger.warning(f"NASDAQ 수집 실패 (계속 진행): {e}")
+
+        if not results:
+            return None
+
+        combined = pd.concat(results, ignore_index=True)
+        logger.info(
+            f"증분 수집 완료: {len(combined):,}행, "
+            f"{start_date} ~ {end_date}"
+        )
+        return combined

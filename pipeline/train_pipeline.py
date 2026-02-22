@@ -533,12 +533,19 @@ class TrainPipeline:
         cfg = self.model_config["rl"]
 
         # Prepare sector returns for RL environment
+        # IMPORTANT: return_1d is RobustScaler-normalized, NOT actual returns.
+        # Use actual close price pct_change to get real decimal returns.
         sector_names = list(sector_map.keys())
         sector_returns = []
         for sector in sector_names:
-            sector_data = df[df["sector"] == sector]
-            if "return_1d" in sector_data.columns:
-                avg_ret = sector_data.groupby("date")["return_1d"].mean()
+            sector_data = df[df["sector"] == sector].sort_values("date")
+            if "close" in sector_data.columns:
+                close_pivot = sector_data.pivot_table(
+                    index="date", columns="ticker", values="close"
+                )
+                stock_rets = close_pivot.pct_change()
+                avg_ret = stock_rets.mean(axis=1)
+                avg_ret.name = sector
                 sector_returns.append(avg_ret)
 
         if not sector_returns:
@@ -575,6 +582,7 @@ class TrainPipeline:
             drawdown_penalty=cfg["drawdown_penalty"],
             window_size=cfg.get("window_size", 60),
             vol_target=cfg.get("vol_target", 0.15),
+            episode_length=cfg.get("episode_length", 252),
         )
 
         state_dim = env.observation_space.shape[0]

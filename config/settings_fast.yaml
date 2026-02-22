@@ -44,7 +44,7 @@ data:
   markets:
     - "KOSPI"
     - "NASDAQ"
-  history_years: 5       # 5 years instead of 20
+  history_years: 5       # 5 years - recent data is more predictive for short-term test period
   min_history_days: 250  # ~1 year minimum
   filter_unknown_sectors: true  # Remove tickers with unknown sector classification
   train_ratio: 0.7

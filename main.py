@@ -252,33 +252,53 @@ def cmd_backtest(args):
             n_sectors = test_returns.shape[1]
             model_signals = np.zeros((n_test, n_sectors))
 
-            # For each sector, get predictions over the test period
+            # Build sector→id map matching training order (sectors.yaml key order)
+            _sectors_cfg_path = config_dir / "sectors.yaml"
+            with open(_sectors_cfg_path, "r", encoding="utf-8") as _sf:
+                _sectors_cfg = yaml.safe_load(_sf)
+            _train_sector_names = list(_sectors_cfg["sectors"].keys())
+            _sector_to_train_id = {name: idx for idx, name in enumerate(_train_sector_names)}
+
+            # Use training-time sector ID (sectors.yaml order), not sorted index
+            # Per-ticker inference: run model on each ticker individually, then
+            # average signals to the sector level (matches training distribution)
             for s_idx, sector in enumerate(test_returns.columns):
+                train_sector_id = _sector_to_train_id.get(sector, 0)
+                sector_id_tensor = torch.tensor([train_sector_id], dtype=torch.long).to(dm.device)
+
                 sector_data = df[df["sector"] == sector].sort_values("date")
-                if len(sector_data) < seq_len:
-                    continue
+                tickers_in_sector = sector_data["ticker"].unique()
 
-                sector_features = sector_data[feature_cols].values
-                sector_dates = pd.to_datetime(sector_data["date"].values)
+                # Accumulate predictions per ticker for each test day
+                ticker_signal_sum = np.zeros((n_test,))
+                ticker_signal_count = np.zeros((n_test,), dtype=int)
 
-                for t_idx, test_date in enumerate(test_returns.index):
-                    # Find the position of test_date in sector data
-                    mask = sector_dates <= test_date
-                    valid_count = mask.sum()
-                    if valid_count < seq_len:
+                for ticker in tickers_in_sector:
+                    tkr_data = sector_data[sector_data["ticker"] == ticker].sort_values("date")
+                    if len(tkr_data) < seq_len:
                         continue
+                    tkr_features = tkr_data[feature_cols].values
+                    tkr_dates = pd.to_datetime(tkr_data["date"].values)
 
-                    window = sector_features[valid_count - seq_len : valid_count]
-                    seq_tensor = torch.FloatTensor(window).unsqueeze(0).to(dm.device)
-                    sector_id = torch.tensor([0], dtype=torch.long).to(dm.device)
+                    for t_idx, test_date in enumerate(test_returns.index):
+                        mask = tkr_dates <= test_date
+                        valid_count = mask.sum()
+                        if valid_count < seq_len:
+                            continue
+                        window = tkr_features[valid_count - seq_len : valid_count]
+                        seq_tensor = torch.FloatTensor(window).unsqueeze(0).to(dm.device)
+                        with torch.no_grad():
+                            signals_out = ensemble.get_signals(seq_tensor, sector_id_tensor)
+                            ticker_signal_sum[t_idx] += signals_out["prediction"].cpu().item()
+                            ticker_signal_count[t_idx] += 1
 
-                    with torch.no_grad():
-                        signals_out = ensemble.get_signals(seq_tensor, sector_id)
-                        model_signals[t_idx, s_idx] = signals_out["prediction"].cpu().item()
+                # Average over tickers; leave 0 where no ticker has enough data
+                valid = ticker_signal_count > 0
+                model_signals[valid, s_idx] = ticker_signal_sum[valid] / ticker_signal_count[valid]
 
             # Normalize signals: top-K sectors long, rest neutral
             # Avoids always-100%-long problem; negative signals treated as neutral
-            top_k = 3
+            top_k = 5
             for t_idx in range(n_test):
                 row = model_signals[t_idx]
                 weights = np.zeros_like(row)
@@ -295,6 +315,11 @@ def cmd_backtest(args):
                         weights = np.ones(n_sectors) / n_sectors
                 else:
                     weights = np.ones(n_sectors) / n_sectors
+                # Blend model signal with equal-weight: model adds tilts on top of
+                # equal-weight base, reducing concentration risk
+                alpha = 0.4  # 40% model signal, 60% equal-weight
+                ew = np.ones(n_sectors) / n_sectors
+                weights = alpha * weights + (1.0 - alpha) * ew
                 model_signals[t_idx] = weights
 
             # Apply daily risk management pre-filter to signals

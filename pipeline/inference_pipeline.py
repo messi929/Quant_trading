@@ -8,7 +8,7 @@ import torch
 import yaml
 from loguru import logger
 
-from data.collector import MarketDataCollector
+from data.collector import MarketDataCollector, DataCollector
 from data.processor import DataProcessor
 from data.feature_engineer import FeatureEngineer
 
@@ -53,7 +53,8 @@ class InferencePipeline:
             compile_model=False,  # Skip compile for inference
         )
 
-        self.processor = DataProcessor()
+        # For live inference, only seq_length days needed — lower threshold
+        self.processor = DataProcessor(min_history_days=self.config["data"]["sequence_length"])
         self.feature_eng = FeatureEngineer()
         self.signal_gen = SignalGenerator()
         self.portfolio_opt = PortfolioOptimizer(
@@ -67,36 +68,57 @@ class InferencePipeline:
 
     def _load_ensemble(self, path: str) -> ModelEnsemble:
         """Load trained model ensemble."""
+        import torch as _torch
         vae_cfg = self.model_config["vae"]
         tf_cfg = self.model_config["transformer"]
         gan_cfg = self.model_config["gan"]
         rl_cfg = self.model_config["rl"]
+        seq_length = self.config["data"]["sequence_length"]
 
-        # Placeholder input dims - will be set from saved state
+        # Detect actual n_features from checkpoint to avoid shape mismatch
+        # VAE encoder.network.0.weight shape = [hidden_dim, seq_length * n_features]
+        if Path(path).exists():
+            ckpt = _torch.load(path, map_location="cpu", weights_only=False)
+            flat_dim = ckpt["vae"]["encoder.network.0.weight"].shape[1]
+            n_features = flat_dim // seq_length
+            logger.info(f"Checkpoint n_features detected: {n_features} (flat_dim={flat_dim})")
+        else:
+            n_features = 34  # fallback
+            ckpt = None
+
         vae = MarketVAE(
-            input_dim=1,  # Will be overridden by checkpoint
+            input_dim=n_features,
             latent_dim=vae_cfg["latent_dim"],
-            seq_length=self.config["data"]["sequence_length"],
+            seq_length=seq_length,
         )
 
         transformer = TemporalTransformer(
-            input_dim=1,  # Will be overridden
+            input_dim=n_features,
             d_model=tf_cfg["d_model"],
             n_heads=tf_cfg["n_heads"],
             n_layers=tf_cfg["n_encoder_layers"],
             d_ff=tf_cfg["d_ff"],
             n_sectors=tf_cfg["n_sectors"],
+            sector_embed_dim=tf_cfg.get("sector_embed_dim", 32),
         )
 
         gan = ConditionalWGAN(
             noise_dim=gan_cfg["noise_dim"],
-            output_dim=1,  # Will be overridden
+            hidden_dims=gan_cfg.get("generator_hidden_dims", [64, 128, 64]),
+            output_dim=n_features,
             seq_length=gan_cfg["sequence_length"],
         )
 
-        state_dim = vae_cfg["latent_dim"] + tf_cfg["d_model"]  # Approximation
+        # Detect RL state_dim from checkpoint (first linear layer input size)
+        if ckpt is not None:
+            rl_first_w = next(
+                v for k, v in ckpt["rl_policy"].items() if "weight" in k
+            )
+            rl_state_dim = rl_first_w.shape[1]
+        else:
+            rl_state_dim = vae_cfg["latent_dim"] + tf_cfg["d_model"]
         agent = PPOAgent(
-            state_dim=state_dim,
+            state_dim=rl_state_dim,
             n_sectors=rl_cfg["n_sectors"],
             hidden_dims=rl_cfg["hidden_dims"],
             device=self.dm.device,
@@ -107,13 +129,30 @@ class InferencePipeline:
             device=self.dm.device,
         )
 
-        if Path(path).exists():
+        if ckpt is not None:
             ensemble.load_ensemble(path)
             logger.info(f"Loaded ensemble from {path}")
         else:
             logger.warning(f"Ensemble not found at {path}, using untrained models")
 
         return ensemble
+
+    def _build_sector_id_map(self) -> dict:
+        """Load training-time sector→id mapping from sectors.yaml."""
+        # Try to find sectors.yaml relative to config_path
+        config_dir = Path(self.config.get("root_dir", "."))
+        sectors_path = config_dir / "config" / "sectors.yaml"
+        if not sectors_path.exists():
+            sectors_path = Path("config/sectors.yaml")
+        if not sectors_path.exists():
+            logger.warning("sectors.yaml not found, using default order")
+            return {}
+        with open(sectors_path, "r", encoding="utf-8") as f:
+            sectors_cfg = yaml.safe_load(f)
+        return {
+            name: idx
+            for idx, name in enumerate(sectors_cfg["sectors"].keys())
+        }
 
     def generate_signals(
         self,
@@ -140,26 +179,69 @@ class InferencePipeline:
         feature_cols = self.feature_eng.get_feature_names()
         df = self.processor.normalize(df, feature_cols, fit=True)
 
-        # Get latest sequences for each sector
+        # Assign sector column from training data mapping (avoid slow API calls)
+        if "sector" not in df.columns:
+            processed_path = Path("data/processed/processed_data.parquet")
+            if processed_path.exists():
+                ticker_sector = (
+                    pd.read_parquet(processed_path, columns=["ticker", "sector"])
+                    .drop_duplicates("ticker")
+                    .set_index("ticker")["sector"]
+                )
+                df["sector"] = df["ticker"].map(ticker_sector).fillna("unknown")
+                logger.info(f"Sector assigned from training data: {df['sector'].nunique()} sectors")
+            else:
+                df["sector"] = "unknown"
+                logger.warning("No sector mapping found, all tickers assigned to 'unknown'")
+
+        # Build training-time sector ID map (fixes sector_id always=0 bug)
+        sector_id_map = self._build_sector_id_map()
+
+        # Per-ticker inference, averaged to sector level
+        # (fixes mixed-ticker rows bug: sector_data has N_tickers×N_days rows)
         signals_per_sector = {}
-        sector_predictions = {}
 
         for sector in df["sector"].unique():
-            sector_data = df[df["sector"] == sector].tail(self.seq_length)
-            if len(sector_data) < self.seq_length:
+            if sector == "unknown":
                 continue
+            sector_df = df[df["sector"] == sector]
+            tickers_in_sector = sector_df["ticker"].unique()
 
-            features = torch.FloatTensor(
-                sector_data[feature_cols].values
-            ).unsqueeze(0).to(self.dm.device)
+            train_sector_id = sector_id_map.get(sector, 0)
+            sector_id_tensor = torch.tensor(
+                [train_sector_id], dtype=torch.long
+            ).to(self.dm.device)
 
-            sector_id = torch.tensor([0], dtype=torch.long).to(self.dm.device)
+            ticker_scores = {}  # ticker -> prediction score
+            for ticker in tickers_in_sector:
+                tkr_df = sector_df[sector_df["ticker"] == ticker].sort_values("date")
+                if len(tkr_df) < self.seq_length:
+                    continue
 
-            with torch.no_grad():
-                model_signals = self.ensemble.get_signals(features, sector_id)
+                window = tkr_df[feature_cols].values[-self.seq_length:]
+                features = torch.FloatTensor(window).unsqueeze(0).to(self.dm.device)
+
+                with torch.no_grad():
+                    model_signals = self.ensemble.get_signals(features, sector_id_tensor)
+                    ticker_scores[ticker] = model_signals["prediction"].cpu().item()
+
+            if ticker_scores:
+                # Rank tickers by model score, keep top N with positive signal only
+                top_n = 3
+                ranked = sorted(ticker_scores.items(), key=lambda x: x[1], reverse=True)
+                top_tickers = [
+                    {
+                        "ticker": t,
+                        "score": s,
+                        "market": "overseas" if not t.isdigit() else "domestic",
+                    }
+                    for t, s in ranked[:top_n]
+                    if s > 0  # 상승 신호 있는 종목만
+                ]
                 signals_per_sector[sector] = {
-                    "prediction": model_signals["prediction"].cpu().item(),
-                    "latent": model_signals["latent_indicators"].cpu().numpy(),
+                    "prediction": float(np.mean(list(ticker_scores.values()))),
+                    "n_tickers": len(ticker_scores),
+                    "top_tickers": top_tickers,
                 }
 
         # Aggregate into allocation
@@ -196,8 +278,15 @@ class InferencePipeline:
         pv = portfolio_value or self.config["backtest"]["initial_capital"]
         weights, risk_report = self.risk_mgr.check_and_adjust(weights, pv)
 
+        # Per-sector top tickers for individual stock ordering
+        sector_top_tickers = {
+            s: signals_per_sector[s].get("top_tickers", [])
+            for s in sector_list
+        }
+
         return {
             "sector_allocations": dict(zip(sector_list, weights[:n_sectors].tolist())),
+            "sector_top_tickers": sector_top_tickers,
             "signals": signal_result,
             "risk_report": risk_report,
             "predictions": dict(zip(sector_list, predictions.tolist())),

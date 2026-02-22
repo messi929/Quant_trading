@@ -61,6 +61,11 @@ class BacktestEngine:
         n_sectors = sector_returns.shape[1]
         dates = sector_returns.index
 
+        # Reset risk manager state so each run is independent
+        self.risk_mgr.peak_value = 0.0
+        self.risk_mgr.daily_pnl = 0.0
+        self.risk_mgr.is_risk_off = False
+
         logger.info(
             f"Running backtest: {n_days} days, {n_sectors} sectors, "
             f"capital={self.initial_capital:,.0f}"

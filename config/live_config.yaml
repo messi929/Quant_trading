@@ -1,0 +1,105 @@
+# Live Trading Configuration
+# 한국투자증권 KIS API 실거래 설정
+
+broker:
+  name: "한국투자증권"
+  mode: "sandbox"          # "sandbox" | "production" — 반드시 sandbox로 시작
+  base_url_sandbox: "https://openapivts.koreainvestment.com:9443"
+  base_url_prod:    "https://openapi.koreainvestment.com:9443"
+  ws_url_prod:      "ws://ops.koreainvestment.com:21000"
+  token_expire_hours: 24
+
+account:
+  # 실제 계좌번호는 .env 파일에 설정 (CANO, ACNT_PRDT_CD)
+  currency_domestic: "KRW"
+  currency_overseas: "USD"
+
+portfolio:
+  total_capital: 100_000_000    # 1억원 (KRW)
+  rebalance_threshold: 0.03     # 3% 이상 괴리 시 리밸런싱
+  rebalance_day: "daily"        # 매일 리밸런싱 (신호 변경 즉시 반영)
+  max_sector_weight: 0.30       # 섹터별 최대 30%
+  min_order_amount: 100_000     # 최소 주문금액 10만원
+  cash_buffer: 0.05             # 5% 현금 유보
+
+risk:
+  daily_loss_limit: 0.03        # 일간 -3% 초과 시 전량 청산
+  total_loss_limit: 0.15        # 누적 -15% 초과 시 거래 중단
+  drawdown_halt: 0.10           # MDD -10% 시 거래 중단
+
+trading:
+  # KOSPI 섹터 ETF (메인)
+  kospi_etf_map:
+    energy:                  "117460"  # KODEX 에너지화학
+    materials:               "117460"  # KODEX 에너지화학 (소재 ETF 없음 → 에너지화학으로 대체)
+    industrials:             "214830"  # KODEX 건설
+    consumer_discretionary:  "091220"  # KODEX 소비재
+    consumer_staples:        "091220"  # KODEX 소비재 (필수소비재 ETF 없음)
+    healthcare:              "266410"  # KODEX 헬스케어
+    financials:              "091160"  # KODEX 금융
+    information_technology:  "261110"  # KODEX IT
+    communication_services:  "261110"  # KODEX IT (통신서비스 ETF 없음)
+    utilities:               "337140"  # KODEX 유틸리티
+    real_estate:             "395400"  # KODEX 리츠부동산인프라
+
+  # 미국 섹터 ETF (해외주식 계좌)
+  nasdaq_etf_map:
+    energy:                  "XLE"
+    materials:               "XLB"
+    industrials:             "XLI"
+    consumer_discretionary:  "XLY"
+    consumer_staples:        "XLP"
+    healthcare:              "XLV"
+    financials:              "XLF"
+    information_technology:  "XLK"
+    communication_services:  "XLC"
+    utilities:               "XLU"
+    real_estate:             "XLRE"
+
+  # 어느 시장으로 섹터를 실행할지
+  execution_market: "kospi"    # "kospi" | "nasdaq" | "split"
+  # split: 모델 signal이 KOSPI/NASDAQ 혼합이므로
+  #        가중치를 절반씩 양 시장에 투자
+
+model:
+  config_path: "config/settings_fast.yaml"
+  ensemble_path: "saved_models/ensemble.pt"
+  inference_timeout: 600       # 초 (추론 최대 10분)
+
+retrain:
+  weekly_fine_tune: true
+  weekly_day: "saturday"
+  weekly_start_phase: 3        # Transformer부터 재학습
+  monthly_full_retrain: true
+  monthly_day: 1               # 매월 1일
+  monthly_start_phase: 2       # VAE부터 전체 재학습
+  model_backup_count: 5        # 최근 5개 모델 버전 보관
+
+execution:
+  # Phase A: 지정가 주문 + 미체결 재시도
+  retry_wait_secs:       300      # 5분 후 미체결 확인
+  # Phase B: TWAP 분할 (50만원 이상 주문을 3개 파로 나눔)
+  twap_threshold:        500000   # 50만원 이상 → 3-파 TWAP
+  # Phase C: 신호 강도 → 긴급도 매핑
+  urgency_thresholds:
+    aggressive: 0.5               # score ≥ 0.5 → 공격적 (ask+0.3%, 시장가 폴백)
+    normal:     0.2               # score ≥ 0.2 → 일반 (ask 가격, 1회 재시도)
+    # score < 0.2 → 인내 (중간값, 재시도 없음)
+  # Phase D: 거래비용 임계값
+  transaction_cost_rate: 0.006    # 왕복 0.6% (수수료 0.2%×2 + 슬리피지 0.1%×2)
+  score_cost_threshold:  0.0      # 모델 score 범위 0.001~0.011 → 임계값 비활성화
+
+schedule:
+  data_collect_time:   "06:00"
+  signal_gen_time:     "06:30"
+  # TWAP 3-파 주문 (단일 08:50 → 3개 시간대로 분산)
+  order_waves:
+    wave1:             "09:10"    # 40% — 장 시작 10분 후 (갭 안정화 대기)
+    wave2:             "11:00"    # 35% — 오전 중반
+    wave3:             "13:30"    # 25% — 오후 장
+  eod_record_time:     "16:00"  # 종가 기록
+
+logging:
+  trade_log_db: "tracking/trades.db"
+  performance_log: "tracking/performance.csv"
+  alert_email: ""              # 선택사항: 이메일 알림

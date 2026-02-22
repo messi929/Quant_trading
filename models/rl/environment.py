@@ -40,6 +40,7 @@ class SectorTradingEnv(gym.Env):
         drawdown_penalty: float = 5.0,
         window_size: int = 60,
         vol_target: float = 0.15,
+        episode_length: int = 252,
     ):
         """
         Args:
@@ -69,6 +70,8 @@ class SectorTradingEnv(gym.Env):
         self.drawdown_penalty = drawdown_penalty
         self.window_size = window_size
         self.vol_target = vol_target
+        # Episode length: how many steps per episode (random window sampling)
+        self.episode_length = min(episode_length, len(features))
 
         feature_dim = features.shape[1]
         # State: features + current positions + portfolio value ratio + step ratio
@@ -93,7 +96,12 @@ class SectorTradingEnv(gym.Env):
         options: Optional[dict] = None,
     ) -> tuple[np.ndarray, dict]:
         super().reset(seed=seed)
-        self.current_step = 0
+        # Random start: sample a different market window each episode
+        max_start = max(0, self.n_steps - self.episode_length)
+        self.episode_start = self.np_random.integers(0, max_start + 1) if max_start > 0 else 0
+        self.episode_end = self.episode_start + self.episode_length
+        self.current_step = self.episode_start
+
         self.positions = np.zeros(self.n_sectors, dtype=np.float32)
         self.portfolio_value = self.initial_capital
         self.peak_value = self.initial_capital
@@ -128,7 +136,7 @@ class SectorTradingEnv(gym.Env):
         position_change = np.abs(action - self.positions)
         costs = np.sum(position_change) * self.transaction_cost * self.portfolio_value
 
-        # Compute portfolio return
+        # Compute portfolio return using current episode step
         if self.current_step < self.n_steps:
             sector_ret = self.sector_returns[self.current_step]
             portfolio_return = np.dot(action, sector_ret)
@@ -162,9 +170,9 @@ class SectorTradingEnv(gym.Env):
         # Compute reward
         reward = self._compute_reward(daily_return, current_dd)
 
-        # Termination
+        # Termination: end of episode window or bankruptcy
         terminated = self.portfolio_value <= 0
-        truncated = self.current_step >= self.n_steps
+        truncated = self.current_step >= self.episode_end
 
         return self._get_obs(), reward, terminated, truncated, self._get_info()
 
@@ -173,7 +181,9 @@ class SectorTradingEnv(gym.Env):
         step_idx = min(self.current_step, self.n_steps - 1)
         features = self.features[step_idx]
         value_ratio = np.float32(self.portfolio_value / self.initial_capital)
-        step_ratio = np.float32(self.current_step / self.n_steps)
+        # Step ratio relative to episode window (not total dataset)
+        episode_steps = self.episode_end - self.episode_start
+        step_ratio = np.float32((self.current_step - self.episode_start) / max(episode_steps, 1))
 
         return np.concatenate([
             features,

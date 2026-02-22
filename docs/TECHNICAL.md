@@ -1,7 +1,8 @@
 # Alpha Signal Discovery Engine - 기술 상세 문서
 
-**버전**: 2026-02-21
-**현재 최고 성과**: Sharpe 0.62, MDD -25.89% (Phase 2 기준)
+**버전**: 2026-02-22 (Phase 10: Hetzner Cloud 배포)
+**현재 최고 성과**: Sharpe **2.03**, MDD **-4.30%**, Return **+17.82%** (기준선 대비 +0.21 Sharpe)
+**배포 상태**: Hetzner Cloud `77.42.78.9` systemd 데몬 실행 중 (KST 기준 일간 자동화)
 
 ---
 
@@ -21,6 +22,9 @@
 12. [훈련 파이프라인](#12-훈련-파이프라인)
 13. [하이퍼파라미터 참조표](#13-하이퍼파라미터-참조표)
 14. [데이터 흐름 전체 도식](#14-데이터-흐름-전체-도식)
+15. [라이브 트레이딩 시스템](#15-라이브-트레이딩-시스템)
+16. [신호 생성 파이프라인 수정사항](#16-신호-생성-파이프라인-수정사항)
+17. [Phase 8: 추론 파이프라인 버그 수정 + 개별 종목 매매](#17-phase-8-추론-파이프라인-버그-수정--개별-종목-매매)
 
 ---
 
@@ -877,27 +881,30 @@ python main.py train --start-phase 2 --config config/settings_fast.yaml
 | `learning_rate` | 1e-4 | Adam 학습률 |
 | `epochs` | 30 | 훈련 에포크 |
 
-### Transformer
+### Transformer (Phase 6 업데이트됨)
 
 | 파라미터 | 값 | 의미 |
 |---------|-----|------|
-| `d_model` | 128 | 모델 차원 |
+| `d_model` | **256** | 모델 차원 (128→256) |
 | `n_heads` | 8 | 멀티헤드 어텐션 수 |
-| `n_encoder_layers` | 4 | Transformer 레이어 수 |
-| `d_ff` | 512 | FFN 은닉층 크기 |
-| `prediction_horizon` | 5 | 예측 목표 (5일 후) |
-| `learning_rate` | 5e-5 | 학습률 (워밍업 포함) |
-| `epochs` | 25 | 훈련 에포크 |
+| `n_encoder_layers` | **6** | Transformer 레이어 수 (4→6) |
+| `d_ff` | **1024** | FFN 은닉층 크기 (512→1024) |
+| `prediction_horizon` | **1** | 예측 목표 (5일→1일, 단기 예측이 더 안정적) |
+| `learning_rate` | **3e-5** | 학습률 (5e-5→3e-5) |
+| `warmup_steps` | **1000** | Warmup (500→1000) |
+| `epochs` | **50** | 훈련 에포크 (25→50) |
 
-### GAN
+### GAN (Phase 4 업데이트됨)
 
 | 파라미터 | 값 | 의미 |
 |---------|-----|------|
 | `noise_dim` | 64 | Generator 입력 노이즈 차원 |
-| `generator_hidden_dims` | [128, 256, 128] | Generator 구조 |
+| `generator_hidden_dims` | **[64, 128, 64]** | Generator 구조 (과적합 방지, 축소됨) |
+| `spectral_norm` | **true** | Lipschitz 조건 강제 |
 | `learning_rate_g/d` | 5e-5 | 학습률 (1e-4에서 감소) |
-| `n_critic` | 5 | Discriminator 업데이트 횟수 |
+| `n_critic` | **10** | Discriminator 업데이트 횟수 (5→10) |
 | `gradient_penalty_weight` | 10.0 | GP 강도 λ |
+| `early_stopping_delta` | **5.0** | W-dist 상승 허용폭 (best+5 초과 시 조기 종료) |
 | `epochs` | 50 | 훈련 에포크 |
 
 ### PPO RL
@@ -951,73 +958,395 @@ kl_weight=0.01          lr=5e-5, 25ep             lr=5e-5, 50ep
                     [ensemble.pt]
 ```
 
-### 추론/백테스트 시
+### 추론/백테스트 시 (Phase 7 수정 반영)
 
 ```
-[Test Period Data: 180 days, 11 sectors]
+[Test Period Data: 180 days, 11 sectors × N tickers]
     ↓
 [ensemble.pt 로드]
+[sectors.yaml → sector_to_train_id 로드]  ← Bug 2 수정
     ↓
 For each test day t:
     For each sector s:
-        window = data[-60:t, sector_s]  (60일 롤링 창)
+        train_sector_id = sector_to_train_id[s]  ← Bug 2 수정
+        sector_id = torch.tensor([train_sector_id])
 
-        ① vae.encode(window) → latent_indicators (32-dim)
-        ② transformer(window, sector_id) → signal_embedding (128-dim)
-        ③ fusion([latent, signal_embed]) → prediction (scalar)
+        For each ticker in sector:               ← Bug 3 수정 (per-ticker)
+            window = ticker_data[-60:t]          ← 정확한 60일 단일 ticker
+            ① vae.encode(window) → latent (32-dim)
+            ② transformer(window, sector_id) → prediction (scalar)
+            ticker_preds.append(prediction)
 
-        model_signals[t, s] = prediction
+        model_signals[t, s] = mean(ticker_preds)  ← sector 평균
     ↓
-[신호 정규화]
-    shifted = row - row.min() + 1e-8
-    weights = shifted / shifted.sum()
-    → 항상 100% long (개선 예정: top-K 선택)
+[Top-K 정규화 (k=5)]
+    상위 5개 섹터만 양수 가중치, 나머지 0
+    normalize to sum=1
+    ↓
+[Alpha Blending]                                 ← Phase 7 추가
+    final = 0.4 × model_weights + 0.6 × equal_weight
     ↓
 [일별 리스크 차단기 (사전 필터)]
-    portfolio_value 시뮬레이션 → 차단기 적용
+    portfolio_value 시뮬레이션 → 5단계 차단기
     ↓
-[BacktestEngine.run()]
+[BacktestEngine.run()]                           ← Bug 1 수정 (state reset)
     주간 리밸런싱
     포트폴리오 최적화 → 리스크 관리 → 거래 비용 차감
     ↓
 [백테스트 결과]
-    Sharpe: 0.62 | MDD: -25.89% | Return: +29.9%
+    Sharpe: 2.03 | MDD: -4.30% | Return: +17.82%
     → results/equity_curve.png
     → results/backtest_report.html
 ```
 
 ---
 
-## 부록: 알려진 문제와 해결 방향
+## 15. 라이브 트레이딩 시스템
 
-### A. GAN 불안정 (W-dist 발산)
+**파일**: `broker/`, `live/`, `tracking/`, `scheduler/`, `dashboard/`
 
-**현상**: Epoch 1 (W-dist≈13) 이후 Epoch 2부터 발산 (40+)
-**원인**: Generator의 mode collapse — 실제 데이터 분포의 특정 모드만 생성
-**해결 방향**:
-1. GAN 조기 종료 (W-dist가 best+5 초과 시 중단)
-2. n_critic 증가 (5 → 10)
-3. Generator 구조 축소 ([128,256,128] → [64,128,64])
-4. Spectral Normalization 추가
+### 15.1 전체 아키텍처
 
-### B. RL 포트폴리오 폭발
-
-**현상**: 내부 평가 MDD=102%, portfolio_value 66조원
-**원인**: action이 simplex 제약 없음 → 레버리지 무제한
-**해결 방향**:
-```python
-action = np.clip(action, 0, None)
-if action.sum() > 0:
-    action = action / action.sum()  # simplex 투영
+```
+[InferencePipeline.generate_signals()]
+    ↓ sector_allocations + sector_top_tickers (섹터별 top-3 종목 + score)
+[DailyRunner.step_signal()]
+    ↓ top-K 정규화 + alpha blend (40% model + 60% EW)
+    → final_weights (11,), sector_top_tickers dict
+[DailyRunner.step_sell_check(sector_top_tickers)]
+    ↓ 보유 종목 중 오늘 양수 신호 없는 종목 → 즉시 매도
+[OrderGenerator.execute_rebalance(final_weights, sector_top_tickers)]
+    ↓ 현재 포지션 조회 → 개별 종목 목표 포지션 계산 → 매도 먼저 → 매수
+[KISApi.order_domestic() / order_overseas()]
+    ↓ 체결
+[TradeLogger.log_trade()]
+    → tracking/trades.db
 ```
 
-### C. 백테스트 항상 100% Long
+### 15.2 KIS API (`broker/kis_api.py`)
 
-**현상**: 하락 예상 섹터도 long 포지션
-**원인**: `row - row.min() + 1e-8` 처리로 모든 값 양수화
-**해결 방향**: 상위 3개 섹터만 투자 (음수 신호는 neutral 처리)
+```python
+# TR_ID: sandbox/production 모드별 다른 엔드포인트
+TR_IDS = {
+    "sandbox": {
+        "domestic_buy": "VTTC0802U", "domestic_sell": "VTTC0801U",
+        "balance_domestic": "VTTC8434R", ...
+    },
+    "production": {
+        "domestic_buy": "TTTC0802U", "domestic_sell": "TTTC0801U",
+        "balance_domestic": "TTTC8434R", ...
+    }
+}
+
+# OAuth2 토큰 캐싱 (24시간 유효)
+token = KISApi.get_token()  # disk cache → 재시작시 재발급 불필요
+```
+
+**설정**: `.env` 파일에 `KIS_APP_KEY`, `KIS_APP_SECRET`, `KIS_CANO`, `KIS_ACNT_PRDT_CD`
+
+### 15.3 개별 종목 선택 (`pipeline/inference_pipeline.py`)
+
+Phase 8에서 ETF 매매 → 개별 종목 매매로 전환.
+
+```python
+# 섹터당 ticker 예측값 계산
+ticker_scores = {}
+for ticker in tickers_in_sector:
+    tkr_df = sector_df[sector_df["ticker"] == ticker].sort_values("date")
+    window = tkr_df[feature_cols].values[-self.seq_length:]  # 60일 창
+    features = torch.FloatTensor(window).unsqueeze(0).to(device)
+    with torch.no_grad():
+        model_signals = self.ensemble.get_signals(features, sector_id_tensor)
+        ticker_scores[ticker] = model_signals["prediction"].cpu().item()
+
+# score 내림차순 정렬 → top-3, 양수만 (상승 신호 있는 종목만 매수)
+ranked = sorted(ticker_scores.items(), key=lambda x: x[1], reverse=True)
+top_tickers = [
+    {"ticker": t, "score": s, "market": "overseas" if not t.isdigit() else "domestic"}
+    for t, s in ranked[:3]
+    if s > 0
+]
+```
+
+**섹터별 자금 배분**:
+- 섹터 배분 금액 / top 종목 수 = 종목당 투자금액
+- 1종목당 최소 10만원 미만 → 1종목에 섹터 전액 집중
+- 동일 ticker가 여러 섹터 top-3에 등장 시 수량 합산
+
+### 15.4 일간 자동화 스케줄
+
+```
+06:00  DataCollector.collect_all(last 10 days)       증분 데이터 수집
+06:30  InferencePipeline.generate_signals()           모델 추론 → (weights, top_tickers)
+       DailyRunner.step_sell_check(top_tickers)        하락 신호 종목 즉시 매도
+08:50  OrderGenerator.execute_rebalance(weights, tickers)  평일 매일 리밸런싱
+16:00  DailyRunner.step_eod()                        종가 기록 + 성과 업데이트
+```
+
+**Phase 8 변경**: `08:50` 주문이 월요일 전용에서 **평일(월~금) 매일**로 변경.
+
+**토요일 22:00**: `RetrainRunner.run_weekly()` — Transformer Phase 3+ (~30분)
+**매월 1일**: `RetrainRunner.run_monthly()` — VAE Phase 2+ (~2시간)
+
+### 15.5 자동 재학습 + Rollback
+
+```python
+# 재학습 필요 조건 (should_retrain)
+if dir_acc < 0.48:     → weekly retrain  # 신호 정확도 저하
+if sharpe_14d < 0.5:   → weekly retrain  # 최근 성과 저하
+if mdd_14d < -0.10:    → monthly retrain # MDD 위험 수준
+
+# 재학습 후 품질 검증 (auto-rollback)
+if dir_acc_after < 0.48:
+    rollback_model()  # 가장 최근 backup에서 복원
+    # saved_models/backups/ 에 최근 5개 버전 보관
+```
+
+### 15.6 성과 모니터링 (`tracking/trade_log.py`)
+
+SQLite 4개 테이블:
+- `trades`: 거래 이력 (ticker, side, qty, price, sector, order_no)
+- `daily_performance`: 일별 성과 (portfolio_value, daily_return, sharpe_30d, mdd_cumul)
+- `model_signals`: 신호 이력 (sector, signal, weight, actual_return) — 방향 정확도 계산용
+- `retrain_log`: 재학습 이력 (trigger, duration_sec, dir_acc, val_loss)
+
+### 15.7 Streamlit 대시보드
+
+실행: `streamlit run dashboard/app.py` → http://localhost:8501
+
+- 포트폴리오 가치 / 누적 수익률 / 30일 Sharpe / MDD / 승률
+- 수익 곡선 vs Equal-weight 벤치마크 (Plotly)
+- 섹터 배분 파이 차트 (최신 신호 기준)
+- 방향 예측 정확도 게이지 (기준: 50%)
+- 일별 수익률 바 차트 (녹색/적색)
+- 최근 거래 내역 테이블
+- 재학습 이력 테이블
+
+---
+
+## 16. 신호 생성 파이프라인 수정사항
+
+Phase 7에서 수정된 **3개의 핵심 버그** 및 **Alpha Blending 추가**:
+
+### 16.1 Bug 1: RiskManager 상태 오염 (`backtest/engine.py`)
+
+```python
+# 수정 전: 두 번의 run() 호출이 같은 RiskManager 인스턴스 공유
+# → baseline run이 model run의 peak_value를 물려받아 결과 오염
+
+# 수정 후: 각 run() 시작 시 state 초기화
+def run(self, ...):
+    self.risk_mgr.peak_value = 0.0    # ← 추가
+    self.risk_mgr.daily_pnl = 0.0     # ← 추가
+    self.risk_mgr.is_risk_off = False  # ← 추가
+    ...
+```
+
+### 16.2 Bug 2: sector_id 항상 0 (`main.py`, `inference_pipeline.py`)
+
+```python
+# 수정 전: 모든 섹터에 Energy(0) 임베딩 적용
+sector_id = torch.tensor([0], dtype=torch.long)
+
+# 수정 후: sectors.yaml 키 순서 = 훈련 시 id
+with open("config/sectors.yaml") as f:
+    sectors_cfg = yaml.safe_load(f)
+sector_to_train_id = {
+    name: idx for idx, name in enumerate(sectors_cfg["sectors"].keys())
+}
+# → energy=0, materials=1, industrials=2, ...
+train_sector_id = sector_to_train_id.get(sector, 0)
+sector_id = torch.tensor([train_sector_id], dtype=torch.long)
+```
+
+### 16.3 Bug 3: Ticker 혼합 행 (`main.py`, `inference_pipeline.py`)
+
+```python
+# 수정 전: sector_data (N_tickers × N_days 행)에서 tail(60)
+# → 6일 × 10 ticker = 60행 (60일 시퀀스가 아님!)
+sector_data = df[df["sector"] == sector].tail(seq_length)
+features = torch.FloatTensor(sector_data[feature_cols].values)
+
+# 수정 후: ticker별 독립적으로 60일 시퀀스 구성 → 평균
+for ticker in tickers_in_sector:
+    tkr_df = sector_df[sector_df["ticker"] == ticker].sort_values("date")
+    window = tkr_df[feature_cols].values[-60:]  # 정확한 60일
+    features = torch.FloatTensor(window).unsqueeze(0)
+    prediction = ensemble.get_signals(features, sector_id)["prediction"]
+    ticker_preds.append(prediction.item())
+sector_signal = np.mean(ticker_preds)
+```
+
+### 16.4 Alpha Blending 추가 (`main.py`, `scheduler/daily_runner.py`)
+
+```python
+# 순수 모델 신호는 상위 섹터에 집중 → equal-weight 대비 열세
+# Grid search: alpha=0.4 (40% model + 60% equal-weight) 최적
+
+# top-K 정규화 (모델 신호 처리)
+top_k = 5
+top_indices = np.argsort(raw_weights)[-top_k:]
+model_weights = np.zeros(n_sectors)
+for idx in top_indices:
+    if raw_weights[idx] > 0:
+        model_weights[idx] = raw_weights[idx]
+model_weights /= model_weights.sum()
+
+# alpha blending
+equal_weight = np.ones(n_sectors) / n_sectors
+final_weights = 0.4 * model_weights + 0.6 * equal_weight
+```
+
+**효과**: Sharpe 1.51 (pure model) → **2.03** (alpha=0.4)
+
+---
+
+## 17. Phase 8: 추론 파이프라인 버그 수정 + 개별 종목 매매
+
+**파일**: `pipeline/inference_pipeline.py`, `live/signal_to_order.py`, `scheduler/daily_runner.py`
+
+### 17.1 체크포인트 Shape 자동 감지
+
+훈련 시 사용된 하이퍼파라미터와 추론 시 기본값 불일치 문제를 체크포인트에서 직접 읽어 해결:
+
+```python
+# VAE n_features 자동 감지
+ckpt = torch.load(path, map_location="cpu", weights_only=False)
+flat_dim = ckpt["vae"]["encoder.network.0.weight"].shape[1]
+n_features = flat_dim // seq_length    # 2040 // 60 = 34
+
+# RL state_dim 자동 감지
+rl_first_w = next(v for k, v in ckpt["rl_policy"].items() if "weight" in k)
+rl_state_dim = rl_first_w.shape[1]    # PPO 첫 번째 Linear 입력 크기
+
+# Transformer sector_embed_dim 명시적 전달
+transformer = TemporalTransformer(
+    ...,
+    sector_embed_dim=tf_cfg.get("sector_embed_dim", 32),  # config에서 읽기
+)
+```
+
+### 17.2 DataProcessor 추론 모드 설정
+
+```python
+# 훈련 시: min_history_days=500 (5년치 기준)
+# 추론 시: seq_length=60 (마지막 60일만 필요)
+self.processor = DataProcessor(
+    min_history_days=self.config["data"]["sequence_length"]  # 60
+)
+```
+
+### 17.3 Sector Column 처리
+
+추론 시 새로 수집한 OHLCV 데이터에는 sector 컬럼이 없으므로 훈련 데이터에서 로드:
+
+```python
+if "sector" not in df.columns:
+    processed_path = Path("data/processed/processed_data.parquet")
+    if processed_path.exists():
+        ticker_sector = (
+            pd.read_parquet(processed_path, columns=["ticker", "sector"])
+            .drop_duplicates("ticker")
+            .set_index("ticker")["sector"]
+        )
+        df["sector"] = df["ticker"].map(ticker_sector).fillna("unknown")
+```
+
+### 17.4 개별 종목 목표 포지션 계산 (`live/signal_to_order.py`)
+
+```python
+def _compute_target_positions(self, weights, portfolio_value, sector_top_tickers):
+    for i, sector in enumerate(self.sectors):
+        if weights[i] < 1e-4:
+            continue
+        sector_amount = portfolio_value * weights[i]
+        top_tickers = sector_top_tickers.get(sector, [])
+        if not top_tickers:
+            continue   # 해당 섹터 양수 신호 종목 없으면 패스
+
+        # 종목 수에 따라 균등 분배
+        per_ticker_amount = sector_amount / len(top_tickers)
+        if per_ticker_amount < self.min_order_amount:
+            top_tickers = top_tickers[:1]  # 소액이면 1종목 집중
+            per_ticker_amount = sector_amount
+
+        for tkr_info in top_tickers:
+            ticker = tkr_info["ticker"]
+            current_price = self.api.get_domestic_price(ticker)["price"]
+            qty = int(per_ticker_amount / current_price)
+            if qty >= 1:
+                targets[ticker] = {
+                    "target_qty": qty,
+                    "target_amount": per_ticker_amount,
+                    ...
+                }
+```
+
+### 17.5 하락 신호 즉시 매도 (`execute_sell_check`)
+
+매일 06:30 신호 생성 직후 실행:
+
+```python
+def execute_sell_check(self, sector_top_tickers):
+    # 오늘 양수 신호 있는 ticker 집합
+    positive_tickers = {
+        t["ticker"]
+        for tickers in sector_top_tickers.values()
+        for t in tickers
+    }
+    # 보유 중인데 양수 신호 없는 종목 → 즉시 매도
+    for ticker, pos in self._get_current_positions().items():
+        if pos["qty"] > 0 and ticker not in positive_tickers:
+            self._submit_order({"side": "sell", "qty": pos["qty"], ...})
+```
+
+### 17.6 일간 리밸런싱 흐름 요약
+
+```
+매일 06:30:
+  step_signal() → (final_weights, sector_top_tickers)
+  step_sell_check(sector_top_tickers)
+    → 하락 신호 종목 전량 매도 → 현금 확보
+
+매일 08:50:
+  step_order(final_weights, sector_top_tickers)
+    ↓ execute_rebalance()
+    1. _validate_weights()         가중치 검증 + cash_buffer(5%) 적용
+    2. _get_current_positions()    현재 보유 종목/수량 조회
+    3. _compute_target_positions() 개별 종목 목표 수량 계산
+    4. _compute_orders()           현재 vs 목표 비교 → 주문 목록
+       (amount_diff < 3% → skip / 매도 먼저 → 매수)
+    5. _is_daily_loss_exceeded()   일간 -3% 초과 시 중단
+    6. _submit_order()             KIS API 실제 주문
+```
+
+---
+
+## 부록: 알려진 문제와 해결 방향
+
+### A. GAN 불안정 (부분 해결)
+
+**현상**: Epoch 1 best (W-dist≈6.66), 이후 점진적 상승
+**현재 상태**: Spectral Norm + n_critic=10 + 구조 축소로 발산 패턴 개선 (13→6.66)
+**잔존 문제**: 여전히 epoch마다 W-dist 증가 추세. mode collapse 근본 미해결.
+**다음 시도**: Progressive GAN 또는 Diffusion 기반 시장 시뮬레이터
+
+### B. RL 포트폴리오 폭발 (해결됨)
+
+**현상**: portfolio_value 66조원까지 폭발 (해결 전)
+**해결**: simplex 투영 (long-only, 합=1) + reward clipping ±10 → best_reward 1.75→4.75
+
+### C. 백테스트 신호 생성 개선 이력
+
+**이전**: softmax 정규화 → 항상 100% long (하락장 회피 불가)
+**현재**: top-K (k=5) + alpha blending (0.4/0.6) → MDD 개선됨
+
+### D. 섹터 정보 일관성 (해결됨)
+
+**이전**: 백테스트에서 alphabetical sort, 추론에서 YAML 키 순서 → 섹터 임베딩 오인식
+**현재**: 모든 경로에서 `sectors.yaml` 키 순서를 training-time id로 사용
 
 ---
 
 *이 문서는 실제 소스 코드를 기반으로 작성되었습니다.*
-*마지막 업데이트: 2026-02-21*
+*마지막 업데이트: 2026-02-21 (Phase 7)*

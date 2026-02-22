@@ -17,22 +17,22 @@ vae:
   l2_weight: 1.0e-5
 
 transformer:
-  d_model: 128
+  d_model: 256          # 128 → 256 (더 많은 표현력)
   n_heads: 8
-  n_encoder_layers: 4
-  d_ff: 512
+  n_encoder_layers: 6   # 4 → 6 (더 깊은 모델)
+  d_ff: 1024            # 512 → 1024 (d_model 2배에 맞게)
   dropout: 0.1
   max_seq_length: 60
   input_dim: null
   output_dim: 1
-  prediction_horizon: 5
-  learning_rate: 5.0e-5
+  prediction_horizon: 1 # 5 → 1 (단기 예측이 더 예측 가능)
+  learning_rate: 3.0e-5 # 5e-5 → 3e-5 (큰 모델에 작은 LR)
   batch_size: 32
-  epochs: 25            # Reduced from 80
-  warmup_steps: 500     # Reduced from 1000
+  epochs: 50            # 25 → 50 (더 많은 학습)
+  warmup_steps: 1000    # 500 → 1000 (큰 모델에 더 긴 warmup)
   use_sector_attention: true
   n_sectors: 11
-  sector_embed_dim: 32
+  sector_embed_dim: 64  # 32 → 64 (d_model 증가에 맞게)
 
 gan:
   generator_hidden_dims: [64, 128, 64]   # [128,256,128] → 축소 (mode collapse 방지)
@@ -69,6 +69,7 @@ rl:
   drawdown_penalty: 5.0
   window_size: 60
   vol_target: 0.15
+  episode_length: 252    # Random 252-day windows per episode (prevents overfitting)
 
 ensemble:
   vae_weight: 0.25
