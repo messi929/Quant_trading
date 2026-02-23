@@ -90,25 +90,20 @@ execution:
   score_cost_threshold:  0.0      # 모델 score 범위 0.001~0.011 → 임계값 비활성화
 
 schedule:
+  # ── 공통 ────────────────────────────────────────────────────────────
+  # NASDAQ은 KST 06:00에 마감 → 06:00 수집에 전일 종가 포함
+  data_collect_time:   "06:00"    # KR + US 전일 종가 수집
+
+  # ── 미국 장: NASDAQ 종가 직후 1회 주문 ──────────────────────────────
+  us_order_time:       "06:10"    # 신호 재생성 + 해외 종목 전량 주문 (100%, TWAP 없음)
+
   # ── 한국 장 (KST 09:00~15:30) ──────────────────────────────────────
-  data_collect_time:   "06:00"
   signal_gen_time:     "06:30"
   kr_order_waves:
     wave1:             "09:10"    # 40% — 한국 장 시작 10분 후
     wave2:             "11:00"    # 35% — 오전 중반
     wave3:             "13:30"    # 25% — 오후 장
   eod_record_time:     "16:00"
-
-  # ── 미국 장 (KST 23:30~06:00, EST 09:30~16:00) ─────────────────────
-  # 각 Wave 직전에 신호 재생성 (re-score) 후 주문
-  us_order_waves:
-    wave1_signal:      "23:20"    # Wave 1 전 재수집 + 재신호
-    wave1:             "23:40"    # 40% — 미국 장 시작 10분 후
-    wave2_signal:      "01:50"    # Wave 2 전 재신호 (수집 생략)
-    wave2:             "02:00"    # 35% — 미국 오전 중반
-    wave3_signal:      "04:20"    # Wave 3 전 재신호
-    wave3:             "04:30"    # 25% — 미국 오후 장
-  us_eod_time:         "06:10"    # 미국 장 마감 후 성과 기록
 
 logging:
   trade_log_db: "tracking/trades.db"

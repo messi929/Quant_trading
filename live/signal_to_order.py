@@ -34,7 +34,8 @@ from tracking.trade_log import TradeLogger
 TRANSACTION_COST_RATE = 0.006
 
 # TWAP 웨이브별 실행 비율 (합=1.0)
-TWAP_FRACTIONS = {1: 0.40, 2: 0.35, 3: 0.25}
+# None = 단일 실행 (100%, TWAP 없음)
+TWAP_FRACTIONS = {None: 1.00, 1: 0.40, 2: 0.35, 3: 0.25}
 
 # 분할 실행 기준 금액 (이상이면 TWAP, 미만이면 Wave 1에서 전량)
 TWAP_THRESHOLD = 500_000  # 50만원

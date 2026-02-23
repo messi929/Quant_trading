@@ -1,11 +1,12 @@
 """일간 자동 실행 스케줄러.
 
-매일 아침 실행 순서:
-  06:00 - 데이터 수집 (yfinance + pykrx)
-  06:30 - 모델 추론 → 섹터 신호 생성 + 하락 신호 즉시 매도
-  09:10 - TWAP Wave 1 (40%) — 장 시작 10분 후
-  11:00 - TWAP Wave 2 (35%) — 오전 중반
-  13:30 - TWAP Wave 3 (25%) — 오후 장
+매일 실행 순서:
+  06:00 - 데이터 수집 (yfinance + pykrx, NASDAQ 전일 종가 포함)
+  06:10 - [US] NASDAQ 종가 기반 신호 생성 + 해외 종목 주문 (1회, 100%)
+  06:30 - [KR] 신호 생성 + 하락 신호 즉시 매도
+  09:10 - [KR] TWAP Wave 1 (40%) — 장 시작 10분 후
+  11:00 - [KR] TWAP Wave 2 (35%) — 오전 중반
+  13:30 - [KR] TWAP Wave 3 (25%) — 오후 장
   16:00 - 종가 기록 + 성과 업데이트
 
 실행 방법:
@@ -374,74 +375,54 @@ class DailyRunner:
         top_tickers = getattr(self, "_last_top_tickers", {})
         self.step_order(weights, top_tickers, twap_wave=twap_wave, market_filter="domestic")
 
-    def _daemon_us_signal(self, collect: bool = False):
-        """데몬용: 미국 장 중 신호 재생성 (re-score).
+    def _daemon_us_order(self):
+        """데몬용: NASDAQ 종가 직후 (06:10) 해외 종목 주문.
 
-        Args:
-            collect: True이면 데이터 재수집 후 신호 생성 (Wave 1 전),
-                     False이면 수집 생략하고 신호만 재생성 (Wave 2/3 전)
+        06:00 수집 완료 직후 실행 → NASDAQ 전일 종가 기반 신선한 신호로 해외 주문 1회.
+        캐시 무시(use_cache=False)하여 방금 수집한 데이터로 재추론.
         """
-        if collect:
-            try:
-                self.step_collect()
-            except Exception as e:
-                logger.warning(f"US 재수집 실패 (신호 생성은 계속): {e}")
-        weights, top_tickers = self.step_signal()
-        self._us_weights     = weights
-        self._us_top_tickers = top_tickers
-        logger.info("미국 장 re-score 완료")
-
-    def _daemon_us_order(self, twap_wave: int = 1):
-        """데몬용: 해외(US) 종목만 TWAP 파별 주문 (re-score된 신호 사용)."""
-        weights     = getattr(self, "_us_weights",     getattr(self, "_last_weights",     np.ones(11) / 11))
-        top_tickers = getattr(self, "_us_top_tickers", getattr(self, "_last_top_tickers", {}))
-        self.step_order(weights, top_tickers, twap_wave=twap_wave, market_filter="overseas")
+        logger.info("=== [US] NASDAQ 종가 기반 신호 생성 + 해외 주문 (1회) ===")
+        try:
+            # 캐시 무시 — 06:00 수집 데이터로 신선한 신호 생성
+            weights, top_tickers = self.step_signal(use_cache=False)
+            # KR 신호 생성(06:30)에서도 이 결과를 재사용하도록 저장
+            self._last_weights     = weights
+            self._last_top_tickers = top_tickers
+            # 해외 보유 종목 하락 신호 매도
+            self.step_sell_check(top_tickers)
+            # 해외 종목 단일 실행 (twap_wave=None → 100%)
+            self.step_order(weights, top_tickers, twap_wave=None, market_filter="overseas")
+        except Exception as e:
+            logger.error(f"[US] 주문 실패: {e}")
 
     def run_daemon(self):
-        """스케줄러 데몬: 한국/미국 장 별도 스케줄 (TWAP 3-파)."""
+        """스케줄러 데몬: NASDAQ 종가 직후 US 1회 + 한국 장 TWAP 3-파."""
         import schedule
 
-        sc   = self.cfg["schedule"]
-        kr   = sc["kr_order_waves"]
-        us   = sc["us_order_waves"]
+        sc = self.cfg["schedule"]
+        kr = sc["kr_order_waves"]
+
+        # ── 데이터 수집 (KR + US 공통) ───────────────────────────────
+        schedule.every().day.at(sc["data_collect_time"]).do(self.step_collect)
+
+        # ── 미국 장: NASDAQ 종가 직후 1회 주문 ───────────────────────
+        schedule.every().day.at(sc["us_order_time"]).do(self._daemon_us_order)
 
         # ── 한국 장 ───────────────────────────────────────────────────
-        schedule.every().day.at(sc["data_collect_time"]).do(self.step_collect)
         schedule.every().day.at(sc["signal_gen_time"]).do(self._daemon_signal_and_sell)
         schedule.every().day.at(kr["wave1"]).do(lambda: self._daemon_kr_order(twap_wave=1))
         schedule.every().day.at(kr["wave2"]).do(lambda: self._daemon_kr_order(twap_wave=2))
         schedule.every().day.at(kr["wave3"]).do(lambda: self._daemon_kr_order(twap_wave=3))
         schedule.every().day.at(sc["eod_record_time"]).do(self.step_eod)
 
-        # ── 미국 장 (re-score → 주문) ─────────────────────────────────
-        schedule.every().day.at(us["wave1_signal"]).do(
-            lambda: self._daemon_us_signal(collect=True)   # Wave 1 전: 재수집 + 재신호
-        )
-        schedule.every().day.at(us["wave1"]).do(lambda: self._daemon_us_order(twap_wave=1))
-        schedule.every().day.at(us["wave2_signal"]).do(
-            lambda: self._daemon_us_signal(collect=False)  # Wave 2/3 전: 재신호만
-        )
-        schedule.every().day.at(us["wave2"]).do(lambda: self._daemon_us_order(twap_wave=2))
-        schedule.every().day.at(us["wave3_signal"]).do(
-            lambda: self._daemon_us_signal(collect=False)
-        )
-        schedule.every().day.at(us["wave3"]).do(lambda: self._daemon_us_order(twap_wave=3))
-        schedule.every().day.at(sc["us_eod_time"]).do(self.step_eod)
-
-        logger.info("스케줄러 데몬 시작 (한국/미국 분리 TWAP 3-파):")
-        logger.info(f"  [KR] 데이터 수집: {sc['data_collect_time']}")
-        logger.info(f"  [KR] 신호 생성:   {sc['signal_gen_time']}")
-        logger.info(f"  [KR] Wave 1:      {kr['wave1']} (40%, domestic)")
-        logger.info(f"  [KR] Wave 2:      {kr['wave2']} (35%, domestic)")
-        logger.info(f"  [KR] Wave 3:      {kr['wave3']} (25%, domestic)")
-        logger.info(f"  [KR] EOD:         {sc['eod_record_time']}")
-        logger.info(f"  [US] re-score+수집: {us['wave1_signal']}")
-        logger.info(f"  [US] Wave 1:      {us['wave1']} (40%, overseas)")
-        logger.info(f"  [US] re-score:    {us['wave2_signal']}")
-        logger.info(f"  [US] Wave 2:      {us['wave2']} (35%, overseas)")
-        logger.info(f"  [US] re-score:    {us['wave3_signal']}")
-        logger.info(f"  [US] Wave 3:      {us['wave3']} (25%, overseas)")
-        logger.info(f"  [US] EOD:         {sc['us_eod_time']}")
+        logger.info("스케줄러 데몬 시작 (NASDAQ 종가 직후 US 1회 + KR TWAP 3-파):")
+        logger.info(f"  {sc['data_collect_time']} 데이터 수집 (KR + US 전일 종가)")
+        logger.info(f"  {sc['us_order_time']} [US] NASDAQ 종가 신호 + 해외 주문 (1회, 100%)")
+        logger.info(f"  {sc['signal_gen_time']} [KR] 신호 생성 + 하락 매도")
+        logger.info(f"  {kr['wave1']} [KR] Wave 1 (40%, domestic)")
+        logger.info(f"  {kr['wave2']} [KR] Wave 2 (35%, domestic)")
+        logger.info(f"  {kr['wave3']} [KR] Wave 3 (25%, domestic)")
+        logger.info(f"  {sc['eod_record_time']} EOD 기록")
 
         while True:
             schedule.run_pending()
