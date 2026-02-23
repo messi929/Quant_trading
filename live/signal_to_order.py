@@ -137,8 +137,9 @@ class OrderGenerator:
                 if market == "domestic":
                     p = float(api.get_domestic_price(ticker)["price"])
                 else:
-                    exch = exchange[:3] if exchange else "NAS"
-                    p = float(api.get_overseas_price(ticker, exch)["price"])
+                    import yfinance as yf
+                    p = yf.Ticker(ticker).fast_info.last_price
+                    logger.info(f"{ticker} 호가 yfinance 폴백: ${p:.2f}")
             except Exception:
                 raise
             bid = ask = p
@@ -312,8 +313,12 @@ class OrderGenerator:
         self,
         sector_weights: np.ndarray,
         sector_top_tickers: dict = None,
+        market_filter: str = None,
     ) -> list[dict]:
         """모델 섹터 가중치로 리밸런싱 실행.
+
+        Args:
+            market_filter: None=전체, "domestic"=국내만, "overseas"=해외만
 
         Phase B: twap_wave에 따라 매수 수량 분할
           - 매도는 항상 즉시 전량 (리스크 우선)
@@ -325,6 +330,12 @@ class OrderGenerator:
         target_positions  = self._compute_target_positions(
             weights, portfolio_value, sector_top_tickers
         )
+        # market_filter 적용: 지정 시장 종목만 주문
+        if market_filter:
+            target_positions = {
+                t: v for t, v in target_positions.items()
+                if v.get("market") == market_filter
+            }
         orders = self._compute_orders(current_positions, target_positions)
 
         if not orders:
@@ -393,10 +404,14 @@ class OrderGenerator:
                     if order["market"] == "domestic":
                         p = float(api.get_domestic_price(order["ticker"])["price"])
                     else:
-                        exch = order.get("exchange", "NAS")
-                        p = float(api.get_overseas_price(
-                            order["ticker"], exch[:3]
-                        )["price"])
+                        try:
+                            exch = order.get("exchange", "NAS")
+                            p = float(api.get_overseas_price(
+                                order["ticker"], exch[:3]
+                            )["price"])
+                        except Exception:
+                            import yfinance as yf
+                            p = yf.Ticker(order["ticker"]).fast_info.last_price
                     required = p * wave_qty
                 except Exception:
                     required = 0
@@ -460,8 +475,11 @@ class OrderGenerator:
             b = self.api_domestic.get_domestic_balance()
             total += b.get("total_eval", 0) + b.get("cash", 0)
         if self.execution_market in ("nasdaq", "split"):
-            b = self.api_overseas.get_overseas_balance()
-            total += b.get("total_eval", 0) + b.get("cash", 0)
+            try:
+                b = self.api_overseas.get_overseas_balance()
+                total += b.get("total_eval", 0) + b.get("cash", 0)
+            except Exception as e:
+                logger.warning(f"해외 잔고 조회 실패 (sandbox 미지원일 수 있음): {e}")
         if total < self.total_capital * 0.1:
             logger.warning(f"포트폴리오 가치 낮음: {total:,.0f}")
             return self.total_capital
@@ -545,14 +563,24 @@ class OrderGenerator:
                     if market == "domestic":
                         price_info = api.get_domestic_price(ticker)
                         exchange   = ""
+                        current_price = float(price_info["price"])
                     else:
                         exchange   = tkr_info.get("exchange", "NASD")
-                        price_info = api.get_overseas_price(
-                            ticker, exchange[:3] if exchange else "NAS"
-                        )
-                    current_price = float(price_info["price"])
+                        try:
+                            price_info    = api.get_overseas_price(
+                                ticker, exchange[:3] if exchange else "NAS"
+                            )
+                            current_price = float(price_info["price"])
+                        except Exception:
+                            import yfinance as yf
+                            current_price = yf.Ticker(ticker).fast_info.last_price
+                            logger.info(f"{ticker} KIS 시세 불가 → yfinance 폴백: ${current_price:.2f}")
                 except Exception as e:
                     logger.warning(f"{ticker} 현재가 조회 실패: {e}")
+                    continue
+
+                if current_price <= 0:
+                    logger.warning(f"{ticker} 현재가 0 또는 음수 → 스킵")
                     continue
 
                 qty = int(per_ticker_amount / current_price)

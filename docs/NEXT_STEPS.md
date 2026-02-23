@@ -1,12 +1,27 @@
 # Next Steps - 다음 작업 로드맵
 
-**최종 업데이트**: 2026-02-22 (Phase 10: Hetzner Cloud 서버 배포 + systemd 데몬)
+**최종 업데이트**: 2026-02-23 (Phase 11: 개별 종목 매매 활성화 + KR/US 분리 스케줄)
 **현재 성과**: Sharpe **2.03**, MDD **-4.30%**, Return **+17.82%** (기준선: Sharpe 1.82, +15.87%)
-**라이브 시스템**: Hetzner 서버 배포 완료, systemd 데몬 실행 중. sandbox 실제 체결 테스트 필요.
+**라이브 시스템**: Hetzner 서버 배포 완료, KR/US 이중 스케줄 데몬 실행 중. 평일 장 중 국내 주문 체결 확인 필요.
 
 ---
 
 ## 완료된 작업 전체 이력
+
+### ✅ Phase 11: 개별 종목 매매 활성화 + KR/US 분리 스케줄 (2026-02-23)
+
+- **버그 수정 4건**:
+  - `OverflowError` 방지: `current_price <= 0` 종목 스킵 (`live/signal_to_order.py`)
+  - `execution_market: "kospi"` → `"split"` 수정 (KODEX ETF → 개별 종목 활성화)
+  - KIS sandbox 해외주식 시세 API 404 → **yfinance 폴백** 3곳 적용 (AAPL $264.58 검증 ✅)
+  - 해외 잔고 API 500 오류 → try/except graceful handling
+- **KR/US 분리 스케줄 구현** (`scheduler/daily_runner.py`):
+  - `_daemon_kr_order(wave)`: 국내 종목 전용 (market_filter="domestic")
+  - `_daemon_us_signal(collect)`: US Wave 전 신호 재생성 (Wave1은 재수집 포함)
+  - `_daemon_us_order(wave)`: 해외 종목 전용 (market_filter="overseas")
+- **live_config.yaml 재구성**: `order_waves` → `kr_order_waves` + `us_order_waves` 분리
+- **execute_rebalance `market_filter` 파라미터 추가**: 국내/해외 주문 선택 실행
+- **Hetzner 서버 배포 완료**: `git pull` + `systemctl restart quant-trading` ✅
 
 ### ✅ Phase 10: Hetzner Cloud 서버 배포 (2026-02-22)
 
@@ -91,14 +106,14 @@
 
 ## 다음 우선순위
 
-### 🔴 우선순위 1: KIS API sandbox 주문 테스트 (평일 장 중)
+### 🔴 우선순위 1: KIS API sandbox 국내 주문 체결 테스트 (평일 장 중)
 
-> 서버 데몬이 이미 실행 중 (`77.42.78.9`). 평일 장 시간에 로그 확인 필요.
+> 서버 데몬이 이미 실행 중 (`77.42.78.9`). 평일 09:10~15:30 에 로그 확인.
+> KR Wave: 09:10(40%) / 11:00(35%) / 13:30(25%) 자동 실행됨.
 
 ```bash
 # 서버 로그 실시간 확인
-ssh root@77.42.78.9
-tail -f /var/log/quant-trading.log
+ssh root@77.42.78.9 "tail -f /var/log/quant-trading.log"
 ```
 
 **완료된 항목**:
@@ -107,12 +122,15 @@ tail -f /var/log/quant-trading.log
 - [x] `python scheduler/daily_runner.py --step signal` 정상 실행 확인
 - [x] 섹터별 가중치 생성 확인 (sum ≈ 1.0, 최솟값 0.0545 = 0.6/11 블렌딩 최솟값)
 - [x] 지정가 주문 + TWAP 3-파 + 긴급도 + 비용임계 주문 체계 구현 완료
+- [x] execution_market="split" — 개별 종목 매매 활성화
+- [x] yfinance 폴백 — KIS sandbox 해외 시세 미지원 해결
+- [x] KR/US 분리 스케줄 배포 완료
 
 **남은 항목**:
 
 ```bash
-# 1. sandbox Wave 1 주문 테스트 (지정가, 09:10 로직, 실제 체결 안 됨)
-python scheduler/daily_runner.py --step order --wave 1
+# 1. 평일 장 중 KR Wave 1 주문 sandbox 체결 확인 (자동 실행 09:10)
+ssh root@77.42.78.9 "grep 'Wave 1\|order\|체결' /var/log/quant-trading.log | tail -50"
 
 # 2. 호가창 조회 확인 (지정가 가격 산출)
 # KISApi.get_domestic_bid_ask("005930")  # 삼성전자 테스트
@@ -121,8 +139,8 @@ python scheduler/daily_runner.py --step order --wave 1
 # KISApi.get_pending_orders()
 # KISApi.cancel_order(order_no, ticker, side, qty)
 
-# 4. 종가 기록 테스트
-python scheduler/daily_runner.py --step eod
+# 4. US Wave 체결 확인 (자동 실행 KST 23:40)
+ssh root@77.42.78.9 "grep 'US\|overseas\|yfinance' /var/log/quant-trading.log | tail -20"
 
 # 5. 대시보드 확인
 streamlit run dashboard/app.py
@@ -132,10 +150,13 @@ streamlit run dashboard/app.py
 - [x] KIS API 인증 (.env 설정 완료)
 - [x] 섹터 배분 신호 합 ≈ 1.0
 - [x] Phase A~D 주문 로직 구현 완료
+- [x] 개별 종목 매매 활성화 (execution_market="split")
+- [x] 해외 종목 yfinance 폴백 (sandbox 제약 해결)
 - [ ] `get_domestic_bid_ask()` 호가 조회 정상 반환 확인
 - [ ] `get_pending_orders()` 미체결 목록 조회 확인
 - [ ] `cancel_order()` 취소 정상 작동 확인
-- [ ] Wave 1 지정가 주문 sandbox 체결 확인
+- [ ] KR Wave 1 지정가 주문 sandbox 체결 확인
+- [ ] US Wave 1 해외 주문 실행 확인 (KST 23:40)
 - [ ] 대시보드에서 포트폴리오 가치 갱신 확인
 
 ---

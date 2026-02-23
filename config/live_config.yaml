@@ -57,7 +57,7 @@ trading:
     real_estate:             "XLRE"
 
   # 어느 시장으로 섹터를 실행할지
-  execution_market: "kospi"    # "kospi" | "nasdaq" | "split"
+  execution_market: "split"    # "kospi" | "nasdaq" | "split"
   # split: 모델 signal이 KOSPI/NASDAQ 혼합이므로
   #        가중치를 절반씩 양 시장에 투자
 
@@ -90,14 +90,25 @@ execution:
   score_cost_threshold:  0.0      # 모델 score 범위 0.001~0.011 → 임계값 비활성화
 
 schedule:
+  # ── 한국 장 (KST 09:00~15:30) ──────────────────────────────────────
   data_collect_time:   "06:00"
   signal_gen_time:     "06:30"
-  # TWAP 3-파 주문 (단일 08:50 → 3개 시간대로 분산)
-  order_waves:
-    wave1:             "09:10"    # 40% — 장 시작 10분 후 (갭 안정화 대기)
+  kr_order_waves:
+    wave1:             "09:10"    # 40% — 한국 장 시작 10분 후
     wave2:             "11:00"    # 35% — 오전 중반
     wave3:             "13:30"    # 25% — 오후 장
-  eod_record_time:     "16:00"  # 종가 기록
+  eod_record_time:     "16:00"
+
+  # ── 미국 장 (KST 23:30~06:00, EST 09:30~16:00) ─────────────────────
+  # 각 Wave 직전에 신호 재생성 (re-score) 후 주문
+  us_order_waves:
+    wave1_signal:      "23:20"    # Wave 1 전 재수집 + 재신호
+    wave1:             "23:40"    # 40% — 미국 장 시작 10분 후
+    wave2_signal:      "01:50"    # Wave 2 전 재신호 (수집 생략)
+    wave2:             "02:00"    # 35% — 미국 오전 중반
+    wave3_signal:      "04:20"    # Wave 3 전 재신호
+    wave3:             "04:30"    # 25% — 미국 오후 장
+  us_eod_time:         "06:10"    # 미국 장 마감 후 성과 기록
 
 logging:
   trade_log_db: "tracking/trades.db"

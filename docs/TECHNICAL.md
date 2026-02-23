@@ -1,8 +1,8 @@
 # Alpha Signal Discovery Engine - 기술 상세 문서
 
-**버전**: 2026-02-22 (Phase 10: Hetzner Cloud 배포)
+**버전**: 2026-02-23 (Phase 11: 개별 종목 매매 활성화 + KR/US 분리 스케줄)
 **현재 최고 성과**: Sharpe **2.03**, MDD **-4.30%**, Return **+17.82%** (기준선 대비 +0.21 Sharpe)
-**배포 상태**: Hetzner Cloud `77.42.78.9` systemd 데몬 실행 중 (KST 기준 일간 자동화)
+**배포 상태**: Hetzner Cloud `77.42.78.9` systemd 데몬 실행 중 (KR 장 + US 장 분리 스케줄)
 
 ---
 
@@ -25,6 +25,7 @@
 15. [라이브 트레이딩 시스템](#15-라이브-트레이딩-시스템)
 16. [신호 생성 파이프라인 수정사항](#16-신호-생성-파이프라인-수정사항)
 17. [Phase 8: 추론 파이프라인 버그 수정 + 개별 종목 매매](#17-phase-8-추론-파이프라인-버그-수정--개별-종목-매매)
+18. [Phase 11: KR/US 분리 스케줄 + 해외 시세 yfinance 폴백](#18-phase-11-krus-분리-스케줄--해외-시세-yfinance-폴백)
 
 ---
 
@@ -1073,20 +1074,33 @@ top_tickers = [
 - 1종목당 최소 10만원 미만 → 1종목에 섹터 전액 집중
 - 동일 ticker가 여러 섹터 top-3에 등장 시 수량 합산
 
-### 15.4 일간 자동화 스케줄
+### 15.4 일간 자동화 스케줄 (Phase 11 기준)
 
+**한국 시장 (KST 09:00~15:30)**:
 ```
-06:00  DataCollector.collect_all(last 10 days)       증분 데이터 수집
-06:30  InferencePipeline.generate_signals()           모델 추론 → (weights, top_tickers)
-       DailyRunner.step_sell_check(top_tickers)        하락 신호 종목 즉시 매도
-08:50  OrderGenerator.execute_rebalance(weights, tickers)  평일 매일 리밸런싱
-16:00  DailyRunner.step_eod()                        종가 기록 + 성과 업데이트
+06:00  DataCollector.collect_all(last 10 days)         증분 데이터 수집
+06:30  InferencePipeline.generate_signals()             모델 추론 → (weights, top_tickers)
+       DailyRunner.step_sell_check(top_tickers)          하락 신호 종목 즉시 매도
+09:10  execute_rebalance(..., market_filter="domestic")  KR Wave 1 (40%, 국내 종목)
+11:00  execute_rebalance(..., market_filter="domestic")  KR Wave 2 (35%, 국내 종목)
+13:30  execute_rebalance(..., market_filter="domestic")  KR Wave 3 (25%, 국내 종목)
+16:00  DailyRunner.step_eod()                          종가 기록 + 성과 업데이트
 ```
 
-**Phase 8 변경**: `08:50` 주문이 월요일 전용에서 **평일(월~금) 매일**로 변경.
+**미국 시장 (KST 23:30~06:00, 다음날 새벽)**:
+```
+23:20  DataCollector 재수집 + InferencePipeline 재추론   US Wave 1 전 최신 신호
+23:40  execute_rebalance(..., market_filter="overseas")  US Wave 1 (40%, 해외 종목)
+01:50  InferencePipeline 재추론 (재수집 없음)             US Wave 2 전 신호 갱신
+02:00  execute_rebalance(..., market_filter="overseas")  US Wave 2 (35%, 해외 종목)
+04:20  InferencePipeline 재추론                          US Wave 3 전 신호 갱신
+04:30  execute_rebalance(..., market_filter="overseas")  US Wave 3 (25%, 해외 종목)
+06:10  DailyRunner.step_eod()                          미국 장 마감 기록
+```
 
-**토요일 22:00**: `RetrainRunner.run_weekly()` — Transformer Phase 3+ (~30분)
-**매월 1일**: `RetrainRunner.run_monthly()` — VAE Phase 2+ (~2시간)
+**재훈련 스케줄** (변경 없음):
+- **토요일 22:00**: `RetrainRunner.run_weekly()` — Transformer Phase 3+ (~30분)
+- **매월 1일**: `RetrainRunner.run_monthly()` — VAE Phase 2+ (~2시간)
 
 ### 15.5 자동 재학습 + Rollback
 
@@ -1322,6 +1336,159 @@ def execute_sell_check(self, sector_top_tickers):
 
 ---
 
+## 18. Phase 11: KR/US 분리 스케줄 + 해외 시세 yfinance 폴백
+
+**파일**: `config/live_config.yaml`, `live/signal_to_order.py`, `scheduler/daily_runner.py`
+
+### 18.1 배경 — 오늘 발견된 버그들 (2026-02-23)
+
+서버 로그 분석으로 다음 문제가 발견되어 수정:
+
+| 증상 | 원인 | 파일 |
+|------|------|------|
+| `OverflowError: cannot convert float infinity to integer` | 현재가 0 반환 → `int(amount/0)` | `signal_to_order.py:558` |
+| KODEX ETF 조회 (개별 종목이어야 함) | `execution_market: "kospi"` — Phase 8 후 미변경 | `live_config.yaml` |
+| 해외 종목 현재가 404 (전 종목) | KIS sandbox 해외 시세 API 미지원 | `broker/kis_api.py` 한계 |
+| `get_overseas_balance()` 500 | KIS sandbox 해외 잔고 API 미지원 | `broker/kis_api.py` 한계 |
+
+### 18.2 OverflowError 수정 (`live/signal_to_order.py`)
+
+```python
+# 수정 전: current_price=0 → ZeroDivisionError 또는 float('inf') → int() OverflowError
+qty = int(per_ticker_amount / current_price)
+
+# 수정 후: 0 이하 가격 종목 스킵
+if current_price is None or current_price <= 0:
+    logger.warning(f"{ticker} 현재가 조회 실패 ({current_price}) → 스킵")
+    continue
+qty = int(per_ticker_amount / current_price)
+```
+
+### 18.3 yfinance 폴백 — KIS sandbox 해외 API 미지원 해결
+
+KIS sandbox 서버(`openapivts.koreainvestment.com:9443`)는 **국내 주식만 지원**. 해외주식 엔드포인트는 sandbox에 없어 404 반환. 3곳에 yfinance 폴백 적용:
+
+**`_compute_target_positions` (해외 종목 현재가)**:
+```python
+try:
+    price_info    = api.get_overseas_price(ticker, exchange)
+    current_price = float(price_info["price"])
+except Exception:
+    import yfinance as yf
+    current_price = yf.Ticker(ticker).fast_info.last_price
+    logger.info(f"{ticker} KIS 시세 불가 → yfinance 폴백: ${current_price:.2f}")
+```
+
+**`_get_limit_price` (지정가 계산)**:
+```python
+if market == "domestic":
+    p = float(api.get_domestic_price(ticker)["price"])
+else:
+    import yfinance as yf
+    p = yf.Ticker(ticker).fast_info.last_price
+    logger.info(f"{ticker} 호가 yfinance 폴백: ${p:.2f}")
+bid = ask = p  # yfinance는 호가가 없으므로 현재가로 대체
+```
+
+**`get_overseas_balance()` 오류 처리**:
+```python
+if self.execution_market in ("nasdaq", "split"):
+    try:
+        b = self.api_overseas.get_overseas_balance()
+        total += b.get("total_eval", 0) + b.get("cash", 0)
+    except Exception as e:
+        logger.warning(f"해외 잔고 조회 실패 (sandbox 미지원): {e}")
+        # 잔고 0으로 계속 진행 (국내 잔고는 정상 조회됨)
+```
+
+**검증**: `yf.Ticker("AAPL").fast_info.last_price` → $264.58 (정상) ✅
+
+### 18.4 KR/US 분리 스케줄 구현
+
+#### market_filter 파라미터 (`live/signal_to_order.py`)
+
+```python
+def execute_rebalance(self, sector_weights, sector_top_tickers=None, market_filter=None):
+    ...
+    target_positions = self._compute_target_positions(...)
+
+    # market_filter로 국내/해외 주문 분리
+    if market_filter:
+        target_positions = {
+            t: v for t, v in target_positions.items()
+            if v.get("market") == market_filter
+        }
+```
+
+#### 데몬 함수 (`scheduler/daily_runner.py`)
+
+```python
+def _daemon_kr_order(self, twap_wave: int):
+    """한국 장 시간에 국내 종목 주문 실행"""
+    self.step_order(twap_wave=twap_wave, market_filter="domestic")
+
+def _daemon_us_signal(self, collect: bool = False):
+    """미국 장 Wave 전 신호 재생성 (US only)"""
+    if collect:
+        self.step_collect()                # Wave 1 전만 재수집
+    self._us_weights, self._us_top_tickers = self.step_signal()
+
+def _daemon_us_order(self, twap_wave: int):
+    """미국 장 시간에 해외 종목 주문 실행 (재생성된 신호 사용)"""
+    rebalancer = OrderGenerator(self.cfg, self.live_cfg, self.logger)
+    rebalancer.execute_rebalance(
+        self._us_weights,
+        self._us_top_tickers,
+        market_filter="overseas",
+        twap_wave=twap_wave,
+    )
+```
+
+#### run_daemon() 이중 스케줄 등록
+
+```python
+# 한국 장 스케줄
+schedule.every().day.at(kr["wave1"]).do(lambda: self._daemon_kr_order(1))  # 09:10
+schedule.every().day.at(kr["wave2"]).do(lambda: self._daemon_kr_order(2))  # 11:00
+schedule.every().day.at(kr["wave3"]).do(lambda: self._daemon_kr_order(3))  # 13:30
+
+# 미국 장 스케줄 (Wave 전 재추론 포함)
+schedule.every().day.at(us["wave1_signal"]).do(lambda: self._daemon_us_signal(collect=True))  # 23:20
+schedule.every().day.at(us["wave1"]).do(lambda: self._daemon_us_order(1))  # 23:40
+schedule.every().day.at(us["wave2_signal"]).do(lambda: self._daemon_us_signal(collect=False))  # 01:50
+schedule.every().day.at(us["wave2"]).do(lambda: self._daemon_us_order(2))  # 02:00
+schedule.every().day.at(us["wave3_signal"]).do(lambda: self._daemon_us_signal(collect=False))  # 04:20
+schedule.every().day.at(us["wave3"]).do(lambda: self._daemon_us_order(3))  # 04:30
+schedule.every().day.at(sc["us_eod_time"]).do(self.step_eod)              # 06:10
+```
+
+### 18.5 live_config.yaml 변경사항
+
+```yaml
+trading:
+  execution_market: "split"    # "kospi" → "split" (개별 종목 활성화)
+
+schedule:
+  # 한국 장
+  kr_order_waves:
+    wave1: "09:10"    # 40%
+    wave2: "11:00"    # 35%
+    wave3: "13:30"    # 25%
+  eod_record_time: "16:00"
+
+  # 미국 장 (Wave 전 신호 재생성)
+  us_order_waves:
+    wave1_signal: "23:20"    # 재수집 + 재추론
+    wave1:        "23:40"    # 40%
+    wave2_signal: "01:50"    # 재추론만
+    wave2:        "02:00"    # 35%
+    wave3_signal: "04:20"    # 재추론만
+    wave3:        "04:30"    # 25%
+  us_eod_time: "06:10"
+```
+
+---
+
 ## 부록: 알려진 문제와 해결 방향
 
 ### A. GAN 불안정 (부분 해결)
@@ -1349,4 +1516,4 @@ def execute_sell_check(self, sector_top_tickers):
 ---
 
 *이 문서는 실제 소스 코드를 기반으로 작성되었습니다.*
-*마지막 업데이트: 2026-02-21 (Phase 7)*
+*마지막 업데이트: 2026-02-23 (Phase 11)*

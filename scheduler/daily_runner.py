@@ -251,20 +251,23 @@ class DailyRunner:
         sector_weights: np.ndarray,
         sector_top_tickers: dict = None,
         twap_wave: int = 1,
+        market_filter: str = None,
     ) -> list[dict]:
         """매일 실행: 신호 기반 리밸런싱 (TWAP 분할 주문).
 
         Args:
             sector_weights:     섹터별 목표 비중 배열
             sector_top_tickers: 섹터별 top 종목 정보
-            twap_wave:          TWAP 파 번호 (1=09:10 40%, 2=11:00 35%, 3=13:30 25%)
+            twap_wave:          TWAP 파 번호
+            market_filter:      None=전체, "domestic"=국내만, "overseas"=해외만
 
         장 휴장일(토/일)에는 스킵.
         """
-        logger.info(f"=== Step 3: 리밸런싱 주문 시작 (Wave {twap_wave}) ===")
+        market_label = f"[{market_filter}] " if market_filter else ""
+        logger.info(f"=== Step 3: {market_label}리밸런싱 주문 시작 (Wave {twap_wave}) ===")
 
         today = date.today()
-        if today.weekday() >= 5:  # 토=5, 일=6
+        if today.weekday() >= 5:
             if not getattr(self, "_force", False):
                 logger.info(f"오늘은 {today.strftime('%A')} → 장 휴장, 스킵")
                 return []
@@ -277,12 +280,14 @@ class DailyRunner:
         )
 
         try:
-            executed = generator.execute_rebalance(sector_weights, sector_top_tickers)
+            executed = generator.execute_rebalance(
+                sector_weights, sector_top_tickers, market_filter=market_filter
+            )
         except Exception as e:
-            logger.error(f"주문 실행 실패 (Wave {twap_wave}): {e}")
+            logger.error(f"주문 실행 실패 ({market_label}Wave {twap_wave}): {e}")
             raise
 
-        logger.info(f"=== Step 3: 리밸런싱 완료 Wave {twap_wave} ({len(executed)}건) ===")
+        logger.info(f"=== Step 3: {market_label}리밸런싱 완료 Wave {twap_wave} ({len(executed)}건) ===")
         return executed
 
     # ------------------------------------------------------------------
@@ -363,42 +368,80 @@ class DailyRunner:
         self._last_top_tickers = top_tickers
         self.step_sell_check(top_tickers)
 
-    def _daemon_order(self, twap_wave: int = 1):
-        """데몬용: 저장된 신호로 TWAP 파별 리밸런싱 주문."""
-        weights    = getattr(self, "_last_weights",     np.ones(11) / 11)
+    def _daemon_kr_order(self, twap_wave: int = 1):
+        """데몬용: 국내(KR) 종목만 TWAP 파별 주문."""
+        weights     = getattr(self, "_last_weights",     np.ones(11) / 11)
         top_tickers = getattr(self, "_last_top_tickers", {})
-        self.step_order(weights, top_tickers, twap_wave=twap_wave)
+        self.step_order(weights, top_tickers, twap_wave=twap_wave, market_filter="domestic")
+
+    def _daemon_us_signal(self, collect: bool = False):
+        """데몬용: 미국 장 중 신호 재생성 (re-score).
+
+        Args:
+            collect: True이면 데이터 재수집 후 신호 생성 (Wave 1 전),
+                     False이면 수집 생략하고 신호만 재생성 (Wave 2/3 전)
+        """
+        if collect:
+            try:
+                self.step_collect()
+            except Exception as e:
+                logger.warning(f"US 재수집 실패 (신호 생성은 계속): {e}")
+        weights, top_tickers = self.step_signal()
+        self._us_weights     = weights
+        self._us_top_tickers = top_tickers
+        logger.info("미국 장 re-score 완료")
+
+    def _daemon_us_order(self, twap_wave: int = 1):
+        """데몬용: 해외(US) 종목만 TWAP 파별 주문 (re-score된 신호 사용)."""
+        weights     = getattr(self, "_us_weights",     getattr(self, "_last_weights",     np.ones(11) / 11))
+        top_tickers = getattr(self, "_us_top_tickers", getattr(self, "_last_top_tickers", {}))
+        self.step_order(weights, top_tickers, twap_wave=twap_wave, market_filter="overseas")
 
     def run_daemon(self):
-        """스케줄러 데몬: 지정 시간에 자동 실행 (TWAP 3-파)."""
+        """스케줄러 데몬: 한국/미국 장 별도 스케줄 (TWAP 3-파)."""
         import schedule
 
-        schedule_cfg = self.cfg["schedule"]
-        order_times  = schedule_cfg["order_waves"]          # wave1/wave2/wave3
+        sc   = self.cfg["schedule"]
+        kr   = sc["kr_order_waves"]
+        us   = sc["us_order_waves"]
 
-        schedule.every().day.at(schedule_cfg["data_collect_time"]).do(self.step_collect)
-        schedule.every().day.at(schedule_cfg["signal_gen_time"]).do(self._daemon_signal_and_sell)
+        # ── 한국 장 ───────────────────────────────────────────────────
+        schedule.every().day.at(sc["data_collect_time"]).do(self.step_collect)
+        schedule.every().day.at(sc["signal_gen_time"]).do(self._daemon_signal_and_sell)
+        schedule.every().day.at(kr["wave1"]).do(lambda: self._daemon_kr_order(twap_wave=1))
+        schedule.every().day.at(kr["wave2"]).do(lambda: self._daemon_kr_order(twap_wave=2))
+        schedule.every().day.at(kr["wave3"]).do(lambda: self._daemon_kr_order(twap_wave=3))
+        schedule.every().day.at(sc["eod_record_time"]).do(self.step_eod)
 
-        # TWAP 3-파 주문 스케줄
-        schedule.every().day.at(order_times["wave1"]).do(
-            lambda: self._daemon_order(twap_wave=1)
+        # ── 미국 장 (re-score → 주문) ─────────────────────────────────
+        schedule.every().day.at(us["wave1_signal"]).do(
+            lambda: self._daemon_us_signal(collect=True)   # Wave 1 전: 재수집 + 재신호
         )
-        schedule.every().day.at(order_times["wave2"]).do(
-            lambda: self._daemon_order(twap_wave=2)
+        schedule.every().day.at(us["wave1"]).do(lambda: self._daemon_us_order(twap_wave=1))
+        schedule.every().day.at(us["wave2_signal"]).do(
+            lambda: self._daemon_us_signal(collect=False)  # Wave 2/3 전: 재신호만
         )
-        schedule.every().day.at(order_times["wave3"]).do(
-            lambda: self._daemon_order(twap_wave=3)
+        schedule.every().day.at(us["wave2"]).do(lambda: self._daemon_us_order(twap_wave=2))
+        schedule.every().day.at(us["wave3_signal"]).do(
+            lambda: self._daemon_us_signal(collect=False)
         )
+        schedule.every().day.at(us["wave3"]).do(lambda: self._daemon_us_order(twap_wave=3))
+        schedule.every().day.at(sc["us_eod_time"]).do(self.step_eod)
 
-        schedule.every().day.at(schedule_cfg["eod_record_time"]).do(self.step_eod)
-
-        logger.info("스케줄러 데몬 시작 (TWAP 3-파):")
-        logger.info(f"  데이터 수집:  {schedule_cfg['data_collect_time']}")
-        logger.info(f"  신호 생성:    {schedule_cfg['signal_gen_time']}")
-        logger.info(f"  주문 Wave 1:  {order_times['wave1']} (40%)")
-        logger.info(f"  주문 Wave 2:  {order_times['wave2']} (35%)")
-        logger.info(f"  주문 Wave 3:  {order_times['wave3']} (25%)")
-        logger.info(f"  종가 기록:    {schedule_cfg['eod_record_time']}")
+        logger.info("스케줄러 데몬 시작 (한국/미국 분리 TWAP 3-파):")
+        logger.info(f"  [KR] 데이터 수집: {sc['data_collect_time']}")
+        logger.info(f"  [KR] 신호 생성:   {sc['signal_gen_time']}")
+        logger.info(f"  [KR] Wave 1:      {kr['wave1']} (40%, domestic)")
+        logger.info(f"  [KR] Wave 2:      {kr['wave2']} (35%, domestic)")
+        logger.info(f"  [KR] Wave 3:      {kr['wave3']} (25%, domestic)")
+        logger.info(f"  [KR] EOD:         {sc['eod_record_time']}")
+        logger.info(f"  [US] re-score+수집: {us['wave1_signal']}")
+        logger.info(f"  [US] Wave 1:      {us['wave1']} (40%, overseas)")
+        logger.info(f"  [US] re-score:    {us['wave2_signal']}")
+        logger.info(f"  [US] Wave 2:      {us['wave2']} (35%, overseas)")
+        logger.info(f"  [US] re-score:    {us['wave3_signal']}")
+        logger.info(f"  [US] Wave 3:      {us['wave3']} (25%, overseas)")
+        logger.info(f"  [US] EOD:         {sc['us_eod_time']}")
 
         while True:
             schedule.run_pending()

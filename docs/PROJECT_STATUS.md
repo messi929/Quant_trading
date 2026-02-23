@@ -1,6 +1,6 @@
 # Alpha Signal Discovery Engine - 프로젝트 현황
 
-**최종 업데이트**: 2026-02-22 (Phase 10: Hetzner Cloud 서버 배포 + systemd 데몬)
+**최종 업데이트**: 2026-02-23 (Phase 11: 개별 종목 매매 활성화 + KR/US 분리 스케줄)
 **현재 최고 성과**: Sharpe **2.03**, MDD **-4.30%**, Return **+17.82%** (기준선: Sharpe 1.82, +15.87%)
 
 ---
@@ -44,6 +44,62 @@ KOSPI/NASDAQ 시장 데이터에서 딥러닝으로 **새로운 수학적 지표
 
 ## 개발 이력
 
+### Phase 11: 개별 종목 매매 활성화 + KR/US 분리 스케줄 (2026-02-23)
+
+오늘(2026-02-23) 서버 로그 분석으로 다수의 버그를 발견하고 수정. 한국/미국 시장을 분리 스케줄로 운용하도록 전면 재설계.
+
+#### 11-A. 버그 수정
+
+| 버그 | 원인 | 수정 내용 |
+|------|------|---------|
+| `OverflowError: cannot convert float infinity to integer` | KIS sandbox에서 국내 종목 현재가 조회 실패(0 반환) → `int(amount / 0)` | `current_price <= 0` guard 추가 → 해당 종목 스킵 |
+| KODEX ETF 조회 (개별 종목 아닌 ETF) | `execution_market: "kospi"` 설정 오류 — Phase 8에서 개별 종목 전환했으나 config 미변경 | `execution_market: "split"` 으로 수정 |
+| 해외 현재가 API 404 (모든 NASDAQ 종목) | KIS sandbox는 해외주식 시세 API(`/uapi/overseas-stock/v1/quotations/price`) 미지원 | yfinance 폴백: `yf.Ticker(ticker).fast_info.last_price` (3곳 적용) |
+| `get_overseas_balance()` 500 Server Error | KIS sandbox 해외 잔고 API 미지원 | try/except로 감싸고 warning 로그 후 계속 |
+
+#### 11-B. KR/US 분리 스케줄
+
+**변경 배경**: 미국 시장(KST 23:30~06:00)과 한국 시장(KST 09:00~15:30)이 시간대가 완전히 분리됨. 미국 시장은 운영시간이 길므로 Wave마다 신호를 재계산하여 최신 정보 반영.
+
+**한국 시장 스케줄 (KST)**:
+
+| 시각 | 작업 |
+|------|------|
+| 06:00 | 데이터 수집 (증분) |
+| 06:30 | 신호 생성 + 하락 종목 매도 |
+| 09:10 | KR Wave 1 (40%, 국내 종목) |
+| 11:00 | KR Wave 2 (35%, 국내 종목) |
+| 13:30 | KR Wave 3 (25%, 국내 종목) |
+| 16:00 | 종가 기록 + 성과 업데이트 |
+
+**미국 시장 스케줄 (KST, 다음날 새벽)**:
+
+| 시각 | 작업 |
+|------|------|
+| 23:20 | 데이터 재수집 + 신호 재생성 (US Wave 1 전) |
+| 23:40 | US Wave 1 (40%, 해외 종목) |
+| 01:50 | 신호 재생성 (재수집 없음, US Wave 2 전) |
+| 02:00 | US Wave 2 (35%, 해외 종목) |
+| 04:20 | 신호 재생성 (US Wave 3 전) |
+| 04:30 | US Wave 3 (25%, 해외 종목) |
+| 06:10 | 미국 장 마감 기록 |
+
+#### 11-C. execute_rebalance market_filter 추가
+
+`execute_rebalance(market_filter="domestic")` / `market_filter="overseas"` 파라미터를 추가하여 KR/US 주문을 분리 실행.
+
+**수정 파일 요약**:
+
+| 파일 | 변경 내용 |
+|------|---------|
+| `config/live_config.yaml` | `execution_market: "split"`, `order_waves` → `kr_order_waves` + `us_order_waves` 분리 |
+| `live/signal_to_order.py` | `current_price <= 0` guard, yfinance 폴백 3곳, overseas balance try/except, `market_filter` 파라미터 |
+| `scheduler/daily_runner.py` | `_daemon_kr_order()`, `_daemon_us_signal()`, `_daemon_us_order()` 추가, `run_daemon()` KR+US 이중 스케줄 |
+
+**배포**: 변경사항 Hetzner 서버(`77.42.78.9`)에 적용 완료, systemd 데몬 재시작 확인.
+
+---
+
 ### Phase 10: Hetzner Cloud 서버 배포 (2026-02-22)
 
 24/7 자동 운용을 위해 Hetzner Cloud ARM 서버에 전체 시스템 배포 완료.
@@ -66,16 +122,23 @@ KOSPI/NASDAQ 시장 데이터에서 딥러닝으로 **새로운 수학적 지표
 - 데몬 비정상 종료 시 60초 후 자동 재시작 (`Restart=always`)
 - 로그: `/var/log/quant-trading.log`
 
-**일간 자동 스케줄 (KST)**:
+**일간 자동 스케줄 (KST) — Phase 11 이후**:
 
 | 시각 | 작업 |
 |------|------|
 | 06:00 | 데이터 수집 (증분) |
 | 06:30 | 신호 생성 + 하락 종목 매도 |
-| 09:10 | 주문 Wave 1 (40%) |
-| 11:00 | 주문 Wave 2 (35%) |
-| 13:30 | 주문 Wave 3 (25%) |
+| 09:10 | KR Wave 1 (40%, 국내 종목) |
+| 11:00 | KR Wave 2 (35%, 국내 종목) |
+| 13:30 | KR Wave 3 (25%, 국내 종목) |
 | 16:00 | 종가 기록 + 성과 업데이트 |
+| 23:20 | US 데이터 재수집 + 신호 재생성 |
+| 23:40 | US Wave 1 (40%, 해외 종목) |
+| 01:50 | US 신호 재생성 |
+| 02:00 | US Wave 2 (35%, 해외 종목) |
+| 04:20 | US 신호 재생성 |
+| 04:30 | US Wave 3 (25%, 해외 종목) |
+| 06:10 | 미국 장 마감 기록 |
 
 **검증 완료**:
 - `python scheduler/daily_runner.py --step signal` 서버에서 정상 실행 ✅
@@ -288,7 +351,7 @@ requirements.txt            python-dotenv, streamlit, schedule 추가
 
 ---
 
-## 현재 상태 (2026-02-22 기준)
+## 현재 상태 (2026-02-23 기준)
 
 ### 훈련 체크포인트
 
@@ -334,7 +397,9 @@ requirements.txt            python-dotenv, streamlit, schedule 추가
 | alpha=0.4 테스트셋에서 튜닝됨 (미래 데이터 누설 우려) | 중간 | 잔존 |
 | GAN W-dist 여전히 불안정 (개선됐으나 미해결) | 낮음 | 부분해결 |
 | 180일 테스트 기간 짧음 | 낮음 | 잔존 |
-| sandbox 주문 테스트 미완료 (signal만 검증, TWAP 주문 로직 구현 완료) | 중간 | 잔존 |
+| KIS sandbox 해외주식 시세/잔고 API 미지원 (yfinance 폴백으로 해결) | 낮음 | 해결됨 |
+| sandbox 국내 주문 체결 테스트 미완료 (평일 장 중 확인 필요) | 중간 | 잔존 |
+| 일간 리밸런싱 회전율 미측정 (과도한 매매 비용 위험) | 중간 | 잔존 |
 
 ---
 
@@ -385,10 +450,13 @@ $PYTHON main.py backtest --walk-forward --config config/settings_fast.yaml
 # 라이브 트레이딩
 setup_live.bat                                        # 최초 설정 (.env 생성, Task Scheduler 등록)
 python scheduler/daily_runner.py --step signal        # 신호 테스트 ✅ (검증 완료)
-python scheduler/daily_runner.py --step order         # sandbox 주문 테스트 (Wave 1, 40%)
-python scheduler/daily_runner.py --step order --wave 2  # Wave 2 단독 테스트 (35%)
-python scheduler/daily_runner.py --step order --wave 3  # Wave 3 단독 테스트 (25%)
-python scheduler/daily_runner.py --daemon             # 데몬 실행 (3-파 자동 스케줄)
+python scheduler/daily_runner.py --step order         # sandbox KR 주문 테스트 (Wave 1, 40%, 국내)
+python scheduler/daily_runner.py --step order --wave 2  # KR Wave 2 단독 테스트 (35%)
+python scheduler/daily_runner.py --step order --wave 3  # KR Wave 3 단독 테스트 (25%)
+python scheduler/daily_runner.py --daemon             # 데몬 실행 (KR 3-파 + US 3-파 자동 스케줄)
+
+# 서버 로그 확인
+ssh root@77.42.78.9 "tail -f /var/log/quant-trading.log"
 
 # 대시보드
 streamlit run dashboard/app.py
