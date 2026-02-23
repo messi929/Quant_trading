@@ -1,8 +1,8 @@
 # Alpha Signal Discovery Engine - 기술 상세 문서
 
-**버전**: 2026-02-23 (Phase 11: 개별 종목 매매 활성화 + KR/US 분리 스케줄)
+**버전**: 2026-02-24 (Phase 11: KR/US 분리 스케줄 확정 — 신호 1회 생성 + TWAP 집행)
 **현재 최고 성과**: Sharpe **2.03**, MDD **-4.30%**, Return **+17.82%** (기준선 대비 +0.21 Sharpe)
-**배포 상태**: Hetzner Cloud `77.42.78.9` systemd 데몬 실행 중 (KR 장 + US 장 분리 스케줄)
+**배포 상태**: Hetzner Cloud `77.42.78.9` systemd 데몬 실행 중 (KR/US 각 신호 1회 + TWAP 3-파)
 
 ---
 
@@ -1076,27 +1076,27 @@ top_tickers = [
 
 ### 15.4 일간 자동화 스케줄 (Phase 11 기준)
 
-**한국 시장 (KST 09:00~15:30)**:
 ```
-06:00  DataCollector.collect_all(last 10 days)         증분 데이터 수집
-06:30  InferencePipeline.generate_signals()             모델 추론 → (weights, top_tickers)
-       DailyRunner.step_sell_check(top_tickers)          하락 신호 종목 즉시 매도
-09:10  execute_rebalance(..., market_filter="domestic")  KR Wave 1 (40%, 국내 종목)
-11:00  execute_rebalance(..., market_filter="domestic")  KR Wave 2 (35%, 국내 종목)
-13:30  execute_rebalance(..., market_filter="domestic")  KR Wave 3 (25%, 국내 종목)
-16:00  DailyRunner.step_eod()                          종가 기록 + 성과 업데이트
+06:00  DataCollector.collect_all(last 10 days)          KR + US 전일 종가 수집
+06:10  _daemon_us_signal()                              [US] NASDAQ 종가 신호 생성
+         InferencePipeline (use_cache=False)             → 캐시 무시, 방금 수집 데이터로 재추론
+         step_sell_check(top_tickers)                    → 해외 하락 신호 즉시 매도
+         _us_weights / _us_top_tickers 저장              → Wave 1/2/3에서 재사용
+06:30  _daemon_signal_and_sell()                        [KR] 신호 생성 + 국내 하락 매도
+         (캐시 있으면 06:10 결과 재사용)
+09:10  execute_rebalance(..., market_filter="domestic")  [KR] Wave 1 (40%)
+11:00  execute_rebalance(..., market_filter="domestic")  [KR] Wave 2 (35%)
+13:30  execute_rebalance(..., market_filter="domestic")  [KR] Wave 3 (25%)
+16:00  DailyRunner.step_eod()                           종가 기록 + 성과 업데이트
+23:40  execute_rebalance(..., market_filter="overseas")  [US] Wave 1 (40%, 06:10 신호)
+02:00  execute_rebalance(..., market_filter="overseas")  [US] Wave 2 (35%, 06:10 신호)
+04:30  execute_rebalance(..., market_filter="overseas")  [US] Wave 3 (25%, 06:10 신호)
 ```
 
-**미국 시장 (KST 23:30~06:00, 다음날 새벽)**:
-```
-23:20  DataCollector 재수집 + InferencePipeline 재추론   US Wave 1 전 최신 신호
-23:40  execute_rebalance(..., market_filter="overseas")  US Wave 1 (40%, 해외 종목)
-01:50  InferencePipeline 재추론 (재수집 없음)             US Wave 2 전 신호 갱신
-02:00  execute_rebalance(..., market_filter="overseas")  US Wave 2 (35%, 해외 종목)
-04:20  InferencePipeline 재추론                          US Wave 3 전 신호 갱신
-04:30  execute_rebalance(..., market_filter="overseas")  US Wave 3 (25%, 해외 종목)
-06:10  DailyRunner.step_eod()                          미국 장 마감 기록
-```
+**설계 원칙**: US/KR 모두 신호는 하루 1회 생성, TWAP는 동일 신호의 시간 분산 집행.
+- US: NASDAQ 종가 직후(06:10) 신호 생성 → 미국 장 중(23:40/02:00/04:30) 분산 집행
+- KR: 장 전(06:30) 신호 생성 → 한국 장 중(09:10/11:00/13:30) 분산 집행
+- Wave 간 재추론 없음 (daily 모델에서 intraday 재추론은 의미 없음)
 
 **재훈련 스케줄** (변경 없음):
 - **토요일 22:00**: `RetrainRunner.run_weekly()` — Transformer Phase 3+ (~30분)
@@ -1336,7 +1336,7 @@ def execute_sell_check(self, sector_top_tickers):
 
 ---
 
-## 18. Phase 11: KR/US 분리 스케줄 + 해외 시세 yfinance 폴백
+## 18. Phase 11: KR/US 분리 스케줄 확정 + 해외 시세 yfinance 폴백
 
 **파일**: `config/live_config.yaml`, `live/signal_to_order.py`, `scheduler/daily_runner.py`
 
@@ -1403,7 +1403,10 @@ if self.execution_market in ("nasdaq", "split"):
 
 **검증**: `yf.Ticker("AAPL").fast_info.last_price` → $264.58 (정상) ✅
 
-### 18.4 KR/US 분리 스케줄 구현
+### 18.4 KR/US 분리 스케줄 구현 (확정 설계)
+
+**핵심 원칙**: daily 신호 모델 → 신호는 하루 1회 생성, Wave는 동일 신호의 분산 집행.
+- Wave 간 재추론은 의미 없음 (intraday 데이터 없음, 모델이 daily OHLCV 기반)
 
 #### market_filter 파라미터 (`live/signal_to_order.py`)
 
@@ -1423,68 +1426,66 @@ def execute_rebalance(self, sector_weights, sector_top_tickers=None, market_filt
 #### 데몬 함수 (`scheduler/daily_runner.py`)
 
 ```python
-def _daemon_kr_order(self, twap_wave: int):
-    """한국 장 시간에 국내 종목 주문 실행"""
-    self.step_order(twap_wave=twap_wave, market_filter="domestic")
-
-def _daemon_us_signal(self, collect: bool = False):
-    """미국 장 Wave 전 신호 재생성 (US only)"""
-    if collect:
-        self.step_collect()                # Wave 1 전만 재수집
-    self._us_weights, self._us_top_tickers = self.step_signal()
+def _daemon_us_signal(self):
+    """NASDAQ 종가 직후 (06:10) — 신호 생성 + 저장 + 해외 하락 매도."""
+    weights, top_tickers = self.step_signal(use_cache=False)  # 캐시 무시, 재추론
+    self._us_weights     = weights
+    self._us_top_tickers = top_tickers
+    self.step_sell_check(top_tickers)   # 해외 하락 신호 즉시 매도
+    # → 23:40/02:00/04:30 Wave에서 _us_weights/_us_top_tickers 재사용
 
 def _daemon_us_order(self, twap_wave: int):
-    """미국 장 시간에 해외 종목 주문 실행 (재생성된 신호 사용)"""
-    rebalancer = OrderGenerator(self.cfg, self.live_cfg, self.logger)
-    rebalancer.execute_rebalance(
-        self._us_weights,
-        self._us_top_tickers,
-        market_filter="overseas",
-        twap_wave=twap_wave,
-    )
+    """해외 종목 TWAP 집행 (06:10 신호 그대로 사용, 재추론 없음)."""
+    weights     = getattr(self, "_us_weights",     self._last_weights)
+    top_tickers = getattr(self, "_us_top_tickers", self._last_top_tickers)
+    self.step_order(weights, top_tickers, twap_wave=twap_wave, market_filter="overseas")
+
+def _daemon_kr_order(self, twap_wave: int):
+    """국내 종목 TWAP 집행 (06:30 신호 그대로 사용)."""
+    weights     = getattr(self, "_last_weights",     np.ones(11) / 11)
+    top_tickers = getattr(self, "_last_top_tickers", {})
+    self.step_order(weights, top_tickers, twap_wave=twap_wave, market_filter="domestic")
 ```
 
-#### run_daemon() 이중 스케줄 등록
+#### run_daemon() 스케줄 등록
 
 ```python
-# 한국 장 스케줄
-schedule.every().day.at(kr["wave1"]).do(lambda: self._daemon_kr_order(1))  # 09:10
-schedule.every().day.at(kr["wave2"]).do(lambda: self._daemon_kr_order(2))  # 11:00
-schedule.every().day.at(kr["wave3"]).do(lambda: self._daemon_kr_order(3))  # 13:30
+# 공통 수집
+schedule.every().day.at(sc["data_collect_time"]).do(self.step_collect)   # 06:00
 
-# 미국 장 스케줄 (Wave 전 재추론 포함)
-schedule.every().day.at(us["wave1_signal"]).do(lambda: self._daemon_us_signal(collect=True))  # 23:20
-schedule.every().day.at(us["wave1"]).do(lambda: self._daemon_us_order(1))  # 23:40
-schedule.every().day.at(us["wave2_signal"]).do(lambda: self._daemon_us_signal(collect=False))  # 01:50
-schedule.every().day.at(us["wave2"]).do(lambda: self._daemon_us_order(2))  # 02:00
-schedule.every().day.at(us["wave3_signal"]).do(lambda: self._daemon_us_signal(collect=False))  # 04:20
-schedule.every().day.at(us["wave3"]).do(lambda: self._daemon_us_order(3))  # 04:30
-schedule.every().day.at(sc["us_eod_time"]).do(self.step_eod)              # 06:10
+# US: 신호 생성 1회 → 장 중 3-파 집행
+schedule.every().day.at(sc["us_signal_time"]).do(self._daemon_us_signal) # 06:10
+schedule.every().day.at(us["wave1"]).do(lambda: self._daemon_us_order(1)) # 23:40
+schedule.every().day.at(us["wave2"]).do(lambda: self._daemon_us_order(2)) # 02:00
+schedule.every().day.at(us["wave3"]).do(lambda: self._daemon_us_order(3)) # 04:30
+
+# KR: 신호 생성 1회 → 장 중 3-파 집행
+schedule.every().day.at(sc["signal_gen_time"]).do(self._daemon_signal_and_sell) # 06:30
+schedule.every().day.at(kr["wave1"]).do(lambda: self._daemon_kr_order(1)) # 09:10
+schedule.every().day.at(kr["wave2"]).do(lambda: self._daemon_kr_order(2)) # 11:00
+schedule.every().day.at(kr["wave3"]).do(lambda: self._daemon_kr_order(3)) # 13:30
+schedule.every().day.at(sc["eod_record_time"]).do(self.step_eod)          # 16:00
 ```
 
-### 18.5 live_config.yaml 변경사항
+### 18.5 live_config.yaml 확정 구조
 
 ```yaml
 trading:
   execution_market: "split"    # "kospi" → "split" (개별 종목 활성화)
 
 schedule:
-  # 한국 장
+  data_collect_time: "06:00"   # KR + US 전일 종가 수집
+  us_signal_time:    "06:10"   # NASDAQ 종가 직후 신호 생성 (1회)
+  us_order_waves:
+    wave1: "23:40"    # 40% — US 장 중 분산 집행
+    wave2: "02:00"    # 35%
+    wave3: "04:30"    # 25%
+  signal_gen_time:   "06:30"   # KR 신호 생성
   kr_order_waves:
     wave1: "09:10"    # 40%
     wave2: "11:00"    # 35%
     wave3: "13:30"    # 25%
-  eod_record_time: "16:00"
-
-  # 미국 장 (Wave 전 신호 재생성)
-  us_order_waves:
-    wave1_signal: "23:20"    # 재수집 + 재추론
-    wave1:        "23:40"    # 40%
-    wave2_signal: "01:50"    # 재추론만
-    wave2:        "02:00"    # 35%
-    wave3_signal: "04:20"    # 재추론만
-    wave3:        "04:30"    # 25%
-  us_eod_time: "06:10"
+  eod_record_time:   "16:00"
 ```
 
 ---
@@ -1516,4 +1517,4 @@ schedule:
 ---
 
 *이 문서는 실제 소스 코드를 기반으로 작성되었습니다.*
-*마지막 업데이트: 2026-02-23 (Phase 11)*
+*마지막 업데이트: 2026-02-24 (Phase 11 확정)*
