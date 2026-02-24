@@ -289,7 +289,7 @@ class DailyRunner:
             )
         except Exception as e:
             logger.error(f"주문 실행 실패 ({market_label}Wave {twap_wave}): {e}")
-            raise
+            return []
 
         logger.info(f"=== Step 3: {market_label}리밸런싱 완료 Wave {twap_wave} ({len(executed)}건) ===")
         return executed
@@ -374,8 +374,11 @@ class DailyRunner:
 
     def _daemon_kr_order(self, twap_wave: int = 1):
         """데몬용: 국내(KR) 종목만 TWAP 파별 주문."""
-        weights     = getattr(self, "_last_weights",     np.ones(11) / 11)
-        top_tickers = getattr(self, "_last_top_tickers", {})
+        weights     = getattr(self, "_last_weights",     None)
+        top_tickers = getattr(self, "_last_top_tickers", None)
+        if weights is None or not top_tickers:
+            logger.info("[KR] 메모리 신호 없음 → 캐시에서 로드")
+            weights, top_tickers = self.step_signal(use_cache=True)
         self.step_order(weights, top_tickers, twap_wave=twap_wave, market_filter="domestic")
 
     def _daemon_us_signal(self):
@@ -397,8 +400,11 @@ class DailyRunner:
 
     def _daemon_us_order(self, twap_wave: int = 1):
         """데몬용: 해외(US) 종목 TWAP 파별 주문 (06:10 생성된 신호 사용)."""
-        weights     = getattr(self, "_us_weights",     getattr(self, "_last_weights",     np.ones(11) / 11))
-        top_tickers = getattr(self, "_us_top_tickers", getattr(self, "_last_top_tickers", {}))
+        weights     = getattr(self, "_us_weights",     None)
+        top_tickers = getattr(self, "_us_top_tickers", None)
+        if weights is None or not top_tickers:
+            logger.info("[US] 메모리 신호 없음 → 캐시에서 로드")
+            weights, top_tickers = self.step_signal(use_cache=True)
         self.step_order(weights, top_tickers, twap_wave=twap_wave, market_filter="overseas")
 
     def run_daemon(self):

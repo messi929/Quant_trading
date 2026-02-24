@@ -169,8 +169,15 @@ class KISApi:
             "appkey":      self.app_key,
             "appsecret":   self.app_secret,
         }
-        resp = self._session.post(url, json=body, timeout=10, verify=False)
-        resp.raise_for_status()
+        import time as _time
+        for attempt in range(3):
+            resp = self._session.post(url, json=body, timeout=10, verify=False)
+            if resp.status_code == 403 and attempt < 2:
+                logger.warning(f"토큰 발급 403 (시도 {attempt+1}/3) → 5초 후 재시도")
+                _time.sleep(5)
+                continue
+            resp.raise_for_status()
+            break
         data = resp.json()
 
         self._token = data["access_token"]
