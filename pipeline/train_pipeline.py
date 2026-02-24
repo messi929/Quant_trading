@@ -350,10 +350,14 @@ class TrainPipeline:
         # Sector classification
         ticker_info = df[["ticker", "market"]].drop_duplicates()
         # Load actual company names for KOSPI keyword matching
+        # KOSPI ohlcv tickers are "095570.KS" but ticker_info has "095570"
+        # so match via yf_ticker column (which stores "095570.KS" format)
         ticker_info_path = raw_dir / "ticker_info.parquet"
         if ticker_info_path.exists():
-            name_df = pd.read_parquet(ticker_info_path)[["ticker", "name"]]
-            ticker_info = ticker_info.merge(name_df, on="ticker", how="left")
+            name_df = pd.read_parquet(ticker_info_path)[["yf_ticker", "name"]]
+            ticker_info = ticker_info.merge(
+                name_df, left_on="ticker", right_on="yf_ticker", how="left"
+            )
             ticker_info["name"] = ticker_info["name"].fillna(ticker_info["ticker"])
         else:
             ticker_info["name"] = ticker_info["ticker"]
