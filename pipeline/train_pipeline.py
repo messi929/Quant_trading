@@ -349,7 +349,14 @@ class TrainPipeline:
 
         # Sector classification
         ticker_info = df[["ticker", "market"]].drop_duplicates()
-        ticker_info["name"] = ticker_info["ticker"]  # Simplified
+        # Load actual company names for KOSPI keyword matching
+        ticker_info_path = raw_dir / "ticker_info.parquet"
+        if ticker_info_path.exists():
+            name_df = pd.read_parquet(ticker_info_path)[["ticker", "name"]]
+            ticker_info = ticker_info.merge(name_df, on="ticker", how="left")
+            ticker_info["name"] = ticker_info["name"].fillna(ticker_info["ticker"])
+        else:
+            ticker_info["name"] = ticker_info["ticker"]
 
         kospi_tickers = ticker_info[ticker_info["market"] == "KOSPI"]
         nasdaq_tickers = ticker_info[ticker_info["market"] == "NASDAQ"]

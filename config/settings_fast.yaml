@@ -38,7 +38,7 @@ training:
   seed: 42
   num_workers: 0   # 0 for Windows shared memory compatibility
   pin_memory: true
-  max_tickers: 200  # Limit tickers per market for fast training
+  max_tickers: 400  # 200 KOSPI + 200 NASDAQ (양 시장 개별 종목 포함)
 
 data:
   markets:
