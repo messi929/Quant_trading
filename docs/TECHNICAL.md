@@ -1,8 +1,8 @@
 # Alpha Signal Discovery Engine - 기술 상세 문서
 
-**버전**: 2026-03-04 (Phase 14: execution_market split 수정 + KOSPI 수집 KRX API 수정)
+**버전**: 2026-03-07 (Phase 16: 근본 원인 최종 수정 — 티커 형식 통일 + urgency 임계값 수정 + cancel_order 버그 수정)
 **현재 최고 성과**: Sharpe **2.03**, MDD **-4.30%**, Return **+17.82%** (기준선 대비 +0.21 Sharpe)
-**배포 상태**: Hetzner Cloud `77.42.78.9` systemd 데몬 실행 중 (Phase 14 배포 완료 — KR/US 혼합 개별 종목 33건 체결 확인)
+**배포 상태**: Hetzner Cloud `77.42.78.9` systemd 데몬 실행 중 (Phase 16 배포 완료 — 2026-03-07 18:21 KST 재기동)
 
 ---
 
@@ -29,6 +29,8 @@
 19. [Phase 12: KOSPI 학습 포함 + 데몬 안정성 수정](#19-phase-12-kospi-학습-포함--데몬-안정성-수정)
 20. [Phase 13: 해외 Paper Trading + KOSPI Parquet 구축](#20-phase-13-해외-paper-trading--kospi-parquet-구축)
 21. [Phase 14: execution_market 수정 + KOSPI 수집 KRX API 수정](#21-phase-14-execution_market-수정--kospi-수집-krx-api-수정)
+22. [Phase 15: 티커 형식 불일치 + daemon 안정성 수정](#22-phase-15-티커-형식-불일치--daemon-안정성-수정)
+23. [Phase 16: 근본 원인 최종 수정 — 티커 정규화 유틸 + urgency 임계값](#23-phase-16-근본-원인-최종-수정--티커-정규화-유틸--urgency-임계값)
 
 ---
 
@@ -1967,3 +1969,57 @@ ssh root@77.42.78.9 "systemctl restart quant-trading"
 
 *이 문서는 실제 소스 코드를 기반으로 작성되었습니다.*
 *마지막 업데이트: 2026-03-04 (Phase 14 — execution_market split + KOSPI KRX API 수정)*
+---
+
+## 22. Phase 15: 티커 형식 불일치 + daemon 안정성 수정
+
+**날짜**: 2026-03-05 | **배포**: 서버 23:25 KST 재기동
+
+### 수정 버그 (Bug#29~31)
+
+| 버그 | 증상 | 원인 | 수정 |
+|------|------|------|------|
+| **Bug#29** 티커 형식 불일치 매일 전량 매도 | 매일 보유 포지션 전량 매도 후 재매수 반복 |  KIS 6자리(005930) vs  .KS(005930.KS) →  불일치 → 모든 포지션 매도 |  set:  정규화; : suffix-제거 매핑 |
+| **Bug#30** step_collect raise→daemon 크래시 | 수집 실패 시 while True 루프 중단 |  유지됨 |  으로 교체 |
+| **Bug#31** lotto_runner ImportError→daemon 크래시 | 데몬 시작 시 즉시 크래시 |  실패 시 예외 전파 |  +  플래그 |
+
+---
+
+## 23. Phase 16: 근본 원인 최종 수정 — 티커 정규화 유틸 + urgency 임계값
+
+**날짜**: 2026-03-07 | **배포**: 서버 18:21 KST
+
+### 근본 원인 분석
+
+Phase 11~15에 걸쳐 티커 형식 버그가 6회 재발한 근본 원인과, 모든 주문이 미체결되던 구조적 문제를 최종 해결.
+
+### 수정 1: 티커 정규화 공유 유틸 ( 신규)
+
+
+
+시스템 전체 17곳의  /  호출을 이 두 함수로 통일.
+
+| 파일 | 교체 위치 수 |
+|------|------------|
+|  | 13곳 |
+|  | 1곳 |
+|  | 2곳 |
+|  | 1곳 (cancel_order) |
+
+### 수정 2: urgency 임계값 수정 ()
+
+**문제**: 모델 score 실제 범위 0.001~0.011인데 임계값이 aggressive=0.5, normal=0.2 → 100% patient → 모든 주문이 mid-price 지정가, 재시도 없음 → 사실상 체결 0건.
+
+| 항목 | 이전 | 이후 |
+|------|------|------|
+|  | 0.5 | **0.008** (실제 score 상위 30%) |
+|  | 0.2 | **0.004** (실제 score 중위) |
+|  | 0.0 | **0.001** |
+
+### 수정 3: cancel_order ORD_DVSN 수정 ()
+
+취소 API  (조건부지정가) →  (지정가). 원주문이 지정가이므로 올바른 값으로 수정.
+
+### 배포 결과
+
+
