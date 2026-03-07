@@ -4,6 +4,7 @@
 broker:
   name: "한국투자증권"
   mode: "sandbox"          # "sandbox" | "production" — 반드시 sandbox로 시작
+  paper_trading: true      # true: 해외 주문을 가상 체결로 처리 (sandbox USD 잔고 $0 우회)
   base_url_sandbox: "https://openapivts.koreainvestment.com:9443"
   base_url_prod:    "https://openapi.koreainvestment.com:9443"
   ws_url_prod:      "ws://ops.koreainvestment.com:21000"
@@ -58,8 +59,9 @@ trading:
 
   # 어느 시장으로 섹터를 실행할지
   execution_market: "split"    # "kospi" | "nasdaq" | "split"
-  # split: 모델 signal이 KOSPI/NASDAQ 혼합이므로
-  #        가중치를 절반씩 양 시장에 투자
+  # nasdaq: NASDAQ_ETF_MAP(XLE/XLK 등)만 사용, market_filter="domestic" 시 0건
+  # split: 모델 signal 그대로 사용 (KS 개별종목 → domestic, US 개별종목 → overseas)
+  #        paper_trading=true 시 overseas만 yfinance 가상 체결, domestic은 KIS sandbox
 
 model:
   config_path: "config/settings_fast.yaml"
@@ -82,12 +84,12 @@ execution:
   twap_threshold:        500000   # 50만원 이상 → 3-파 TWAP
   # Phase C: 신호 강도 → 긴급도 매핑
   urgency_thresholds:
-    aggressive: 0.5               # score ≥ 0.5 → 공격적 (ask+0.3%, 시장가 폴백)
-    normal:     0.2               # score ≥ 0.2 → 일반 (ask 가격, 1회 재시도)
-    # score < 0.2 → 인내 (중간값, 재시도 없음)
+    aggressive: 0.008             # score ≥ 0.008 → 공격적 (ask+0.3%, 시장가 폴백) — 실제 score 상위 30%
+    normal:     0.004             # score ≥ 0.004 → 일반 (ask 기준, 1회 재시도) — 실제 score 중위
+    # score < 0.004 → 인내 (중간값, 재시도 없음) — 약한 신호
   # Phase D: 거래비용 임계값
   transaction_cost_rate: 0.006    # 왕복 0.6% (수수료 0.2%×2 + 슬리피지 0.1%×2)
-  score_cost_threshold:  0.0      # 모델 score 범위 0.001~0.011 → 임계값 비활성화
+  score_cost_threshold:  0.001    # 최소 양수 신호만 통과 (0 이하 차단)
 
 schedule:
   # ── 공통 ────────────────────────────────────────────────────────────

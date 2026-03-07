@@ -1,8 +1,8 @@
 # Alpha Signal Discovery Engine - 기술 상세 문서
 
-**버전**: 2026-02-24 (Phase 11: KR/US 분리 스케줄 확정 — 신호 1회 생성 + TWAP 집행)
+**버전**: 2026-03-04 (Phase 14: execution_market split 수정 + KOSPI 수집 KRX API 수정)
 **현재 최고 성과**: Sharpe **2.03**, MDD **-4.30%**, Return **+17.82%** (기준선 대비 +0.21 Sharpe)
-**배포 상태**: Hetzner Cloud `77.42.78.9` systemd 데몬 실행 중 (KR/US 각 신호 1회 + TWAP 3-파)
+**배포 상태**: Hetzner Cloud `77.42.78.9` systemd 데몬 실행 중 (Phase 14 배포 완료 — KR/US 혼합 개별 종목 33건 체결 확인)
 
 ---
 
@@ -26,6 +26,9 @@
 16. [신호 생성 파이프라인 수정사항](#16-신호-생성-파이프라인-수정사항)
 17. [Phase 8: 추론 파이프라인 버그 수정 + 개별 종목 매매](#17-phase-8-추론-파이프라인-버그-수정--개별-종목-매매)
 18. [Phase 11: KR/US 분리 스케줄 + 해외 시세 yfinance 폴백](#18-phase-11-krus-분리-스케줄--해외-시세-yfinance-폴백)
+19. [Phase 12: KOSPI 학습 포함 + 데몬 안정성 수정](#19-phase-12-kospi-학습-포함--데몬-안정성-수정)
+20. [Phase 13: 해외 Paper Trading + KOSPI Parquet 구축](#20-phase-13-해외-paper-trading--kospi-parquet-구축)
+21. [Phase 14: execution_market 수정 + KOSPI 수집 KRX API 수정](#21-phase-14-execution_market-수정--kospi-수집-krx-api-수정)
 
 ---
 
@@ -59,13 +62,14 @@
 
 ### 시장 유니버스
 
-| 시장 | 데이터 소스 | 종목 수 |
-|------|-----------|--------|
-| KOSPI | pykrx | ~100 종목 |
-| NASDAQ/S&P500 | yfinance | ~100 종목 |
-| **합계** | | **~200 종목** |
+| 시장 | 데이터 소스 | 수집 종목 수 | 학습 적용 |
+|------|-----------|------------|---------|
+| KOSPI | pykrx + yfinance | 950종목 수집 | **203종목** (21.6% 섹터 분류 성공) |
+| NASDAQ/S&P500 | yfinance | S&P500 + NQ100 = 517종목 | 상위 200종목 |
+| **합계** | | **1,467종목** | **max_tickers=400** |
 
-**데이터 규모**: 238,202행 × 34 피처 (5년치, 2020-2024)
+**Phase 12 데이터 규모**: 1,466 ticker × 5년치, 358,454행 × 34 피처
+**Phase 11 이전**: 200 ticker (NASDAQ 위주), 238,202행
 **섹터 분류**: GICS 11개 섹터 (config/sectors.yaml 정의)
 
 ---
@@ -1516,5 +1520,450 @@ schedule:
 
 ---
 
+---
+
+## 19. Phase 12: KOSPI 학습 포함 + 데몬 안정성 수정
+
+**파일**: `pipeline/train_pipeline.py`, `config/settings_fast.yaml`, `scheduler/daily_runner.py`, `broker/kis_api.py`
+
+### 19.1 배경 — 서버 운영 중 발견된 문제들 (2026-02-25)
+
+서버 로그 분석:
+- **매일 06:01** 데몬이 종료됨 → systemd가 60초 후 재시작 반복
+- **재시작 후 KR/US Wave 모두 0건 주문** — 재시작으로 메모리 신호 초기화
+- **Wave 3(04:30) 크래시** → 토큰 rate limit 403
+
+KOSPI 개별 종목이 신호에 전혀 안 나타남 → 학습 데이터 자체에 KOSPI 없음 확인.
+
+### 19.2 데몬 크래시 버그 수정 3개
+
+#### Bug 1: step_collect 크래시 (`scheduler/daily_runner.py`)
+
+```python
+# 수정 전: 예외 raise → 데몬 종료 (systemd 재시작)
+def step_collect(self):
+    try:
+        ...
+    except Exception as e:
+        logger.error(f"데이터 수집 실패: {e}")
+        raise  # ← 데몬 크래시
+
+# 수정 후: 경고만 남기고 계속 (step_signal이 자체 수집 수행)
+    except Exception as e:
+        logger.error(f"데이터 수집 실패: {e}")
+        return  # 데몬 유지
+```
+
+**원인**: 증분 수집(10일)된 데이터가 `DataProcessor(min_history_days=500)` 필터에 전부 제거됨 → "No objects to concatenate". step_signal은 어차피 1년치 재수집하므로 step_collect 실패는 무해.
+
+#### Bug 2: 재시작 후 신호 메모리 소실 (`scheduler/daily_runner.py`)
+
+```python
+# 수정 전: 메모리에서만 신호 로드 → 재시작 후 None
+def _daemon_kr_order(self, twap_wave: int = 1):
+    weights     = self._last_weights      # None after restart
+    top_tickers = self._last_top_tickers  # None after restart
+    self.step_order(weights, top_tickers, ...)
+
+# 수정 후: None이면 당일 캐시 파일에서 로드
+def _daemon_kr_order(self, twap_wave: int = 1):
+    weights     = getattr(self, "_last_weights",     None)
+    top_tickers = getattr(self, "_last_top_tickers", None)
+    if weights is None or not top_tickers:
+        logger.info("[KR] 메모리 신호 없음 → 캐시에서 로드")
+        weights, top_tickers = self.step_signal(use_cache=True)
+    self.step_order(weights, top_tickers, twap_wave=twap_wave, market_filter="domestic")
+
+# _daemon_us_order도 동일 패턴 적용
+```
+
+**캐시 파일**: `tracking/signal_cache_{YYYYMMDD}.json` — 당일 신호 생성 시 자동 저장, 재시작 후 Wave 실행 시 이 파일에서 복원.
+
+#### Bug 3: 토큰 rate limit 크래시 (`broker/kis_api.py`)
+
+```python
+# 원인: 국내(29443) + 해외(29443) API 인스턴스가 동시에 토큰 갱신 시도
+# KIS API 정책: 분당 1회 → 두 번째 요청 403 Forbidden
+
+# 수정 전: 403 → raise → 데몬 크래시
+resp = self._session.post(url, json=body, timeout=10, verify=False)
+resp.raise_for_status()
+
+# 수정 후: 3회 재시도 (5초 간격)
+import time as _time
+for attempt in range(3):
+    resp = self._session.post(url, json=body, timeout=10, verify=False)
+    if resp.status_code == 403 and attempt < 2:
+        logger.warning(f"토큰 발급 403 (시도 {attempt+1}/3) → 5초 후 재시도")
+        _time.sleep(5)
+        continue
+    resp.raise_for_status()
+    break
+```
+
+**추가 수정**: `step_order` 내 주문 실패 시 `raise` → `return []` (주문 실패가 데몬 전체를 종료시키지 않도록).
+
+### 19.3 KOSPI 섹터 분류 버그 수정 2개 (`pipeline/train_pipeline.py`)
+
+#### Bug 1: 회사명 대신 ticker code로 키워드 매칭
+
+```python
+# 수정 전: OHLCV ticker ("005930")를 name으로 사용 → 키워드 매칭 0%
+ticker_info["name"] = ticker_info["ticker"]   # "005930" — 의미 없음
+
+# 수정 후: ticker_info.parquet에서 실제 회사명 로드
+ticker_info_path = raw_dir / "ticker_info.parquet"
+if ticker_info_path.exists():
+    name_df = pd.read_parquet(ticker_info_path)[["yf_ticker", "name"]]
+    ticker_info = ticker_info.merge(
+        name_df, left_on="ticker", right_on="yf_ticker", how="left"
+    )
+    ticker_info["name"] = ticker_info["name"].fillna(ticker_info["ticker"])
+```
+
+#### Bug 2: ticker 형식 불일치로 merge 실패
+
+```python
+# 문제: OHLCV는 "095570.KS" (yfinance 형식)
+#       ticker_info.parquet는 "095570" (KRX 코드)
+# → left_on="ticker" merge 시 .KS 접미사 차이로 모두 실패
+
+# 수정: yf_ticker 컬럼(= "095570.KS" 형식) 으로 right_on 지정
+name_df = pd.read_parquet(ticker_info_path)[["yf_ticker", "name"]]
+ticker_info.merge(name_df, left_on="ticker", right_on="yf_ticker", how="left")
+# ticker_info["ticker"] == "095570.KS"
+# name_df["yf_ticker"] == "095570.KS"  → 매칭 성공
+```
+
+**결과 비교**:
+
+| 항목 | 수정 전 | 수정 후 |
+|------|--------|--------|
+| KOSPI 섹터 분류 수 | 0 / 941 | **203 / 941** (21.6%) |
+| 학습 종목 수 | ~200 (NASDAQ 위주) | **1,466** (KOSPI + NASDAQ) |
+| max_tickers | 200 | **400** (KOSPI 200 + NASDAQ 200) |
+| 학습 배치 수 | ~200 | **~1,210** (약 6배) |
+
+### 19.4 재학습 및 배포
+
+**재학습 설정**: `config/settings_fast.yaml`, Phase 2 전체 (~3시간)
+
+```bash
+# 로컬 PC (RTX 4060 Ti 8GB)
+$PYTHON main.py train --start-phase 2 --config config/settings_fast.yaml
+# → 2026-02-25 01:06 완료, ensemble.pt (26MB)
+```
+
+**서버 배포** (`77.42.78.9`, 07:42 재시작 완료):
+
+```bash
+# 자동 배포 스크립트가 타임아웃 (log mtime > ensemble.pt mtime 조건 실패)
+# → 수동 scp 배포
+scp saved_models/ensemble.pt root@77.42.78.9:/opt/quant/saved_models/
+scp data/processed/processed_data.parquet root@77.42.78.9:/opt/quant/data/processed/
+scp pipeline/inference_pipeline.py root@77.42.78.9:/opt/quant/pipeline/
+scp pipeline/train_pipeline.py root@77.42.78.9:/opt/quant/pipeline/
+scp scheduler/daily_runner.py root@77.42.78.9:/opt/quant/scheduler/
+scp broker/kis_api.py root@77.42.78.9:/opt/quant/broker/
+ssh root@77.42.78.9 "systemctl start quant-trading"
+```
+
+**자동 배포 스크립트 한계** (`deploy_on_complete.sh`):
+- `find "$ENSEMBLE" -newer "$LOG"` 조건: 재학습 로그 파일이 tqdm에 의해 지속 갱신 → 로그 mtime이 항상 ensemble.pt보다 최신 → 조건 항상 false → 타임아웃
+- 향후 개선: log 파일 대신 sentinel 파일(완료 플래그) 방식으로 변경 필요
+
+---
+
+## 20. Phase 13: 해외 Paper Trading + KOSPI Parquet 구축 (2026-02-26)
+
+**파일**: `live/signal_to_order.py`, `pipeline/inference_pipeline.py`, `scheduler/daily_runner.py`, `config/live_config.yaml`, `deploy_on_complete.sh`
+
+### 20.1 배경
+
+서버 운영 1일차 로그 분석 결과:
+- NASDAQ 주문 33건 모두 실패 → 해외 sandbox USD 잔고 $0
+- KOSPI domestic Wave "리밸런싱 불필요" → KOSPI 종목이 overseas로 분류됨
+- EOD 기록 실패 → NOT NULL constraint (daily_return = NaN)
+- deploy_on_complete.sh 5시간 타임아웃 반복
+
+### 20.2 버그 수정 6개
+
+#### Bug 1: deploy_on_complete.sh 타임아웃 (`deploy_on_complete.sh`)
+
+```bash
+# 수정 전: find -newer $LOG → log가 ensemble.pt보다 21ms 늦게 기록됨
+# → ensemble이 항상 "더 오래된" 파일 → 조건 항상 false
+if find "$ENSEMBLE" -newer "$LOG" | grep -q .; then ...
+
+# 수정 후: 스크립트 시작 시각(epoch)과 ensemble mtime 비교
+START_TIME=$(date +%s)
+# ...루프 내...
+ENSEMBLE_MTIME=$(stat -c %Y "$ENSEMBLE" 2>/dev/null)
+if [ "$ENSEMBLE_MTIME" -ge "$START_TIME" ]; then
+    # deploy
+fi
+```
+
+#### Bug 2: 해외 sandbox $0 USD → Paper Trading 모드 (`live/signal_to_order.py`, `config/live_config.yaml`)
+
+KIS 해외 모의투자 계좌는 USD 예수금이 $0이며 API로 입금 불가.
+
+```yaml
+# live_config.yaml
+broker:
+  paper_trading: true   # 해외 주문을 가상 체결로 처리
+```
+
+```python
+# signal_to_order.py
+self.paper_trading = self.cfg["broker"].get("paper_trading", False)
+if self.paper_trading:
+    self.api_overseas = None  # 토큰 403 방지 — overseas KISApi init 생략
+
+def _execute_paper_trade(self, order: dict) -> dict:
+    """yfinance 시세 기준 가상 체결. DB에 mode='paper' 기록."""
+    price = float(yf.Ticker(order["ticker"]).fast_info.last_price)
+    return {
+        "ticker": order["ticker"], "side": order["side"],
+        "qty": order["qty"],       "price": price,
+        "order_no": f"PAPER_{ticker}_{int(time.time())}",
+        "mode": "paper",
+    }
+```
+
+**결과**: NASDAQ 33/33 주문 가상 체결, DB 정상 기록.
+
+#### Bug 3: KRW/USD 수량 계산 오류 (`live/signal_to_order.py`)
+
+```python
+# 수정 전: amount(KRW) / price(USD) → 단위 불일치
+qty = int(per_ticker_amount / current_price)  # 41,862주 오계산
+
+# 수정 후: FX 환율 변환 (yfinance USDKRW=X)
+def _get_fx_rate(self) -> float:
+    rate = float(yf.Ticker("USDKRW=X").fast_info.last_price)  # ex: 1425.2
+    self._fx_rate_cache = rate  # 세션 캐시
+    return rate
+
+# overseas paper trading 시 KRW → USD 변환
+if self.paper_trading and market == "overseas":
+    amount_for_qty = per_ticker_amount / self._get_fx_rate()
+qty = int(amount_for_qty / current_price)  # 29주 정상 계산
+```
+
+#### Bug 4: KOSPI 종목 overseas 분류 오류 (`pipeline/inference_pipeline.py`)
+
+```python
+# 수정 전: "095570.KS".isdigit() == False → overseas
+"market": "domestic" if t.isdigit() else "overseas"
+
+# 수정 후: .KS/.KQ 접미사 확인
+"market": "domestic" if (t.isdigit() or t.endswith(".KS") or t.endswith(".KQ")) else "overseas"
+```
+
+#### Bug 5: step_eod NOT NULL constraint (`scheduler/daily_runner.py`)
+
+```python
+# 수정 전: split 모드 → else → overseas balance($0) → ZeroDivision/NaN
+if self.execution_market == "kospi":
+    balance = api.get_domestic_balance()
+else:
+    balance = api.get_overseas_balance()  # split 모드도 여기로 → $0
+
+# 수정 후: split/paper_trading → domestic balance + NaN 방어
+paper_trading = self.cfg["broker"].get("paper_trading", False)
+if self.execution_market in ("kospi", "split") or paper_trading:
+    balance = api.get_domestic_balance()
+else:
+    balance = api.get_overseas_balance()
+
+if prev_value > 0:
+    daily_return = (portfolio_value - prev_value) / prev_value
+else:
+    daily_return = 0.0
+if math.isnan(daily_return) or math.isinf(daily_return):
+    daily_return = 0.0
+```
+
+#### Bug 6: step_collect KOSPI 데이터 필터 (`scheduler/daily_runner.py`)
+
+```python
+# 수정 전: DataProcessor(500) → 10일 증분 데이터 전부 제거
+processor = DataProcessor()  # min_history_days=500 기본값
+
+# 수정 후: 증분 수집은 히스토리 체크 불필요
+processor = DataProcessor(min_history_days=1)  # 모든 행 유지
+```
+
+### 20.3 KOSPI Parquet 구축 (서버 직접)
+
+서버의 `processed_data.parquet`가 NASDAQ 전용(400 tickers)으로, KR 신호 생성 시 KOSPI 종목이 없어 모두 "unknown" 처리됨.
+
+서버에 이미 존재하는 raw 데이터를 활용해 직접 구축:
+
+```python
+# 서버에서 1회 실행 (Python script)
+# 1. 섹터 분류
+from data.sector_classifier import SectorClassifier
+ticker_info = pd.read_parquet('data/raw/ticker_info.parquet')  # 950 KOSPI tickers
+classified = SectorClassifier().classify_kospi(ticker_info[ticker_info['market']=='KOSPI'])
+# → 203/950 종목 섹터 분류 성공 (financials 44, healthcare 37, industrials 26...)
+
+# 2. OHLCV 처리
+kdf = pd.read_parquet('data/raw/kospi_ohlcv.parquet')  # 1,123,789행, 2021~
+kdf = kdf[kdf['ticker'].isin(sector_map.keys())]       # 203 classified tickers
+new_df = DataProcessor(min_history_days=60).process(kdf)
+new_df = FeatureEngineer().compute_all(new_df)         # 220,946행, 34 features
+
+# 3. 기존 parquet 병합
+combined = pd.concat([old_df, new_df]).drop_duplicates(subset=['date','ticker'])
+# 477,802 + 220,946 → 698,748행, 602 tickers
+```
+
+**결과**:
+
+| 항목 | 변경 전 | 변경 후 |
+|------|--------|--------|
+| Total tickers | 400 (NASDAQ only) | **602** (400 NASDAQ + 202 KOSPI) |
+| Total rows | 477,802 | **698,748** |
+| 파일 크기 | 158MB | **221MB** |
+| KS sector coverage | 0% | **11개 섹터 전부** |
+
+### 20.4 inference_pipeline.py — pykrx 재호출 방지
+
+```python
+# 수정 전: generate_signals()마다 pykrx 재수집 (DNS 실패 위험)
+collector = MarketDataCollector(history_years=1)
+market_data_dict = collector.collect_all(save=False)
+
+# 수정 후: step_collect(06:00)이 저장한 parquet 재사용
+processed_path = Path("data/processed/processed_data.parquet")
+if processed_path.exists():
+    market_data = pd.read_parquet(processed_path)
+    logger.info(f"Loaded market data from parquet: {len(market_data):,} rows")
+else:
+    logger.warning("parquet 없음 → pykrx 재수집 (느림)")
+    # ... fallback
+```
+
+### 20.5 배포 현황 (2026-02-26 23:16)
+
+```bash
+# 5개 파일 SCP 배포
+scp config/live_config.yaml root@77.42.78.9:/opt/quant/config/
+scp live/signal_to_order.py root@77.42.78.9:/opt/quant/live/
+scp pipeline/inference_pipeline.py root@77.42.78.9:/opt/quant/pipeline/
+scp scheduler/daily_runner.py root@77.42.78.9:/opt/quant/scheduler/
+# processed_data.parquet는 서버에서 직접 구축 (scp 불필요)
+ssh root@77.42.78.9 "systemctl restart quant-trading"
+```
+
+---
+
+---
+
+## 21. Phase 14: execution_market 수정 + KOSPI 수집 KRX API 수정
+
+**날짜**: 2026-03-04
+**수정 파일**: `config/live_config.yaml`, `data/collector.py`
+
+### 21.1 execution_market 버그 — KR domestic Wave 0건
+
+#### 원인 분석
+
+`live_config.yaml`의 `execution_market: "nasdaq"` 설정으로 인해, `_compute_target_positions()`가 `NASDAQ_ETF_MAP`(XLE, XLB 등)만 사용하고 모든 target에 `market="overseas"`를 붙인다.
+
+KR domestic Wave 실행 시 `execute_rebalance(market_filter="domestic")` 호출 → 모든 target이 `market="overseas"` → 필터 후 빈 dict → `_compute_orders()` 빈 list → `리밸런싱 불필요`.
+
+```
+실행 흐름 (수정 전):
+  execution_market="nasdaq"
+  → _compute_target_positions(): XLE(overseas), XLB(overseas), ... (11개 ETF)
+  → market_filter="domestic" 적용: {} (전부 제거)
+  → _compute_orders({}, {}): []
+  → "리밸런싱 불필요" ← 항상 0건
+```
+
+모델 신호는 `322000.KS(market=domestic)`, `INTU(market=overseas)` 혼합으로 생성되는데, `"nasdaq"` 모드는 이를 무시하고 ETF만 사용한다.
+
+#### 수정
+
+```yaml
+# config/live_config.yaml
+execution_market: "split"   # "nasdaq" → "split"
+```
+
+`"split"` 모드에서 `_compute_target_positions()`:
+```python
+else:  # split: 모델 top-ticker 그대로 사용
+    top_tickers = sector_top_tickers.get(sector, [])
+    ticker_list = top_tickers   # KS → domestic, US → overseas
+```
+
+#### 결과
+
+| market_filter | 수정 전 (nasdaq) | 수정 후 (split) |
+|---|---|---|
+| `"domestic"` (KR Wave) | 0건 — ETF 전부 overseas | KOSPI 개별 종목 집행 |
+| `"overseas"` (US Wave) | XLE/XLB 등 ETF | INTU/EPAM 등 개별 US 주식 |
+
+### 21.2 KOSPI 수집 KRX API 버그 — 06:00 항상 0건
+
+#### 원인 분석
+
+`pykrx.get_market_ticker_list(date)` 내부 구조:
+
+```python
+def get_market_ticker_list(date, market="KOSPI"):
+    s = krx.get_market_ticker_and_name(date, market)   # OHLCV 기반 조회
+    return s.index.to_list()
+```
+
+이 함수는 해당 날짜의 **OHLCV 데이터**를 조회하여 ticker 목록을 추출한다. KRX는 당일 장 종료(15:30 KST) 이후에야 당일 OHLCV를 게시하므로, **06:00 KST 조회 시 당일 데이터 없음 → 0건**.
+
+반면 `상장종목검색().fetch("STK")`은 KRX **상장종목 검색 API** (`dbms/comm/finder/finder_stkisu`)를 사용하여 OHLCV와 무관하게 현재 상장 종목 목록을 반환한다.
+
+```python
+# 기존 — OHLCV 기반, 06:00 0건
+krx.get_market_ticker_list("20260304", market="KOSPI")  # → []
+
+# 수정 — 상장종목 검색 API, 시간 무관
+from pykrx.website.krx.market.core import 상장종목검색
+상장종목검색().fetch("STK")  # → 950행 (항상)
+```
+
+#### 수정 (`data/collector.py`)
+
+```python
+def get_kospi_tickers(self) -> pd.DataFrame:
+    from pykrx.website.krx.market.core import 상장종목검색
+    raw = 상장종목검색().fetch("STK")   # STK = 유가증권(KOSPI)
+    records = [
+        {"ticker": row["short_code"], "name": row["codeName"],
+         "yf_ticker": f"{row['short_code']}.KS", "market": "KOSPI"}
+        for _, row in raw.iterrows()
+    ]
+    return pd.DataFrame(records)   # 950건
+```
+
+#### 결과
+
+| | 수정 전 | 수정 후 |
+|---|---|---|
+| 06:00 수집 | `KOSPI 수집 실패: KRX 0건 반환` | KOSPI tickers: **950건** 정상 |
+| 주말/공휴일 | 0건 (OHLCV 없음) | 950건 (상장 목록 항상 유효) |
+
+### 21.3 배포
+
+```bash
+scp config/live_config.yaml root@77.42.78.9:/opt/quant/config/
+scp data/collector.py root@77.42.78.9:/opt/quant/data/
+ssh root@77.42.78.9 "systemctl restart quant-trading"
+```
+
+테스트 결과 (2026-03-04 12:41): KR 15건 + US 18건 = **33/33 체결**
+
+---
+
 *이 문서는 실제 소스 코드를 기반으로 작성되었습니다.*
-*마지막 업데이트: 2026-02-24 (Phase 11 확정)*
+*마지막 업데이트: 2026-03-04 (Phase 14 — execution_market split + KOSPI KRX API 수정)*

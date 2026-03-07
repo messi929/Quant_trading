@@ -12,9 +12,9 @@ Phase B: TWAP 분할 실행 (50만원 이상 매수 주문)
   - 매도는 항상 즉시 전량 (리스크 우선)
 
 Phase C: 신호 강도 기반 긴급도
-  - score ≥ 0.5 → aggressive (ask+0.3%, 10분 후 시장가)
-  - score ≥ 0.2 → normal    (ask 기준, 10분 후 재조정)
-  - score <  0.2 → patient  (중간값 지정가, 미체결 모니터링 없음)
+  - score ≥ 0.008 → aggressive (ask+0.3%, 10분 후 시장가)  [실제 score 상위 30%]
+  - score ≥ 0.004 → normal    (ask 기준, 10분 후 재조정)   [실제 score 중위]
+  - score <  0.004 → patient  (중간값 지정가, 미체결 모니터링 없음)
 
 Phase D: 거래비용 임계값
   - 왕복 거래비용 ≈ 0.6% (수수료 0.2%×2 + 슬리피지 0.1%×2)
@@ -29,6 +29,7 @@ from loguru import logger
 from broker.kis_api import KISApi
 from live.sector_instruments import get_sector_order
 from tracking.trade_log import TradeLogger
+from utils.ticker_utils import kis_code, is_domestic
 
 # 왕복 거래비용 (수수료 0.2%×2 + 슬리피지 0.1%×2)
 TRANSACTION_COST_RATE = 0.006
@@ -73,12 +74,20 @@ class OrderGenerator:
         self.score_cost_min = exec_cfg.get("score_cost_threshold", 0.05)
 
         _mode = self.cfg["broker"]["mode"]
+        self.paper_trading = self.cfg["broker"].get("paper_trading", False)
+        if self.paper_trading:
+            logger.info("paper_trading=True: 해외 주문은 가상 체결로 처리됩니다.")
+
         self.api_domestic = KISApi(mode=_mode, market_type="domestic")
-        try:
-            self.api_overseas = KISApi(mode=_mode, market_type="overseas")
-        except ValueError as e:
-            logger.warning(f"해외 API 자격증명 미설정 → 국내 계좌로 대체: {e}")
-            self.api_overseas = self.api_domestic
+        if self.paper_trading:
+            # paper_trading=True: overseas KISApi init 생략 (토큰 403 방지)
+            self.api_overseas = None
+        else:
+            try:
+                self.api_overseas = KISApi(mode=_mode, market_type="overseas")
+            except ValueError as e:
+                logger.warning(f"해외 API 자격증명 미설정 → 국내 계좌로 대체: {e}")
+                self.api_overseas = self.api_domestic
 
         # 하위 호환: self.api는 국내 기본 (pending/cancel 등 국내 전용 메서드용)
         self.api = self.api_domestic
@@ -88,7 +97,9 @@ class OrderGenerator:
 
     def _get_api(self, market: str) -> KISApi:
         """market 문자열에 따라 적합한 API 인스턴스 반환."""
-        return self.api_domestic if market == "domestic" else self.api_overseas
+        if market == "domestic" or self.api_overseas is None:
+            return self.api_domestic
+        return self.api_overseas
 
     # ------------------------------------------------------------------
     # Phase C: 신호 강도 → 긴급도
@@ -124,7 +135,7 @@ class OrderGenerator:
         api = self._get_api(market)
         try:
             if market == "domestic":
-                ba  = api.get_domestic_bid_ask(ticker)
+                ba  = api.get_domestic_bid_ask(kis_code(ticker))
                 bid = float(ba["bid"])
                 ask = float(ba["ask"])
             else:
@@ -136,7 +147,7 @@ class OrderGenerator:
             logger.warning(f"{ticker} 호가 조회 실패 — 현재가 대체: {e}")
             try:
                 if market == "domestic":
-                    p = float(api.get_domestic_price(ticker)["price"])
+                    p = float(api.get_domestic_price(kis_code(ticker))["price"])
                 else:
                     import yfinance as yf
                     p = yf.Ticker(ticker).fast_info.last_price
@@ -169,7 +180,7 @@ class OrderGenerator:
         api = self._get_api(order["market"])
         if order["market"] == "domestic":
             return api.order_domestic(
-                ticker=order["ticker"],
+                ticker=kis_code(order["ticker"]),  # KIS: 6자리 코드만 허용
                 side=order["side"],
                 qty=order["qty"],
                 price=int(price),
@@ -192,7 +203,7 @@ class OrderGenerator:
         api = self._get_api(order["market"])
         if order["market"] == "domestic":
             return api.order_domestic(
-                ticker=order["ticker"],
+                ticker=kis_code(order["ticker"]),  # KIS: 6자리 코드만 허용
                 side=order["side"],
                 qty=order["qty"],
                 price=0,
@@ -258,7 +269,7 @@ class OrderGenerator:
 
         # 기존 주문 취소
         try:
-            self.api.cancel_order(order_no, order["ticker"], order["side"], remaining_qty)
+            self.api.cancel_order(order_no, kis_code(order["ticker"]), order["side"], remaining_qty)
         except Exception as e:
             logger.warning(f"취소 실패 ({order_no}): {e}")
             return result
@@ -298,7 +309,7 @@ class OrderGenerator:
             remaining2 = pend2["remaining_qty"]
             try:
                 self.api.cancel_order(
-                    order_no2, order["ticker"], order["side"], remaining2
+                    order_no2, kis_code(order["ticker"]), order["side"], remaining2
                 )
                 return self._submit_market_order({**retry_order, "qty": remaining2})
             except Exception as e:
@@ -425,13 +436,19 @@ class OrderGenerator:
                     continue
 
             try:
-                result = self._execute_with_retry(buy_order, urgency)
+                # overseas: sandbox USD 미지원 → yfinance 가상 체결
+                # domestic: KIS sandbox에 실제 주문 (모의투자 정상 작동)
+                if self.paper_trading and buy_order["market"] == "overseas":
+                    result = self._execute_paper_trade(buy_order)
+                else:
+                    result = self._execute_with_retry(buy_order, urgency)
                 executed.append(result)
                 self.logger.log_trade(result)
                 if available_cash != float("inf"):
                     available_cash -= required
                 logger.info(
-                    f"매수: {order['ticker']} {wave_qty}주 "
+                    f"{'[PAPER] ' if result.get('mode') == 'paper' else ''}매수: "
+                    f"{order['ticker']} {wave_qty}주 "
                     f"[Wave{self.twap_wave} {wave_fraction:.0%} / {urgency}]"
                 )
             except Exception as e:
@@ -464,27 +481,67 @@ class OrderGenerator:
             balance = self.api_domestic.get_domestic_balance()
             for pos in balance["positions"]:
                 positions[pos["ticker"]] = {**pos, "sector": "unknown"}
-        if self.execution_market in ("nasdaq", "split"):
+        if self.execution_market in ("nasdaq", "split") and not self.paper_trading:
             balance = self.api_overseas.get_overseas_balance()
             for pos in balance["positions"]:
                 positions[pos["ticker"]] = {**pos, "sector": "unknown"}
         return positions
 
     def _get_portfolio_value(self, positions: dict) -> float:
+        # KIS API total_eval(tot_evlu_amt) = 주식평가 + 예수금 포함 전체 계좌가치
+        # → cash를 따로 더하면 이중 계산됨
         total = 0.0
         if self.execution_market in ("kospi", "split"):
             b = self.api_domestic.get_domestic_balance()
-            total += b.get("total_eval", 0) + b.get("cash", 0)
-        if self.execution_market in ("nasdaq", "split"):
+            total += b.get("total_eval", 0)   # 현금+주식 합산값
+        if self.execution_market in ("nasdaq", "split") and not self.paper_trading:
             try:
                 b = self.api_overseas.get_overseas_balance()
-                total += b.get("total_eval", 0) + b.get("cash", 0)
+                total += b.get("total_eval", 0)
             except Exception as e:
                 logger.warning(f"해외 잔고 조회 실패 (sandbox 미지원일 수 있음): {e}")
         if total < self.total_capital * 0.1:
             logger.warning(f"포트폴리오 가치 낮음: {total:,.0f}")
             return self.total_capital
         return total
+
+    def _get_fx_rate(self) -> float:
+        """USD/KRW 환율 조회 (캐시, 세션당 1회 fetch)."""
+        if hasattr(self, "_fx_rate_cache"):
+            return self._fx_rate_cache
+        try:
+            import yfinance as yf
+            rate = float(yf.Ticker("USDKRW=X").fast_info.last_price)
+            if rate > 500:  # 정상 범위 확인 (500~2000)
+                self._fx_rate_cache = rate
+                logger.info(f"USD/KRW 환율: {rate:.1f}")
+                return rate
+        except Exception as e:
+            logger.warning(f"환율 조회 실패 → 1,350 사용: {e}")
+        self._fx_rate_cache = 1350.0
+        return self._fx_rate_cache
+
+    def _execute_paper_trade(self, order: dict) -> dict:
+        """Paper trading: yfinance 현재가로 가상 체결 (KIS API 미호출)."""
+        import yfinance as yf
+        from datetime import datetime as dt
+        ticker = order["ticker"]
+        try:
+            price = float(yf.Ticker(ticker).fast_info.last_price)
+        except Exception:
+            price = order.get("target_amount", 0) / max(order["qty"], 1)
+        return {
+            "timestamp": dt.now().isoformat(),
+            "ticker":    ticker,
+            "side":      order["side"],
+            "qty":       order["qty"],
+            "price":     price,
+            "amount":    order["qty"] * price,
+            "sector":    order.get("sector", ""),
+            "order_no":  f"PAPER_{ticker}_{int(time.time())}",
+            "mode":      "paper",
+            "note":      f"wave{self.twap_wave}",
+        }
 
     def _compute_target_positions(
         self,
@@ -562,9 +619,20 @@ class OrderGenerator:
                 try:
                     api = self._get_api(market)
                     if market == "domestic":
-                        price_info = api.get_domestic_price(ticker)
-                        exchange   = ""
-                        current_price = float(price_info["price"])
+                        # KIS domestic API는 6자리 코드만 허용 (.KS/.KQ suffix 제거)
+                        kis_ticker = kis_code(ticker)
+                        try:
+                            price_info    = api.get_domestic_price(kis_ticker)
+                            exchange      = ""
+                            current_price = float(price_info["price"])
+                        except Exception:
+                            import yfinance as yf
+                            _raw = yf.Ticker(ticker if "." in ticker else f"{ticker}.KS").fast_info.last_price
+                            if not _raw or _raw <= 0:
+                                raise ValueError(f"yfinance 가격 없음: {ticker}")
+                            current_price = float(_raw)
+                            exchange      = ""
+                            logger.info(f"{ticker} KIS 시세 불가 → yfinance 폴백: ₩{current_price:,.0f}")
                     else:
                         exchange   = tkr_info.get("exchange", "NASD")
                         try:
@@ -574,7 +642,10 @@ class OrderGenerator:
                             current_price = float(price_info["price"])
                         except Exception:
                             import yfinance as yf
-                            current_price = yf.Ticker(ticker).fast_info.last_price
+                            _raw = yf.Ticker(ticker).fast_info.last_price
+                            if not _raw or _raw <= 0:
+                                raise ValueError(f"yfinance 가격 없음: {ticker}")
+                            current_price = float(_raw)
                             logger.info(f"{ticker} KIS 시세 불가 → yfinance 폴백: ${current_price:.2f}")
                 except Exception as e:
                     logger.warning(f"{ticker} 현재가 조회 실패: {e}")
@@ -584,7 +655,12 @@ class OrderGenerator:
                     logger.warning(f"{ticker} 현재가 0 또는 음수 → 스킵")
                     continue
 
-                qty = int(per_ticker_amount / current_price)
+                # paper_trading + overseas: KRW 금액 → USD 환산 후 수량 계산
+                if self.paper_trading and market == "overseas":
+                    amount_for_qty = per_ticker_amount / self._get_fx_rate()
+                else:
+                    amount_for_qty = per_ticker_amount
+                qty = int(amount_for_qty / current_price)
                 if qty < 1:
                     continue
 
@@ -610,58 +686,99 @@ class OrderGenerator:
         current: dict[str, dict],
         targets: dict[str, dict],
     ) -> list[dict]:
-        """현재 포지션 vs 목표 포지션 → 주문 목록."""
-        orders      = []
-        all_tickers = set(current.keys()) | set(targets.keys())
+        """현재 포지션 vs 목표 포지션 → 주문 목록.
 
-        for ticker in all_tickers:
-            curr_qty   = current.get(ticker, {}).get("qty", 0)
-            target_qty = targets.get(ticker, {}).get("target_qty", 0)
+        KIS balance API는 6자리 숫자 ticker 반환 (예: "005930").
+        sector_top_tickers(parquet 기준)는 ".KS"/".KQ" suffix 포함 (예: "005930.KS").
+        suffix 제거 후 매칭하여 동일 종목 중복 주문(매도+재매수) 방지.
+        """
+        orders = []
 
-            if ticker not in targets:
-                # 목표 없음 → 전량 매도
+        # 정규화 키(suffix 제거) → 원본 키 매핑
+        # current: KIS balance → 이미 정규화된 6자리 코드 또는 US 심볼
+        # targets: parquet → ".KS"/".KQ" suffix 포함 가능
+        norm_to_curr = {k: k for k in current}
+        norm_to_tgt  = {kis_code(k): k for k in targets}
+
+        all_norm = set(norm_to_curr.keys()) | set(norm_to_tgt.keys())
+
+        for norm in all_norm:
+            curr_key = norm_to_curr.get(norm)
+            tgt_key  = norm_to_tgt.get(norm)
+
+            curr_qty   = current[curr_key].get("qty", 0) if curr_key else 0
+            tgt_info   = targets[tgt_key] if tgt_key else {}
+            target_qty = tgt_info.get("target_qty", 0)
+
+            if tgt_key is None:
+                # 목표 없음 → 전량 매도 (curr_key 사용 — KIS 6자리 형식 유지)
                 if curr_qty > 0:
+                    ticker = curr_key
                     orders.append({
-                        "ticker":  ticker,
-                        "side":    "sell",
-                        "qty":     curr_qty,
-                        "sector":  current[ticker].get("sector", "unknown"),
-                        "market":  "domestic" if ticker.isdigit() else "overseas",
-                        "score":   0.0,
+                        "ticker":        ticker,
+                        "side":          "sell",
+                        "qty":           curr_qty,
+                        "sector":        current[curr_key].get("sector", "unknown"),
+                        "market":        "domestic" if is_domestic(ticker) else "overseas",
+                        "score":         0.0,
                         "target_amount": 0,
                     })
                 continue
 
+            # tgt_key(suffix 포함) 기준으로 주문 생성 — market/exchange 정보 보유
+            ticker        = tgt_key
             diff_qty      = target_qty - curr_qty
-            target_amount = targets[ticker]["target_amount"]
-            curr_amount   = curr_qty * targets[ticker]["current_price"]
+            target_amount = tgt_info["target_amount"]
+            curr_amount   = curr_qty * tgt_info.get("current_price", 0)
             amount_diff   = abs(target_amount - curr_amount) / max(target_amount, 1)
 
             # 허용 범위 내 → 스킵 (거래비용 절약)
             if amount_diff < self.rebal_threshold:
                 continue
 
-            score = targets[ticker].get("score", 0.3)
+            score = tgt_info.get("score", 0.3)
             base  = {
                 "ticker":        ticker,
-                "sector":        targets[ticker]["sector"],
-                "market":        targets[ticker]["market"],
-                "exchange":      targets[ticker].get("exchange", ""),
+                "sector":        tgt_info["sector"],
+                "market":        tgt_info["market"],
+                "exchange":      tgt_info.get("exchange", ""),
                 "score":         score,
                 "target_amount": target_amount,
             }
 
             if diff_qty > 0:
-                orders.append({**base, "side": "buy",  "qty": diff_qty})
+                orders.append({**base, "side": "buy", "qty": diff_qty})
             elif diff_qty < 0:
-                orders.append({**base, "side": "sell", "qty": abs(diff_qty)})
+                # 매도 시: curr_key(6자리) 사용 — KIS order API 호환
+                sell_ticker = curr_key if curr_key else ticker
+                orders.append({
+                    **base,
+                    "ticker": sell_ticker,
+                    "side":   "sell",
+                    "qty":    abs(diff_qty),
+                })
 
         return orders
 
-    def execute_sell_check(self, sector_top_tickers: dict) -> list[dict]:
-        """매일 06:30: 양수 신호 없는 보유 종목 즉시 매도."""
+    def execute_sell_check(
+        self,
+        sector_top_tickers: dict,
+        market_filter: str = None,
+    ) -> list[dict]:
+        """보유 종목 중 양수 신호 없는 종목 즉시 매도.
+
+        Args:
+            sector_top_tickers: 섹터별 top 종목 (신호 있는 종목 목록)
+            market_filter: None=전체, "domestic"=국내만, "overseas"=해외만
+
+        KIS balance tickers: 6자리 숫자 (예: "005930")
+        sector_top_tickers: parquet 형식 (예: "005930.KS")
+        → suffix 제거 후 비교하여 매도 오판 방지
+        """
+        market_label = f"[{market_filter}] " if market_filter else ""
+        # ".KS"/".KQ" suffix 제거하여 KIS 잔고 티커 형식과 통일
         positive_tickers = {
-            t["ticker"]
+            kis_code(t["ticker"])
             for tickers in sector_top_tickers.values()
             for t in tickers
         }
@@ -671,18 +788,25 @@ class OrderGenerator:
         for ticker, pos in current_positions.items():
             if pos.get("qty", 0) <= 0:
                 continue
-            if ticker not in positive_tickers:
+            # 시장 필터: 6자리 숫자 → domestic, 그 외 → overseas
+            is_domestic_flag = is_domestic(ticker)
+            if market_filter == "domestic" and not is_domestic_flag:
+                continue  # 해외 포지션은 이번 체크에서 스킵
+            if market_filter == "overseas" and is_domestic_flag:
+                continue  # 국내 포지션은 이번 체크에서 스킵
+            # current_positions 키는 KIS 6자리 형식 → 정규화 없이 직접 비교
+            if kis_code(ticker) not in positive_tickers:
                 sell_orders.append({
-                    "ticker":  ticker,
-                    "side":    "sell",
-                    "qty":     pos["qty"],
-                    "sector":  pos.get("sector", "unknown"),
-                    "market":  "domestic" if ticker.isdigit() else "overseas",
-                    "exchange": "",
-                    "score":   0.0,
+                    "ticker":        ticker,
+                    "side":          "sell",
+                    "qty":           pos["qty"],
+                    "sector":        pos.get("sector", "unknown"),
+                    "market":        "domestic" if is_domestic_flag else "overseas",
+                    "exchange":      "",
+                    "score":         0.0,
                     "target_amount": 0,
                 })
-                logger.info(f"하락 신호 매도 대상: {ticker} ({pos['qty']}주)")
+                logger.info(f"{market_label}하락 신호 매도 대상: {ticker} ({pos['qty']}주)")
 
         if not sell_orders:
             logger.info("하락 신호 종목 없음")
@@ -728,7 +852,7 @@ class OrderGenerator:
                     "ticker":   ticker,
                     "side":     "sell",
                     "qty":      pos["qty"],
-                    "market":   "domestic" if ticker.isdigit() else "overseas",
+                    "market":   "domestic" if is_domestic(ticker) else "overseas",
                     "sector":   pos.get("sector", "unknown"),
                     "score":    0.0,
                     "exchange": "",

@@ -23,6 +23,7 @@ from strategy.portfolio import PortfolioOptimizer
 from strategy.risk import RiskManager
 
 from utils.device import DeviceManager
+from utils.ticker_utils import is_domestic
 
 
 class InferencePipeline:
@@ -169,9 +170,17 @@ class InferencePipeline:
             Dict with signals, allocations, and risk report
         """
         if market_data is None:
-            collector = MarketDataCollector(history_years=1)
-            market_data_dict = collector.collect_all(save=False)
-            market_data = pd.concat(market_data_dict.values(), ignore_index=True)
+            # step_collect이 이미 저장한 processed_data를 재사용 (pykrx 재호출 방지)
+            processed_path = Path("data/processed/processed_data.parquet")
+            if processed_path.exists():
+                market_data = pd.read_parquet(processed_path)
+                logger.info(f"Loaded market data from parquet: {len(market_data):,} rows, "
+                            f"{market_data['ticker'].nunique()} tickers")
+            else:
+                logger.warning("processed_data.parquet 없음 → pykrx 재수집 (느림)")
+                collector = MarketDataCollector(history_years=1)
+                market_data_dict = collector.collect_all(save=False)
+                market_data = pd.concat(market_data_dict.values(), ignore_index=True)
 
         # Process
         df = self.processor.process(market_data)
@@ -233,7 +242,7 @@ class InferencePipeline:
                     {
                         "ticker": t,
                         "score": s,
-                        "market": "overseas" if not t.isdigit() else "domestic",
+                        "market": "domestic" if is_domestic(t) else "overseas",
                     }
                     for t, s in ranked[:top_n]
                     if s > 0  # 상승 신호 있는 종목만

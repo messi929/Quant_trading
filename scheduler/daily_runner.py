@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from loguru import logger
 from utils.logger import setup_logger
 from utils.device import set_seed
+from utils.ticker_utils import is_domestic
 
 
 class DailyRunner:
@@ -91,7 +92,9 @@ class DailyRunner:
                     self.settings["paths"]["processed_data"]
                 ) / "processed_data.parquet"
 
-                processor = DataProcessor()
+                # 증분 수집이므로 min_history_days=1 (히스토리 필터 비활성화)
+                # 기존 parquet과 merge 후 drop_duplicates로 정리됨
+                processor = DataProcessor(min_history_days=1)
                 new_df = processor.process(raw_df)
 
                 if processed_path.exists():
@@ -111,7 +114,7 @@ class DailyRunner:
 
         except Exception as e:
             logger.error(f"데이터 수집 실패: {e}")
-            raise
+            return  # 수집 실패해도 데몬 유지 — step_signal이 기존 parquet 재사용
 
         logger.info("=== Step 1: 데이터 수집 완료 ===")
 
@@ -230,21 +233,95 @@ class DailyRunner:
     # Step 2-B: 하락 신호 즉시 매도 (매일 실행)
     # ------------------------------------------------------------------
 
-    def step_sell_check(self, sector_top_tickers: dict) -> list[dict]:
-        """매일 06:30 실행: 보유 종목 중 하락 신호 → 즉시 매도."""
-        logger.info("=== Step 2-B: 하락 신호 매도 체크 ===")
+    def step_sell_check(
+        self,
+        sector_top_tickers: dict,
+        market_filter: str = None,
+    ) -> list[dict]:
+        """보유 종목 중 하락 신호 → 즉시 매도.
+
+        Args:
+            sector_top_tickers: 섹터별 top 종목
+            market_filter: None=전체, "domestic"=국내만, "overseas"=해외만
+        """
+        market_label = f"[{market_filter}] " if market_filter else ""
+        logger.info(f"=== Step 2-B: {market_label}하락 신호 매도 체크 ===")
 
         from live.signal_to_order import OrderGenerator
         generator = OrderGenerator(config_path="config/live_config.yaml")
 
         try:
-            executed = generator.execute_sell_check(sector_top_tickers)
+            executed = generator.execute_sell_check(sector_top_tickers, market_filter=market_filter)
         except Exception as e:
             logger.error(f"매도 체크 실패: {e}")
             raise
 
-        logger.info(f"=== Step 2-B: 완료 ({len(executed)}건 매도) ===")
+        logger.info(f"=== Step 2-B: {market_label}완료 ({len(executed)}건 매도) ===")
         return executed
+
+    # ------------------------------------------------------------------
+    # 시장별 신호 분리 헬퍼
+    # ------------------------------------------------------------------
+
+    def _filter_by_market(self, sector_top_tickers: dict, market: str) -> dict:
+        """sector_top_tickers에서 특정 시장 종목만 필터링.
+
+        market: "domestic" → .KS/.KQ 종목만 (KOSPI/KOSDAQ)
+                "overseas" → 그 외 종목 (NASDAQ/S&P500)
+        빈 섹터는 제외.
+        """
+        filtered = {}
+        for sector, tickers in sector_top_tickers.items():
+            if market == "domestic":
+                kept = [t for t in tickers if is_domestic(t["ticker"])]
+            else:
+                kept = [t for t in tickers if not is_domestic(t["ticker"])]
+            if kept:
+                filtered[sector] = kept
+        return filtered
+
+    def _save_market_cache(self, weights, top_tickers: dict, market: str):
+        """시장별 신호 캐시 저장 (signal_cache_{market}_{today}.json)."""
+        today_str  = date.today().strftime("%Y%m%d")
+        cache_path = Path("tracking") / f"signal_cache_{market}_{today_str}.json"
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "date":               today_str,
+                    "market":             market,
+                    "final_weights":      weights.tolist(),
+                    "sector_top_tickers": top_tickers,
+                }, f, ensure_ascii=False, indent=2)
+            logger.info(f"[{market.upper()}] 시장별 신호 캐시 저장: {cache_path.name}")
+        except Exception as e:
+            logger.warning(f"[{market.upper()}] 캐시 저장 실패: {e}")
+
+    def _load_market_cache(self, market: str) -> tuple:
+        """시장별 신호 캐시 로드. 없으면 전체 캐시에서 필터링.
+
+        market: "kr" (domestic) 또는 "us" (overseas)
+        """
+        today_str  = date.today().strftime("%Y%m%d")
+        cache_path = Path("tracking") / f"signal_cache_{market}_{today_str}.json"
+
+        if cache_path.exists():
+            try:
+                with open(cache_path, encoding="utf-8") as f:
+                    cache = json.load(f)
+                weights     = np.array(cache["final_weights"])
+                top_tickers = cache["sector_top_tickers"]
+                logger.info(f"[{market.upper()}] 시장별 캐시 로드: {cache_path.name}")
+                return weights, top_tickers
+            except Exception as e:
+                logger.warning(f"[{market.upper()}] 시장별 캐시 로드 실패 → 전체 캐시 폴백: {e}")
+
+        # 폴백: 전체 캐시 로드 후 시장 필터 적용
+        logger.info(f"[{market.upper()}] 시장별 캐시 없음 → 전체 캐시 필터링")
+        weights, top_tickers = self.step_signal(use_cache=True)
+        market_key   = "domestic" if market == "kr" else "overseas"
+        top_tickers  = self._filter_by_market(top_tickers, market_key)
+        return weights, top_tickers
 
     # ------------------------------------------------------------------
     # Step 3: 리밸런싱 주문
@@ -309,19 +386,32 @@ class DailyRunner:
         trade_logger = TradeLogger(self.cfg["logging"]["trade_log_db"])
 
         try:
-            if self.execution_market == "kospi":
+            paper_trading = self.cfg["broker"].get("paper_trading", False)
+
+            # split 모드 또는 paper_trading: 국내 잔고 기준
+            # (해외 sandbox USD $0 → overseas balance $0 → NaN return 방지)
+            if self.execution_market in ("kospi", "split") or paper_trading:
                 balance = api.get_domestic_balance()
             else:
                 balance = api.get_overseas_balance()
 
-            portfolio_value = balance.get("total_eval", 0) + balance.get("cash", 0)
+            # KIS total_eval = 주식+현금 합산값, cash 따로 더하면 이중 계산
+            portfolio_value = balance.get("total_eval", 0)
 
             # 어제 포트폴리오 가치 조회
             perf_df = trade_logger.get_performance_df(days=2)
             if len(perf_df) >= 1:
-                prev_value = perf_df["portfolio_value"].iloc[-1]
-                daily_return = (portfolio_value - prev_value) / prev_value
+                prev_value = float(perf_df["portfolio_value"].iloc[-1])
+                if prev_value > 0:
+                    daily_return = (portfolio_value - prev_value) / prev_value
+                else:
+                    daily_return = 0.0
             else:
+                daily_return = 0.0
+
+            # NaN/Inf 방어 (NOT NULL constraint 위반 방지)
+            import math
+            if math.isnan(daily_return) or math.isinf(daily_return):
                 daily_return = 0.0
 
             trade_logger.log_daily_performance(
@@ -366,35 +456,55 @@ class DailyRunner:
     # ------------------------------------------------------------------
 
     def _daemon_signal_and_sell(self):
-        """데몬용: 신호 생성 + 하락 신호 즉시 매도."""
-        weights, top_tickers = self.step_signal()
-        self._last_weights = weights
-        self._last_top_tickers = top_tickers
-        self.step_sell_check(top_tickers)
+        """데몬용: [KR] 06:30 — 전체 신호에서 국내 종목 분리 + 하락 신호 즉시 매도.
+
+        06:10에 _daemon_us_signal()이 이미 전체 추론을 마치고 캐시를 저장함.
+        여기서는 재추론 없이 캐시 로드 → 국내 종목만 필터 → KR 전용 캐시 저장.
+        이렇게 해야 KOSPI 신호가 NASDAQ 신호(06:10 기준)와 분리됨.
+        """
+        logger.info("=== [KR] KOSPI 신호 분리 및 하락 매도 ===")
+        weights, top_tickers = self.step_signal(use_cache=True)  # 06:10 캐시 재사용
+        kr_top_tickers       = self._filter_by_market(top_tickers, "domestic")
+        self._last_weights     = weights
+        self._last_top_tickers = kr_top_tickers
+        # KR 전용 캐시 저장 (Wave 1/2/3 폴백용)
+        self._save_market_cache(weights, kr_top_tickers, "kr")
+        # 국내 포지션만 하락 신호 체크
+        self.step_sell_check(kr_top_tickers, market_filter="domestic")
+        logger.info(
+            f"[KR] 분리 완료: {sum(len(v) for v in kr_top_tickers.values())}개 국내 종목"
+        )
 
     def _daemon_kr_order(self, twap_wave: int = 1):
         """데몬용: 국내(KR) 종목만 TWAP 파별 주문."""
         weights     = getattr(self, "_last_weights",     None)
         top_tickers = getattr(self, "_last_top_tickers", None)
         if weights is None or not top_tickers:
-            logger.info("[KR] 메모리 신호 없음 → 캐시에서 로드")
-            weights, top_tickers = self.step_signal(use_cache=True)
+            logger.info("[KR] 메모리 신호 없음 → KR 전용 캐시에서 로드")
+            weights, top_tickers = self._load_market_cache("kr")
         self.step_order(weights, top_tickers, twap_wave=twap_wave, market_filter="domestic")
 
     def _daemon_us_signal(self):
-        """데몬용: NASDAQ 종가 직후 (06:10) 해외 신호 생성 + 저장.
+        """데몬용: NASDAQ 종가 직후 (06:10) 전체 추론 + 해외 신호 분리 저장.
 
         06:00 수집 직후 실행. 캐시 무시(use_cache=False)로 신선한 신호 생성.
-        생성된 신호는 당일 US Wave 1/2/3 에서 재사용 (재추론 없음).
+        전체 캐시(domestic+overseas) 저장 후 해외만 필터한 US 전용 캐시도 저장.
+        06:30 _daemon_signal_and_sell은 전체 캐시를 재사용하므로 재추론 불필요.
         """
-        logger.info("=== [US] NASDAQ 종가 기반 신호 생성 ===")
+        logger.info("=== [US] NASDAQ 종가 기반 전체 추론 시작 ===")
         try:
-            weights, top_tickers = self.step_signal(use_cache=False)
+            weights, top_tickers = self.step_signal(use_cache=False)  # 전체 추론
+            us_top_tickers       = self._filter_by_market(top_tickers, "overseas")
             self._us_weights     = weights
-            self._us_top_tickers = top_tickers
-            # 해외 보유 종목 하락 신호 즉시 매도
-            self.step_sell_check(top_tickers)
-            logger.info("[US] 신호 저장 완료 → 23:40/02:00/04:30 집행 예정")
+            self._us_top_tickers = us_top_tickers
+            # US 전용 캐시 저장 (Wave 1/2/3 폴백용)
+            self._save_market_cache(weights, us_top_tickers, "us")
+            # 해외 포지션만 하락 신호 체크
+            self.step_sell_check(us_top_tickers, market_filter="overseas")
+            logger.info(
+                f"[US] 신호 저장 완료: {sum(len(v) for v in us_top_tickers.values())}개 해외 종목"
+                " → 23:40/02:00/04:30 집행 예정"
+            )
         except Exception as e:
             logger.error(f"[US] 신호 생성 실패: {e}")
 
@@ -403,13 +513,19 @@ class DailyRunner:
         weights     = getattr(self, "_us_weights",     None)
         top_tickers = getattr(self, "_us_top_tickers", None)
         if weights is None or not top_tickers:
-            logger.info("[US] 메모리 신호 없음 → 캐시에서 로드")
-            weights, top_tickers = self.step_signal(use_cache=True)
+            logger.info("[US] 메모리 신호 없음 → US 전용 캐시에서 로드")
+            weights, top_tickers = self._load_market_cache("us")
         self.step_order(weights, top_tickers, twap_wave=twap_wave, market_filter="overseas")
 
     def run_daemon(self):
         """스케줄러 데몬: NASDAQ 종가 직후 신호 생성 + KR/US TWAP 3-파."""
         import schedule
+        try:
+            from scheduler import lotto_runner as _lotto_runner
+            _lotto_available = True
+        except ImportError:
+            logger.warning("lotto_runner 모듈 없음 → 로또 분석 스케줄 비활성화")
+            _lotto_available = False
 
         sc = self.cfg["schedule"]
         kr = sc["kr_order_waves"]
@@ -431,6 +547,10 @@ class DailyRunner:
         schedule.every().day.at(kr["wave3"]).do(lambda: self._daemon_kr_order(twap_wave=3))
         schedule.every().day.at(sc["eod_record_time"]).do(self.step_eod)
 
+        # ── 로또 분석 (매주 수요일 10:00) ────────────────────────────
+        if _lotto_available:
+            schedule.every().wednesday.at("10:00").do(_lotto_runner.run)
+
         logger.info("스케줄러 데몬 시작 (KR/US 각 신호 1회 + TWAP 3-파):")
         logger.info(f"  {sc['data_collect_time']} 데이터 수집 (KR + US 전일 종가)")
         logger.info(f"  {sc['us_signal_time']} [US] NASDAQ 종가 신호 생성 + 하락 매도")
@@ -442,6 +562,7 @@ class DailyRunner:
         logger.info(f"  {us['wave1']} [US] Wave 1 (40%, overseas)")
         logger.info(f"  {us['wave2']} [US] Wave 2 (35%, overseas)")
         logger.info(f"  {us['wave3']} [US] Wave 3 (25%, overseas)")
+        logger.info("  매주 수요일 10:00 [LOTTO] 로또 분석 + 텔레그램 발송")
 
         while True:
             schedule.run_pending()

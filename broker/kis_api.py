@@ -335,7 +335,7 @@ class KISApi:
             "ACNT_PRDT_CD":      self.acnt_prdt,
             "KRX_FWDG_ORD_ORGNO": "",
             "ORGN_ODNO":         order_no,
-            "ORD_DVSN":          "02",   # 취소
+            "ORD_DVSN":          "00",   # 지정가 (원주문 유형)
             "RVSE_CNCL_DVSN_CD": "02",  # 취소
             "ORD_QTY":           str(qty),
             "ORD_UNPR":          "0",

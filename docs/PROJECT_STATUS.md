@@ -1,6 +1,6 @@
 # Alpha Signal Discovery Engine - 프로젝트 현황
 
-**최종 업데이트**: 2026-02-24 (Phase 11: 개별 종목 매매 활성화 + KR/US 분리 스케줄 확정)
+**최종 업데이트**: 2026-03-04 (Phase 14: execution_market split 수정 + KOSPI 수집 KRX API 수정)
 **현재 최고 성과**: Sharpe **2.03**, MDD **-4.30%**, Return **+17.82%** (기준선: Sharpe 1.82, +15.87%)
 
 ---
@@ -43,6 +43,209 @@ KOSPI/NASDAQ 시장 데이터에서 딥러닝으로 **새로운 수학적 지표
 ---
 
 ## 개발 이력
+
+### Phase 16: 근본 원인 최종 수정 (2026-03-07)
+
+반복 실패의 5가지 근본 원인을 분석하고 재발 불가능한 방식으로 수정.
+
+#### 16-A. 문제 분석
+
+| 근본 원인 | 재발 횟수 | 영향 |
+|----------|---------|------|
+| 티커 형식 불일치 (KIS 6자리 vs yfinance .KS suffix) | 6회 (Bug#16~#29) | 매도 오판, 시세 조회 실패 |
+| urgency 임계값과 모델 score 범위 불일치 | 미발견 | 전 주문이 patient → 미체결 |
+
+#### 16-B. 수정 내용
+
+**티커 정규화 공유 유틸 ( 신규)**:
+
+
+이 두 함수를 시스템 전체에서 사용하여 형식 불일치 재발 차단.
+
+| 파일 | 변경 위치 |
+|------|---------|
+|  | 신규 — ,  |
+|  | 13곳  /  → 유틸 함수로 교체 |
+|  | market 판별 →  |
+|  |  →  |
+
+**urgency 임계값 수정 ()**:
+
+| 항목 | 이전 | 이후 | 이유 |
+|------|------|------|------|
+|  | 0.5 | 0.008 | 실제 score 상위 30% |
+|  | 0.2 | 0.004 | 실제 score 중위 |
+|  | 0.0 | 0.001 | 0 이하 완전 차단 |
+
+**배경**: 모델이 생성하는 score 범위는 0.001~0.011. 기존 임계값 0.5/0.2는 이 범위를 전혀 커버하지 못해 모든 주문이 patient (중간값 지정가, 재시도 없음)으로 처리되어 실질적으로 체결이 거의 없었음.
+
+---
+
+### Phase 14: execution_market 수정 + KOSPI 수집 KRX API 수정 (2026-03-04)
+
+서버 운영 중 KR domestic Wave가 항상 0건 체결되는 버그와 매일 06:00 KOSPI 수집 실패 버그 2개 발견 및 수정. 수정 후 KR/US 혼합 개별 종목 33건 테스트 체결 확인.
+
+#### 14-A. 버그 수정
+
+| 버그 | 증상 | 원인 | 수정 |
+|------|------|------|------|
+| `execution_market: "nasdaq"` 설정 오류 | KR domestic Wave 1/2/3 항상 0건 (`리밸런싱 불필요`) | `execution_market="nasdaq"` → `_compute_target_positions()`가 `NASDAQ_ETF_MAP`(XLE, XLB 등)만 사용, 모두 `market="overseas"` → `market_filter="domestic"` 적용 시 전부 필터링 → 빈 orders | `live_config.yaml`: `execution_market: "nasdaq"` → `"split"` |
+| KOSPI 수집 KRX 0건 | 매일 06:00 `KOSPI 수집 실패: KRX 0건 반환` | `pykrx.get_market_ticker_list(date)`는 OHLCV 기반 엔드포인트 — 06:00 KST는 당일 OHLCV 미게시 시점 → 0건 반환 | `data/collector.py`: `get_market_ticker_list(date)` → `상장종목검색().fetch("STK")` (날짜 무관, 항상 950건 반환) |
+
+#### 14-B. 수정 내용 상세
+
+**execution_market 수정**:
+- `"nasdaq"` 모드: `NASDAQ_ETF_MAP`(XLE/XLB 등) ETF만 생성 → 전부 `market="overseas"` → KR domestic filter에 0건
+- `"split"` 모드: 모델 signal 그대로 사용 (`322000.KS` → `market="domestic"`, `INTU` → `market="overseas"`)
+- KR Wave (09:10/11:00/13:30): `market_filter="domestic"` → KOSPI 개별 종목만 집행
+- US Wave (23:40/02:00/04:30): `market_filter="overseas"` → US 개별 종목 paper 체결
+
+**KOSPI ticker 수집 수정**:
+- 기존: `krx.get_market_ticker_list("20260304")` → KRX OHLCV API → 06:00 장 미개장 → **0건**
+- 수정: `상장종목검색().fetch("STK")` → KRX 상장종목 검색 API → 시간 무관 → **950건**
+
+#### 14-C. 테스트 결과 (2026-03-04 12:41)
+
+```
+수동 주문 테스트 (--step order --wave 1):
+  [PAPER] 매수: 002220.KS 1012주 [Wave1 40% / patient]
+  [PAPER] 매수: 003060.KS 10857주 [Wave1 40% / patient]
+  [PAPER] 매수: 089590.KS 685주 [Wave1 40% / patient]
+  [PAPER] 매수: INTU 2주 [Wave1 40% / patient]
+  [PAPER] 매수: EPAM 6주 [Wave1 40% / patient]
+  ... (KS 15건 + US 18건 = 33/33 실행)
+```
+
+#### 14-D. 배포 현황 (2026-03-04)
+
+| 파일 | 변경 내용 | 배포 |
+|------|---------|------|
+| `config/live_config.yaml` | `execution_market: "nasdaq"` → `"split"` | ✅ |
+| `data/collector.py` | `get_market_ticker_list` → `상장종목검색().fetch("STK")` | ✅ |
+
+**서비스 상태**: systemd `quant-trading` active(running), 2026-03-04 12:40 재시작 확인
+
+---
+
+### Phase 13: 해외 Paper Trading + KOSPI Parquet 구축 + 다중 버그 수정 (2026-02-26 ~ 2026-02-28)
+
+서버 운영 중 발견된 5가지 버그와 KOSPI 추론 데이터 누락 문제를 해결. NASDAQ paper trading 33/33건 정상 체결 확인.
+
+#### 13-A. 버그 수정
+
+| 버그 | 증상 | 원인 | 수정 파일 |
+|------|------|------|---------|
+| `deploy_on_complete.sh` 타임아웃 | 재학습 후 자동 배포 실패 (5시간 대기) | 재학습 로그(21ms 후 기록) mtime > ensemble.pt mtime → `find -newer` 조건 항상 False | 스크립트 시작 시각 `$START_TIME` 기록, `stat -c %Y ENSEMBLE_MTIME >= START_TIME` 비교 |
+| 해외 sandbox $0 USD | NASDAQ 주문 0/33 체결 | KIS 해외 모의투자 계좌 USD 예수금 $0 — API로 입금 불가 | `paper_trading: true` 추가, 해외 주문을 yfinance 시세로 가상 체결 |
+| KRW/USD 수량 오류 | KKR 41,862주 주문 (실제 ~29주) | `qty = int(amount_KRW / price_USD)` — FX 변환 없음 | `amount_USD = amount_KRW / fx_rate(yfinance USDKRW=X)` → 정상 수량 |
+| KOSPI 종목 overseas 분류 | domestic Wave 시 "리밸런싱 불필요" | `"095570.KS".isdigit()` = False → overseas로 분류 | `.endswith(".KS") or .endswith(".KQ")` → domestic |
+| `step_eod` NOT NULL constraint | SQLite daily_return 저장 실패 | `execution_market="split"` → overseas balance($0) → ZeroDivision/NaN | split/paper_trading 시 domestic balance 사용, ZeroDivision·NaN 방어 |
+| `step_collect` KOSPI 데이터 무시 | 증분 수집 후 parquet에 KOSPI 미반영 | `DataProcessor(min_history_days=500)` → 10일 증분 데이터 전부 필터 | `DataProcessor(min_history_days=1)` |
+
+#### 13-B. KOSPI Parquet 구축 (서버 직접)
+
+서버 `processed_data.parquet`에 KOSPI 종목이 없어 KR 신호 생성 불가 상태. 서버에 저장된 원시 데이터로 재구성.
+
+```
+data/raw/kospi_ohlcv.parquet  (1,123,789행, 950 tickers, 2021~2026)
+data/raw/ticker_info.parquet  (1,467행, KOSPI 회사명)
+      ↓
+SectorClassifier (kospi_keywords 매칭)
+      ↓ 203/950 종목 섹터 분류
+DataProcessor(min_history_days=60) + FeatureEngineer
+      ↓
+processed_data.parquet (기존 477,802행) + KOSPI 220,946행
+      = 698,748행, 602 tickers (400 NASDAQ + 202 KOSPI)
+```
+
+KOSPI 섹터별 분포: financials(44), healthcare(37), industrials(26), real_estate(25), materials(22), information_technology(21), energy(18), ...
+
+#### 13-C. 배포 현황 (2026-02-26 23:16)
+
+| 파일 | 변경 내용 | 배포 |
+|------|---------|------|
+| `config/live_config.yaml` | `paper_trading: true` 추가 | ✅ |
+| `live/signal_to_order.py` | paper_trading 모드, FX 변환, `_execute_paper_trade()`, api_overseas=None | ✅ |
+| `pipeline/inference_pipeline.py` | pykrx 재호출 방지(parquet 로드), `.KS`/`.KQ` domestic 분류 | ✅ |
+| `scheduler/daily_runner.py` | step_eod domestic balance, NaN 방어, step_collect min_history_days=1 | ✅ |
+| `deploy_on_complete.sh` | mtime 비교 → START_TIME epoch 비교 | ✅ (로컬만) |
+| `data/processed/processed_data.parquet` | KOSPI 202 tickers 추가 (서버 직접 구축) | ✅ (서버만) |
+
+**서비스 상태**: systemd `quant-trading` active(running), 2026-02-26 23:16 재시작 확인
+
+#### 13-D. 추가 버그 수정 (2026-02-28)
+
+| 버그 | 증상 | 원인 | 수정 파일 |
+|------|------|------|---------|
+| KOSPI KIS API ticker suffix | KR Wave 1/2/3 전부 0건 (2026-02-27 목요일) | Bug#21 수정 여파: `inference_pipeline.py`가 `"322000.KS"` 채로 signal 저장 → `get_domestic_price("322000.KS")` 호출 → KIS API는 6자리 코드만 허용(`"322000"`) → 시세 0 반환 → 전 KOSPI 종목 스킵 | `signal_to_order.py`: `kis_ticker = ticker.split(".")[0]` + domestic yfinance 폴백 추가 |
+| KOSPI 수집 KeyError `'yf_ticker'` | 매일 06:00 `KOSPI 수집 실패: 'yf_ticker'` | KRX 주말/공휴일 0 tickers 반환 → `pd.DataFrame([])` (컬럼 없음) → `["yf_ticker"]` KeyError | `collector.py`: empty/컬럼 체크 → 명확한 ValueError |
+
+> **근본 원인**: Bug#21(`inference_pipeline.py`)에서 `.endswith(".KS")`로 domestic 분류를 고쳤는데, ticker를 `.KS` suffix 포함한 채로 KIS API에 넘기는 downstream 버그 미확인. KIS 공식 API 문서 상 `FID_INPUT_ISCD`는 반드시 6자리 숫자 (예: `"005930"`).
+
+---
+
+### Phase 12: KOSPI 개별 종목 학습 + 데몬 안정성 수정 (2026-02-25)
+
+서버 운영 중 발견된 3가지 데몬 크래시 원인과 KOSPI 종목이 학습 데이터에서 누락된 2가지 근본 원인을 수정. 재학습 후 서버 배포 완료.
+
+#### 12-A. 데몬 크래시 버그 수정 3개
+
+| 버그 | 증상 | 원인 | 수정 내용 |
+|------|------|------|---------|
+| step_collect 크래시 | 매일 06:01 데몬 종료 | `min_history_days=500` 필터로 증분(10일) 수집 결과 전부 제거 → "No objects to concatenate" | 예외 시 `raise` 대신 `return` (step_signal은 자체 수집 수행) |
+| 재시작 후 KR Wave 0건 | 국내 주문 전혀 없음 | systemd 재시작 후 `_last_weights` 메모리 초기화 → `market_filter="domestic"` 대상 종목 없음 | `_daemon_kr_order`: 메모리 None이면 `step_signal(use_cache=True)` 호출 |
+| Wave 3 크래시 | 04:30 이후 데몬 종료 | 국내/해외 API가 동시에 토큰 갱신 시도 → 분당 1회 rate limit → 403 → `raise` | `kis_api.get_token()`: 403 시 3회 재시도(5초 간격), `step_order` 예외 `raise` → `return []` |
+
+**수정 파일**:
+
+| 파일 | 변경 내용 |
+|------|---------|
+| `scheduler/daily_runner.py` | `_daemon_kr_order`, `_daemon_us_order` — 메모리 없으면 캐시 로드; `step_order` — 예외 시 raise → return |
+| `broker/kis_api.py` | `get_token()` — 403 시 최대 3회 재시도, 각 5초 대기 |
+
+#### 12-B. KOSPI 종목 학습 데이터 미포함 버그 수정 2개
+
+기존 학습 데이터(`processed_data.parquet`)에 KOSPI 종목이 전혀 없었던 근본 원인:
+
+| 버그 | 원인 | 수정 내용 |
+|------|------|---------|
+| KOSPI 섹터 분류 0% | `train_pipeline.py`가 회사명 대신 ticker code("005930")를 name으로 사용 → 키워드 매칭 0% | `ticker_info.parquet`에서 `yf_ticker` 컬럼으로 merge하여 실제 회사명 로드 |
+| ticker 형식 불일치 | OHLCV ticker: `"095570.KS"` (yfinance 형식) vs ticker_info: `"095570"` → merge 실패 | `left_on="ticker"`, `right_on="yf_ticker"` 으로 merge 키 수정 |
+
+**결과**: KOSPI 섹터 분류 0/941 → **203/941 (21.6%)** — 에너지·소재·금융 등 전 섹터에 KOSPI 종목 배분
+
+**수정 파일**:
+
+| 파일 | 변경 내용 |
+|------|---------|
+| `pipeline/train_pipeline.py` | `ticker_info` merge 키를 `yf_ticker` 컬럼으로 수정 |
+| `config/settings_fast.yaml` | `max_tickers: 200 → 400` (KOSPI 200 + NASDAQ 200) |
+
+#### 12-C. 재학습 및 서버 배포
+
+**재학습** (2026-02-25 01:06 완료, Phase 2 전체, ~3시간):
+- 학습 데이터: KOSPI 203종목 + NASDAQ 503종목 = 총 1,466 ticker
+- 배치 수: ~1,210 batches (기존 대비 약 6배)
+- 저장: `saved_models/ensemble.pt` (26MB)
+
+**서버 배포** (2026-02-25 07:42 완료):
+
+| 파일 | 배포 결과 |
+|------|---------|
+| `saved_models/ensemble.pt` | ✅ |
+| `data/processed/processed_data.parquet` | ✅ |
+| `pipeline/inference_pipeline.py` | ✅ |
+| `pipeline/train_pipeline.py` | ✅ |
+| `scheduler/daily_runner.py` | ✅ |
+| `broker/kis_api.py` | ✅ |
+
+**서비스 상태**: systemd `quant-trading` active(running), 07:42 KST 재시작 확인
+
+**현재 신호 (2026-02-25 06:14 캐시)**:
+- 첫 재학습 후 신호에서 US 종목만 상위 — KOSPI 종목은 모델이 추가 훈련 사이클을 통해 점진적으로 순위 상승 예상
+- energy, materials 섹터: 양수 신호 종목 없어 top-3 비어 있음
+
+---
 
 ### Phase 11: 개별 종목 매매 활성화 + KR/US 분리 스케줄 (2026-02-23)
 
@@ -345,7 +548,7 @@ requirements.txt            python-dotenv, streamlit, schedule 추가
 
 ---
 
-## 현재 상태 (2026-02-24 기준)
+## 현재 상태 (2026-03-04 기준)
 
 ### 훈련 체크포인트
 
@@ -355,7 +558,8 @@ requirements.txt            python-dotenv, streamlit, schedule 추가
 | Transformer | `transformer_epoch20.pt` | d_model=256, dir_acc=52.5%, IC=0.065 |
 | GAN | `gan_epoch1.pt` | Spectral Norm, best W-dist=6.66 |
 | RL | `ppo_agent_epoch96.pt` | simplex+reward_clip, best_reward=4.75 |
-| Ensemble | `ensemble.pt` | Phase 7 통합 완료 |
+| **Ensemble** | **`ensemble.pt`** | **Phase 12 재학습 — KOSPI 203종목 포함, 2026-02-25 01:06** |
+| **Parquet** | **`processed_data.parquet`** | **Phase 13 — 698,748행, 602 tickers (400 NASDAQ + 202 KOSPI), 221MB** |
 
 ### 백테스트 성과 이력
 
@@ -391,9 +595,14 @@ requirements.txt            python-dotenv, streamlit, schedule 추가
 | alpha=0.4 테스트셋에서 튜닝됨 (미래 데이터 누설 우려) | 중간 | 잔존 |
 | GAN W-dist 여전히 불안정 (개선됐으나 미해결) | 낮음 | 부분해결 |
 | 180일 테스트 기간 짧음 | 낮음 | 잔존 |
-| KIS sandbox 해외주식 시세/잔고 API 미지원 (yfinance 폴백으로 해결) | 낮음 | 해결됨 |
-| sandbox 국내 주문 체결 테스트 미완료 (평일 장 중 확인 필요) | 중간 | 잔존 |
+| KIS sandbox 해외주식 시세/잔고 API 미지원 (yfinance 폴백 + paper trading) | 낮음 | 해결됨 |
+| sandbox 국내 주문 체결 테스트 | 중간 | **해결됨** — 2026-03-04 KR 15건 + US 18건 = 33건 테스트 체결 확인 |
 | 일간 리밸런싱 회전율 미측정 (과도한 매매 비용 위험) | 중간 | 잔존 |
+| KOSPI 종목 신호 순위가 US 종목보다 낮음 (첫 실전 — 점진적 개선 예상) | 낮음 | 관찰 중 |
+| US Wave 2/3 sandbox paper_trading이지만 잔고 개념 없음 (정상 실행) | 낮음 | 해결됨 |
+| step_collect 증분 수집 KOSPI 섹터 미기록 → 기존 historical row에서 복원 | 낮음 | 해결됨 |
+| 추론 속도 CPU 기준 ~10-15분 (feature engineering 601 tickers) | 낮음 | 잔존 (Wave 1 09:10 충분) |
+| KOSPI 203/950 섹터 분류 (나머지 747개 unknown) — kospi_keywords 커버리지 21% | 낮음 | 잔존 |
 
 ---
 

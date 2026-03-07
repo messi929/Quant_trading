@@ -9,7 +9,9 @@ model inference (daily)
 sector_weights (11개 섹터, 합=1.0)
     │  alpha=0.4 blending (40% 모델 + 60% equal-weight)
     ▼
-OrderGenerator → KIS API → KODEX ETF 매수/매도
+OrderGenerator
+    ├── domestic (KOSPI .KS/.KQ) → KIS domestic API → 실 체결
+    └── overseas (NASDAQ)        → paper_trading=True → yfinance 가상 체결
     │
     ▼
 TradeLogger (SQLite) → Streamlit Dashboard
@@ -18,6 +20,10 @@ TradeLogger (SQLite) → Streamlit Dashboard
 weekly retrain (Transformer, ~30분)
 monthly retrain (VAE→RL 전체, ~2시간)
 ```
+
+**현재 모드** (2026-02-26 기준):
+- 국내(KOSPI): KIS sandbox 실주문 (내일 09:10 KR Wave 1부터 첫 체결 예정)
+- 해외(NASDAQ): `paper_trading=True` — yfinance 시세 기준 가상 체결, DB에 `mode='paper'` 기록
 
 ## 1. 초기 설정
 
@@ -40,12 +46,21 @@ setup_live.bat
 
 ### 1-3. .env 파일 (수동 작성 시)
 ```
-KIS_APP_KEY=your_app_key
-KIS_APP_SECRET=your_app_secret
-KIS_CANO=12345678          # 계좌번호 8자리
-KIS_ACNT_PRDT_CD=01        # 계좌상품코드
+# 국내 계좌 (KIS domestic)
+KIS_DOMESTIC_APP_KEY=your_app_key
+KIS_DOMESTIC_APP_SECRET=your_app_secret
+KIS_DOMESTIC_CANO=12345678
+KIS_DOMESTIC_ACNT_PRDT_CD=01
+
+# 해외 계좌 (KIS overseas) — sandbox USD $0이므로 paper_trading=True 사용
+KIS_OVERSEAS_APP_KEY=your_app_key
+KIS_OVERSEAS_APP_SECRET=your_app_secret
+KIS_OVERSEAS_CANO=12345678
+
 KIS_MODE=sandbox            # sandbox | production
 ```
+
+**주의**: KIS sandbox 해외 모의투자 계좌는 USD 예수금 $0 — `paper_trading: true` 설정으로 yfinance 가상 체결을 사용합니다.
 
 ## 2. 모델 훈련 (최초 1회)
 
@@ -81,7 +96,21 @@ python scheduler/daily_runner.py
 ```bash
 python scheduler/daily_runner.py --daemon
 ```
-설정된 시간(06:00/06:30/08:50/16:10)에 자동 실행됩니다.
+
+**일간 스케줄 (KST)**:
+
+| 시각 | 작업 |
+|------|------|
+| 06:00 | 데이터 수집 (KOSPI + NASDAQ 증분) |
+| 06:10 | [US] NASDAQ 종가 신호 생성 + 하락 매도 |
+| 06:30 | [KR] 신호 생성 + 하락 매도 |
+| 09:10 | [KR] Wave 1 (40%, domestic) |
+| 11:00 | [KR] Wave 2 (35%, domestic) |
+| 13:30 | [KR] Wave 3 (25%, domestic) |
+| 16:00 | EOD 기록 (국내 잔고 기준) |
+| 23:40 | [US] Wave 1 (40%, overseas/paper) |
+| 02:00 | [US] Wave 2 (35%, overseas/paper) |
+| 04:30 | [US] Wave 3 (25%, overseas/paper) |
 
 ### Windows 작업 스케줄러
 `setup_live.bat` 실행 시 자동 등록됩니다.
@@ -121,7 +150,16 @@ streamlit run dashboard/app.py
 - 최근 거래 내역
 - 재학습 이력
 
-## 6. 섹터 → ETF 매핑
+## 6. 매매 방식
+
+**현재**: `execution_market: "split"` — 개별 종목 직접 매매 (ETF 아님)
+
+- 섹터당 모델 예측 상위 3 종목 선정 (`score > 0`인 종목만)
+- KOSPI 종목 (`*.KS`, `*.KQ`) → domestic → KIS sandbox 실주문
+- NASDAQ 종목 → overseas → paper_trading (yfinance 가상 체결)
+- 섹터 배분 금액을 상위 3 종목에 균등 분배
+
+**참고용 ETF 매핑** (ETF 모드 전환 시):
 
 | 섹터 | KOSPI ETF | NASDAQ ETF |
 |------|-----------|------------|
@@ -136,8 +174,6 @@ streamlit run dashboard/app.py
 | Comm. Svcs | KODEX IT (261110) | XLC |
 | Utilities | KODEX 유틸리티 (337140) | XLU |
 | Real Estate | KODEX 리츠 (395400) | XLRE |
-
-`config/live_config.yaml`의 `trading.execution_market`으로 KOSPI/NASDAQ 선택
 
 ## 7. 리스크 관리
 
@@ -174,14 +210,35 @@ run_step.bat                # 스케줄러 헬퍼
 run_retrain.bat             # 재학습 헬퍼
 ```
 
-## 9. 주의사항
+## 9. 서버 관리 명령어
 
-1. **반드시 sandbox 모드로 먼저 테스트** — `live_config.yaml`의 `broker.mode: "sandbox"` 유지
-2. **실전 전환 체크리스트**:
-   - [ ] sandbox로 1주일 이상 신호 검증
+```bash
+# 서버 접속
+ssh root@77.42.78.9
+
+# 로그 실시간 확인
+ssh root@77.42.78.9 "tail -f /opt/quant/logs/quant_$(date +%Y-%m-%d).log"
+
+# 서비스 상태
+ssh root@77.42.78.9 "systemctl status quant-trading --no-pager"
+
+# 파일 배포 (변경 후)
+scp <파일> root@77.42.78.9:/opt/quant/<경로>
+ssh root@77.42.78.9 "systemctl restart quant-trading"
+
+# KOSPI parquet 재구축 (서버에서)
+ssh root@77.42.78.9 "cd /opt/quant && python3 <rebuild_script>"
+```
+
+## 10. 주의사항
+
+1. **sandbox 모드 유지** — `live_config.yaml`의 `broker.mode: "sandbox"`, `paper_trading: true`
+2. **해외 주문은 paper trading** — KIS sandbox USD $0, 가상 체결 (yfinance 시세 기준)
+3. **실전 전환 체크리스트**:
+   - [ ] sandbox로 1주일 이상 KR 신호 및 주문 검증
    - [ ] dir_acc > 52% 확인
-   - [ ] 대시보드에서 섹터 배분 정상 확인
+   - [ ] `paper_trading: false`, `mode: "production"` 전환
    - [ ] 소액(1백만원)으로 먼저 실전 테스트
-3. **API 호출 제한**: KIS는 초당 20회 제한 — 대량 주문 시 자동 대기
-4. **KODEX ETF 유동성**: 일부 소형 ETF는 스프레드가 클 수 있음
-5. **.env 파일은 절대 git commit 금지** (`.gitignore`에 추가 필요)
+4. **API 호출 제한**: KIS 토큰 분당 1회 → `get_token()` 3회 재시도(5초 간격) 구현됨
+5. **KOSPI 섹터 커버리지**: 950종목 중 203종목만 섹터 분류 (21.4%) — unknown 종목은 신호 생성 제외
+6. **.env 파일은 절대 git commit 금지**
