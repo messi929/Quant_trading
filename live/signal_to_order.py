@@ -98,6 +98,16 @@ class OrderGenerator:
         # Phase D
         self.score_cost_min = exec_cfg.get("score_cost_threshold", 0.05)
 
+        # Kelly position sizing toggle (default: enabled)
+        self.use_kelly_sizing = exec_cfg.get("use_kelly_sizing", True)
+        self.kelly_lookback   = exec_cfg.get("kelly_lookback_days", 20)
+        self._kelly_vol_cache: dict = {}  # {ticker: volatility}
+
+        # 시장 충격 모델
+        from strategy.market_impact import MarketImpactModel
+        self._impact_model = MarketImpactModel()
+        self.max_impact_pct = exec_cfg.get("max_impact_pct", 0.5)
+
         _mode = self.cfg["broker"]["mode"]
         self.paper_trading = self.cfg["broker"].get("paper_trading", False)
         if self.paper_trading:
@@ -579,6 +589,45 @@ class OrderGenerator:
             "note":      f"wave{self.twap_wave}",
         }
 
+    def _kelly_scale(self, ticker: str, score: float, market: str) -> float:
+        """Half-Kelly 스케일 팩터 계산.
+
+        Args:
+            ticker: 종목 코드
+            score: 모델 신호 강도 (0 ~ 0.05 범위)
+            market: "domestic" or "overseas"
+
+        Returns:
+            0.3 ~ 1.5 범위 스케일 팩터
+        """
+        if not self.use_kelly_sizing:
+            return 1.0
+
+        # 변동성 조회 (캐시 사용)
+        norm = kis_code(ticker)
+        vol = self._kelly_vol_cache.get(norm)
+
+        if vol is None:
+            try:
+                import yfinance as yf
+                hist = yf.Ticker(ticker).history(period=f"{self.kelly_lookback}d")
+                if len(hist) >= 5:
+                    vol = hist["Close"].pct_change().dropna().std()
+                    self._kelly_vol_cache[norm] = vol
+            except Exception:
+                pass
+
+        if vol is None or vol < 1e-8:
+            return 1.0
+
+        # Half-Kelly: f = signal_edge / variance (scaled down by 0.5)
+        # signal_edge: score 범위 0.001~0.011 → 정규화
+        normalized_score = min(score / 0.008, 2.0)  # 0.008 = 기준 score (aggressive 임계값)
+        kelly_f = 0.5 * normalized_score / (vol * 100 + 1e-8)
+
+        # 0.3 ~ 1.5로 클리핑 (과도한 배율 방지)
+        return float(np.clip(kelly_f, 0.3, 1.5))
+
     def _compute_target_positions(
         self,
         weights: np.ndarray,
@@ -699,6 +748,34 @@ class OrderGenerator:
                 qty = int(amount_for_qty / current_price)
                 if qty < 1:
                     continue
+
+                # Half-Kelly 포지션 조정 (신호 강도 반영)
+                if self.use_kelly_sizing and score > 0:
+                    kelly_s = self._kelly_scale(ticker, score, market)
+                    qty = max(1, int(qty * kelly_s))
+                    if kelly_s != 1.0:
+                        logger.debug(
+                            f"Kelly sizing {ticker}: score={score:.4f}, "
+                            f"kelly_scale={kelly_s:.2f}, qty={qty}"
+                        )
+
+                # 시장 충격 조정 (거래량 대비 주문 크기 제한)
+                try:
+                    import yfinance as yf
+                    _vol_data = yf.Ticker(ticker if '.' in ticker else f"{ticker}.KS" if market == 'domestic' else ticker)
+                    _hist = _vol_data.history(period="20d")
+                    if len(_hist) >= 5:
+                        avg_vol = _hist["Volume"].mean()
+                        daily_vol_pct = _hist["Close"].pct_change().dropna().std()
+                        tier = self._impact_model.get_volume_tier(avg_vol, "KOSPI" if market == "domestic" else "NASDAQ")
+                        qty = self._impact_model.adjust_order_size(
+                            qty, avg_vol, daily_vol_pct, current_price,
+                            max_impact_pct=self.max_impact_pct,
+                            market_cap_tier=tier,
+                            market="KOSPI" if market == "domestic" else "NASDAQ",
+                        )
+                except Exception:
+                    pass  # 충격 모델 실패 시 원래 수량 유지
 
                 if ticker in targets:
                     targets[ticker]["target_qty"]    += qty

@@ -61,6 +61,23 @@ class DailyRunner:
         self._kr_layer2_scales: dict = {}   # Layer 2 장중 신호 (KR)
         self._us_layer2_scales: dict = {}   # Layer 2 장중 신호 (US)
 
+        from strategy.signal import MarketRegimeDetector
+        self._regime_detector = MarketRegimeDetector()
+        self._current_regime: dict = {"regime": "neutral", "scale_factor": 1.0, "alpha": 0.4}
+
+        # 헤지 매니저
+        from strategy.hedge import PortfolioHedger
+        self._hedger = PortfolioHedger()
+
+        # DART 공시 이벤트 클라이언트
+        try:
+            from data.dart_client import DartClient
+            self._dart_client = DartClient()
+            self._dart_available = self._dart_client.is_available
+        except ImportError:
+            self._dart_available = False
+            logger.info("DART 클라이언트 미설치 — 공시 이벤트 비활성화")
+
         logger.info("DailyRunner 초기화 완료")
 
     # ------------------------------------------------------------------
@@ -515,6 +532,46 @@ class DailyRunner:
         except Exception as e:
             logger.error(f"[US] 신호 생성 실패: {e}")
 
+        # 레짐 감지 (시장 레짐 업데이트) + 헤지 신호
+        perf_df = None
+        try:
+            from tracking.trade_log import TradeLogger
+            trade_log = TradeLogger(self.cfg["logging"]["trade_log_db"])
+            perf_df = trade_log.get_performance_df(days=90)
+            if len(perf_df) >= 20 and "daily_return" in perf_df.columns:
+                market_rets = pd.Series(
+                    perf_df["daily_return"].values,
+                    index=pd.to_datetime(perf_df["date"])
+                )
+                self._current_regime = self._regime_detector.detect(market_rets)
+                logger.info(
+                    f"시장 레짐: {self._current_regime['regime']} "
+                    f"(scale={self._current_regime['scale_factor']:.1f}, "
+                    f"alpha={self._current_regime['alpha']:.2f}) — "
+                    f"{self._current_regime['details']}"
+                )
+        except Exception as e:
+            logger.warning(f"레짐 감지 실패: {e}")
+
+        # 헤지 신호 계산
+        try:
+            if perf_df is not None and len(perf_df) >= 20 and "daily_return" in perf_df.columns:
+                port_rets = pd.Series(perf_df["daily_return"].values, index=pd.to_datetime(perf_df["date"]))
+                hedge_signal = self._hedger.compute_hedge_signal(
+                    port_rets,
+                    regime=self._current_regime.get("regime", "neutral"),
+                )
+                if hedge_signal["should_rebalance"]:
+                    logger.info(
+                        f"헤지 신호: ratio={hedge_signal['hedge_ratio']:.0%}, "
+                        f"beta={hedge_signal['beta']:.2f} — {hedge_signal['reason']}"
+                    )
+                    for inst, ratio in hedge_signal["instruments"].items():
+                        if ratio > 0:
+                            logger.info(f"  {inst}: {ratio:.1%}")
+        except Exception as e:
+            logger.warning(f"헤지 신호 계산 실패: {e}")
+
     def _daemon_us_order(self, twap_wave: int = 1):
         """데몬용: 해외(US) 종목 TWAP 파별 주문 (06:10 생성된 신호 사용)."""
         weights     = getattr(self, "_us_weights",     None)
@@ -646,6 +703,12 @@ class DailyRunner:
         KIS API로 현재가 조회 → 인트라데이 모멘텀 스케일 계산 → 메모리 저장.
         다음 Wave 실행 시 이 스케일이 주문 수량에 반영됨.
         """
+        # 스탑로스 체크
+        try:
+            self._check_intraday_stoploss(stoploss_pct=0.03, market_filter="domestic")
+        except Exception as e:
+            logger.error(f"스탑로스 체크 오류: {e}")
+
         logger.info(f"=== [KR] Layer 2 장중 업데이트 #{update_no} ===")
         top_tickers = getattr(self, "_last_top_tickers", None)
         if not top_tickers:
@@ -665,12 +728,72 @@ class DailyRunner:
         except Exception as e:
             logger.error(f"[KR] Layer 2 업데이트 실패: {e}")
 
+        # DART 공시 이벤트 확인
+        try:
+            dart_scales = self._check_dart_events(market_filter="domestic")
+            if dart_scales:
+                # 기존 Layer 2 스케일에 DART 이벤트 스케일 병합
+                for ticker, scale in dart_scales.items():
+                    self._kr_layer2_scales[ticker] = self._kr_layer2_scales.get(ticker, 1.0) * scale
+                logger.info(f"DART 이벤트 → Layer 2 스케일 반영: {len(dart_scales)}종목")
+        except Exception as e:
+            logger.warning(f"DART 이벤트 처리 오류: {e}")
+
+    def _check_dart_events(self, market_filter: str = "domestic") -> dict:
+        """DART 공시 이벤트 확인 및 Layer 2 스케일에 반영.
+
+        강한 부정적 공시 → Layer 2 스케일 0.3 (축소)
+        강한 긍정적 공시 → Layer 2 스케일 1.3 (확대)
+
+        Returns:
+            {ticker_normalized: scale_factor} 이벤트 기반 스케일
+        """
+        if not self._dart_available:
+            return {}
+
+        try:
+            event_signals = self._dart_client.get_event_signals(days_back=1)
+            if not event_signals:
+                return {}
+
+            scales = {}
+            for corp_name, info in event_signals.items():
+                score = info["score"]
+                if score < -0.5:
+                    scale = 0.3  # 강한 부정적 → 대폭 축소
+                elif score < -0.2:
+                    scale = 0.6  # 약한 부정적 → 축소
+                elif score > 0.5:
+                    scale = 1.3  # 강한 긍정적 → 확대
+                elif score > 0.2:
+                    scale = 1.15  # 약한 긍정적 → 소폭 확대
+                else:
+                    continue
+
+                scales[corp_name] = scale
+                logger.info(
+                    f"[DART 이벤트] {corp_name}: score={score:+.2f} → scale={scale:.1f} "
+                    f"({info['events'][0][:50]})"
+                )
+
+            return scales
+
+        except Exception as e:
+            logger.warning(f"DART 이벤트 확인 실패: {e}")
+            return {}
+
     # ------------------------------------------------------------------
     # US Layer 2 장중 업데이트
     # ------------------------------------------------------------------
 
     def _daemon_us_intraday_update(self, update_no: int = 1):
         """데몬용: [US] 장중 Layer 2 신호 업데이트 (01:00, 03:30 KST)."""
+        # 스탑로스 체크
+        try:
+            self._check_intraday_stoploss(stoploss_pct=0.03, market_filter="overseas")
+        except Exception as e:
+            logger.error(f"US 스탑로스 체크 오류: {e}")
+
         logger.info(f"=== [US] Layer 2 장중 업데이트 #{update_no} ===")
         top_tickers = getattr(self, "_us_top_tickers", None)
         if not top_tickers:
@@ -688,6 +811,106 @@ class DailyRunner:
             )
         except Exception as e:
             logger.error(f"[US] Layer 2 업데이트 실패: {e}")
+
+    # ------------------------------------------------------------------
+    # 인트라데이 스탑로스 체크
+    # ------------------------------------------------------------------
+
+    def _check_intraday_stoploss(
+        self,
+        stoploss_pct: float = 0.03,
+        market_filter: str = None,
+    ) -> list:
+        """인트라데이 스탑로스 체크.
+
+        각 포지션의 현재 손실이 stoploss_pct 초과 시 즉시 매도.
+
+        Args:
+            stoploss_pct: 스탑로스 임계값 (기본 3%)
+            market_filter: "domestic", "overseas", or None
+
+        Returns:
+            List of triggered stop-loss sell results
+        """
+        logger.info(f"[스탑로스 체크] 임계값={stoploss_pct:.0%}")
+        from live.signal_to_order import OrderGenerator
+        gen = OrderGenerator(config_path="config/live_config.yaml")
+
+        try:
+            current_positions = gen._get_current_positions()
+        except Exception as e:
+            logger.warning(f"포지션 조회 실패: {e}")
+            return []
+
+        stop_orders = []
+        from utils.ticker_utils import is_domestic, kis_code
+        import yfinance as yf
+
+        for ticker, pos in current_positions.items():
+            qty = pos.get("qty", 0)
+            if qty <= 0:
+                continue
+
+            # 시장 필터
+            is_dom = is_domestic(ticker)
+            if market_filter == "domestic" and not is_dom:
+                continue
+            if market_filter == "overseas" and is_dom:
+                continue
+
+            # 평균단가 조회
+            avg_price = pos.get("avg_price", 0)
+            if avg_price <= 0:
+                continue
+
+            # 현재가 조회
+            try:
+                if is_dom:
+                    api = gen.api_domestic
+                    current_price = float(api.get_domestic_price(kis_code(ticker))["price"])
+                else:
+                    try:
+                        api = gen.api_overseas
+                        current_price = float(api.get_overseas_price(ticker, "NAS")["price"])
+                    except Exception:
+                        current_price = float(yf.Ticker(ticker).fast_info.last_price)
+            except Exception as e:
+                logger.debug(f"{ticker} 현재가 조회 실패: {e}")
+                continue
+
+            loss_pct = (current_price - avg_price) / avg_price
+
+            if loss_pct < -stoploss_pct:
+                logger.warning(
+                    f"[스탑로스 발동] {ticker}: avg={avg_price:.0f}, "
+                    f"current={current_price:.0f}, loss={loss_pct:.1%}"
+                )
+                stop_orders.append({
+                    "ticker":        ticker,
+                    "side":          "sell",
+                    "qty":           qty,
+                    "sector":        pos.get("sector", "unknown"),
+                    "market":        "domestic" if is_dom else "overseas",
+                    "exchange":      "",
+                    "score":         0.0,
+                    "target_amount": 0,
+                })
+
+        if not stop_orders:
+            logger.info("[스탑로스 체크] 발동 없음")
+            return []
+
+        logger.warning(f"[스탑로스] {len(stop_orders)}건 발동")
+        executed = []
+        for order in stop_orders:
+            try:
+                result = gen._execute_with_retry(order, "aggressive")
+                gen.logger.log_trade(result, note="stoploss")
+                executed.append(result)
+            except Exception as e:
+                logger.error(f"스탑로스 실패 [{order['ticker']}]: {e}")
+
+        return executed
 
     # ------------------------------------------------------------------
     # KR 시간외 세션

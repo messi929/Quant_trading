@@ -24,6 +24,10 @@ class SectorClassifier:
     ) -> pd.DataFrame:
         """Classify KOSPI tickers by name keyword matching.
 
+        When a company name matches keywords from multiple sectors, the sector
+        with the highest number of matching keywords wins (best-match logic).
+        Ties are broken by GICS sector order (lower gics_code wins).
+
         Args:
             ticker_info: DataFrame with 'ticker' and 'name' columns
 
@@ -31,15 +35,28 @@ class SectorClassifier:
             DataFrame with added 'sector' column
         """
         df = ticker_info.copy()
-        df["sector"] = "unknown"
 
-        for sector_key, sector_def in self.sectors.items():
-            keywords = sector_def.get("kospi_keywords", [])
-            if not keywords:
-                continue
-            pattern = "|".join(keywords)
-            mask = df["name"].str.contains(pattern, na=False)
-            df.loc[mask & (df["sector"] == "unknown"), "sector"] = sector_key
+        # Build per-sector keyword lists once
+        sector_keywords: dict[str, list[str]] = {
+            sector_key: sector_def.get("kospi_keywords", [])
+            for sector_key, sector_def in self.sectors.items()
+            if sector_def.get("kospi_keywords")
+        }
+
+        def _best_sector(name: str) -> str:
+            """Return the sector with the most keyword hits for a company name."""
+            if not isinstance(name, str) or not name:
+                return "unknown"
+            best_sector = "unknown"
+            best_count = 0
+            for sector_key, keywords in sector_keywords.items():
+                count = sum(1 for kw in keywords if kw in name)
+                if count > best_count:
+                    best_count = count
+                    best_sector = sector_key
+            return best_sector
+
+        df["sector"] = df["name"].apply(_best_sector)
 
         classified = (df["sector"] != "unknown").sum()
         logger.info(

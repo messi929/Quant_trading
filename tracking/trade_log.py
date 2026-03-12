@@ -38,7 +38,8 @@ class TradeLogger:
         sharpe_30d      REAL,
         mdd_cumul       REAL,
         model_version   TEXT,
-        n_trades        INTEGER DEFAULT 0
+        n_trades        INTEGER DEFAULT 0,
+        daily_turnover  REAL DEFAULT 0.0
     );
 
     CREATE TABLE IF NOT EXISTS model_signals (
@@ -73,6 +74,13 @@ class TradeLogger:
                 stmt = stmt.strip()
                 if stmt:
                     conn.execute(stmt)
+            # Backward compat: add daily_turnover column if missing
+            try:
+                conn.execute(
+                    "ALTER TABLE daily_performance ADD COLUMN daily_turnover REAL DEFAULT 0.0"
+                )
+            except sqlite3.OperationalError:
+                pass  # Column already exists
             conn.commit()
 
     def _conn(self) -> sqlite3.Connection:
@@ -141,6 +149,7 @@ class TradeLogger:
         benchmark_return: Optional[float] = None,
         model_version: str = "",
         n_trades: int = 0,
+        turnover: float = 0.0,
     ):
         """일별 성과 기록."""
         today = date.today().isoformat()
@@ -153,16 +162,16 @@ class TradeLogger:
             conn.execute(
                 """INSERT OR REPLACE INTO daily_performance
                    (date, portfolio_value, daily_return, benchmark_return,
-                    sharpe_30d, mdd_cumul, model_version, n_trades)
-                   VALUES (?,?,?,?,?,?,?,?)""",
+                    sharpe_30d, mdd_cumul, model_version, n_trades, daily_turnover)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
                 (today, portfolio_value, daily_return, benchmark_return,
-                 sharpe_30d, mdd_cumul, model_version, n_trades),
+                 sharpe_30d, mdd_cumul, model_version, n_trades, turnover),
             )
             conn.commit()
 
         logger.info(
             f"일별 성과 기록: date={today}, return={daily_return:.2%}, "
-            f"sharpe_30d={sharpe_30d:.2f}, mdd={mdd_cumul:.2%}"
+            f"sharpe_30d={sharpe_30d:.2f}, mdd={mdd_cumul:.2%}, turnover={turnover:.2%}"
         )
 
     def log_retrain(
@@ -257,6 +266,75 @@ class TradeLogger:
             "30일Sharpe":  f"{perf_df['sharpe_30d'].iloc[-1]:.2f}" if not perf_df.empty else "N/A",
             "최대낙폭":      f"{perf_df['mdd_cumul'].min():.2%}",
             "수익일비율":    f"{(perf_df['daily_return'] > 0).mean():.1%}",
+        }
+
+    def compute_turnover(self, date_str: str = None) -> float:
+        """일별 턴오버 계산: sum(매수 금액) / 포트폴리오 가치.
+
+        Args:
+            date_str: 계산할 날짜 (ISO 형식, None이면 오늘).
+
+        Returns:
+            Turnover ratio (0.0 if data is unavailable).
+        """
+        if date_str is None:
+            date_str = date.today().isoformat()
+
+        with self._conn() as conn:
+            # 해당 날짜 매수 총액
+            row = conn.execute(
+                """SELECT COALESCE(SUM(amount), 0)
+                   FROM trades
+                   WHERE DATE(timestamp) = ? AND side = 'buy'""",
+                (date_str,),
+            ).fetchone()
+            buy_total = row[0] if row else 0.0
+
+            # 해당 날짜 포트폴리오 가치
+            pv_row = conn.execute(
+                "SELECT portfolio_value FROM daily_performance WHERE date = ?",
+                (date_str,),
+            ).fetchone()
+            portfolio_value = pv_row[0] if pv_row else 0.0
+
+        if portfolio_value <= 0:
+            return 0.0
+        return buy_total / portfolio_value
+
+    def get_turnover_stats(self, days: int = 30) -> dict:
+        """최근 N일 턴오버 통계.
+
+        Args:
+            days: 조회 일수.
+
+        Returns:
+            dict with:
+                mean_daily_turnover: 일평균 턴오버
+                annualized_turnover: 연간 환산 턴오버 (mean * 252)
+                estimated_annual_cost: 연간 비용 추정 (annualized * 0.006 roundtrip)
+        """
+        with self._conn() as conn:
+            df = pd.read_sql(
+                f"""SELECT date, daily_turnover FROM daily_performance
+                    ORDER BY date DESC LIMIT {days}""",
+                conn,
+            )
+
+        if df.empty:
+            return {
+                "mean_daily_turnover": 0.0,
+                "annualized_turnover": 0.0,
+                "estimated_annual_cost": 0.0,
+            }
+
+        mean_daily = float(df["daily_turnover"].mean())
+        annualized = mean_daily * 252
+        estimated_cost = annualized * 0.006  # roundtrip cost assumption
+
+        return {
+            "mean_daily_turnover": mean_daily,
+            "annualized_turnover": annualized,
+            "estimated_annual_cost": estimated_cost,
         }
 
     # ------------------------------------------------------------------

@@ -4,7 +4,7 @@ sectors:
     gics_code: 10
     name_en: "Energy"
     name_kr: "에너지"
-    kospi_keywords: ["에너지", "석유", "가스", "정유"]
+    kospi_keywords: ["에너지", "석유", "가스", "정유", "오일", "연료", "광물", "탄광", "발전", "원유", "LNG", "LPG", "석탄", "플랜트", "SK에너지", "GS칼텍스"]
     nasdaq_etf: "XLE"
     color: "#FF6B6B"
 
@@ -12,7 +12,7 @@ sectors:
     gics_code: 15
     name_en: "Materials"
     name_kr: "소재"
-    kospi_keywords: ["화학", "철강", "소재", "비철"]
+    kospi_keywords: ["화학", "철강", "소재", "비철", "금속", "알루미늄", "구리", "아연", "니켈", "시멘트", "유리", "도료", "접착제", "플라스틱", "포스코", "현대제철", "고려아연", "롯데케미칼"]
     nasdaq_etf: "XLB"
     color: "#FFA07A"
 
@@ -20,7 +20,7 @@ sectors:
     gics_code: 20
     name_en: "Industrials"
     name_kr: "산업재"
-    kospi_keywords: ["건설", "기계", "조선", "운송", "항공"]
+    kospi_keywords: ["건설", "기계", "조선", "운송", "항공", "물류", "엔지니어링", "설비", "장비", "도로", "철도", "항만", "중공업", "방산", "군수", "현대건설", "대우조선", "한국항공우주", "대한항공"]
     nasdaq_etf: "XLI"
     color: "#FFD700"
 
@@ -28,7 +28,7 @@ sectors:
     gics_code: 25
     name_en: "Consumer Discretionary"
     name_kr: "경기소비재"
-    kospi_keywords: ["자동차", "의류", "호텔", "레저", "미디어"]
+    kospi_keywords: ["자동차", "의류", "호텔", "레저", "미디어", "백화점", "패션", "스포츠", "여행", "관광", "음식점", "외식", "가구", "인테리어", "쇼핑", "면세", "현대자동차", "기아", "이마트"]
     nasdaq_etf: "XLY"
     color: "#98FB98"
 
@@ -36,7 +36,7 @@ sectors:
     gics_code: 30
     name_en: "Consumer Staples"
     name_kr: "필수소비재"
-    kospi_keywords: ["식품", "음료", "담배", "가정용품"]
+    kospi_keywords: ["식품", "음료", "담배", "가정용품", "화장품", "생활용품", "의약외품", "농업", "수산", "유제품", "과자", "라면", "CJ", "롯데", "빙그레", "남양유업", "오리온"]
     nasdaq_etf: "XLP"
     color: "#87CEEB"
 
@@ -44,7 +44,7 @@ sectors:
     gics_code: 35
     name_en: "Health Care"
     name_kr: "헬스케어"
-    kospi_keywords: ["제약", "바이오", "의료기기", "헬스케어"]
+    kospi_keywords: ["제약", "바이오", "의료기기", "헬스케어", "병원", "진단", "치료제", "백신", "의약품", "임상", "신약", "유전자", "세포치료", "셀트리온", "삼성바이오", "한미약품", "유한양행"]
     nasdaq_etf: "XLV"
     color: "#DDA0DD"
 
@@ -52,7 +52,7 @@ sectors:
     gics_code: 40
     name_en: "Financials"
     name_kr: "금융"
-    kospi_keywords: ["은행", "증권", "보험", "금융"]
+    kospi_keywords: ["은행", "증권", "보험", "금융", "카드", "캐피탈", "저축", "투자", "자산운용", "신탁", "리스", "여신", "신용", "KB", "신한", "하나", "우리", "삼성생명", "한국거래소"]
     nasdaq_etf: "XLF"
     color: "#F0E68C"
 
@@ -60,7 +60,7 @@ sectors:
     gics_code: 45
     name_en: "Information Technology"
     name_kr: "IT"
-    kospi_keywords: ["반도체", "전자", "소프트웨어", "IT", "통신장비"]
+    kospi_keywords: ["반도체", "전자", "소프트웨어", "IT", "통신장비", "디스플레이", "배터리", "OLED", "LCD", "메모리", "시스템반도체", "파운드리", "PCB", "카메라모듈", "삼성전자", "SK하이닉스", "LG전자", "삼성SDI"]
     nasdaq_etf: "XLK"
     color: "#00CED1"
 
@@ -68,7 +68,7 @@ sectors:
     gics_code: 50
     name_en: "Communication Services"
     name_kr: "커뮤니케이션서비스"
-    kospi_keywords: ["통신", "미디어", "엔터", "게임", "인터넷"]
+    kospi_keywords: ["통신", "미디어", "엔터", "게임", "인터넷", "방송", "포털", "콘텐츠", "OTT", "SNS", "광고", "영화", "음악", "KT", "SK텔레콤", "LG유플러스", "카카오", "네이버", "넷마블", "크래프톤"]
     nasdaq_etf: "XLC"
     color: "#BA55D3"
 
@@ -76,7 +76,7 @@ sectors:
     gics_code: 55
     name_en: "Utilities"
     name_kr: "유틸리티"
-    kospi_keywords: ["전력", "가스", "수도", "유틸리티"]
+    kospi_keywords: ["전력", "가스", "수도", "유틸리티", "원자력", "신재생", "태양광", "풍력", "한국전력", "한국가스공사", "Korea Electric"]
     nasdaq_etf: "XLU"
     color: "#20B2AA"
 
@@ -84,7 +84,7 @@ sectors:
     gics_code: 60
     name_en: "Real Estate"
     name_kr: "부동산"
-    kospi_keywords: ["부동산", "리츠", "REITs"]
+    kospi_keywords: ["부동산", "리츠", "REITs", "건물관리", "임대", "분양", "아파트", "오피스", "물류센터", "개발", "신탁", "토지"]
     nasdaq_etf: "XLRE"
     color: "#CD853F"
 

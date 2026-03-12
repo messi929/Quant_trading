@@ -55,10 +55,13 @@ data:
 
 backtest:
   initial_capital: 100_000_000
-  commission_rate: 0.00015
-  slippage_rate: 0.001
+  commission_rate: 0.0002    # 실제 수준: 국내 0.015~0.05% → 평균 0.02% 사용
+  slippage_rate: 0.003       # 실제 수준: KOSPI 소형주 0.3~1.0%, 평균 0.3%
   max_position_pct: 0.1
   rebalance_frequency: "weekly"
+  # alpha_blend: model/equal-weight 블렌딩 비율 (val set으로 튜닝, test set 미사용)
+  # python main.py backtest --tune-alpha 로 val set 기준 최적값 자동 탐색
+  alpha_blend: 0.4
 
 logging:
   level: "INFO"

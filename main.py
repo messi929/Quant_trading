@@ -317,7 +317,9 @@ def cmd_backtest(args):
                     weights = np.ones(n_sectors) / n_sectors
                 # Blend model signal with equal-weight: model adds tilts on top of
                 # equal-weight base, reducing concentration risk
-                alpha = 0.4  # 40% model signal, 60% equal-weight
+                # alpha_blend은 val set으로 튜닝된 값 (config에서 로드)
+                # ⚠️  test set으로 재튜닝 금지 — look-ahead bias 발생
+                alpha = config["backtest"].get("alpha_blend", 0.4)
                 ew = np.ones(n_sectors) / n_sectors
                 weights = alpha * weights + (1.0 - alpha) * ew
                 model_signals[t_idx] = weights

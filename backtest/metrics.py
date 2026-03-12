@@ -145,3 +145,133 @@ def compute_rolling_metrics(
     rolling["drawdown"] = (equity - rolling_max) / rolling_max
 
     return rolling
+
+
+def compute_walkforward_stability(
+    daily_returns: pd.Series,
+    n_splits: int = 5,
+    window_days: int = 30,
+    risk_free_rate: float = 0.03,
+) -> dict:
+    """Walk-forward 안정성 측정 (세계적 퀀트 기준: std/mean < 0.5).
+
+    Args:
+        daily_returns: Daily return series
+        n_splits: Number of walk-forward windows
+        window_days: Days per window
+        risk_free_rate: Annual risk-free rate
+
+    Returns:
+        dict with:
+            sharpes: list of Sharpe ratios per window
+            mean_sharpe: mean across windows
+            std_sharpe: std across windows
+            stability_ratio: std/mean (target: < 0.5)
+            n_profitable: number of profitable windows
+            n_splits: actual number of windows computed
+    """
+    daily_rf = risk_free_rate / 252
+    required = n_splits * window_days
+
+    # Use the most recent required days; if not enough, trim n_splits
+    if len(daily_returns) < window_days:
+        return {
+            "sharpes": [],
+            "mean_sharpe": float("nan"),
+            "std_sharpe": float("nan"),
+            "stability_ratio": float("nan"),
+            "n_profitable": 0,
+            "n_splits": 0,
+        }
+
+    # Trim to available data
+    actual_splits = min(n_splits, len(daily_returns) // window_days)
+    tail = daily_returns.iloc[-(actual_splits * window_days):]
+
+    sharpes = []
+    for i in range(actual_splits):
+        window = tail.iloc[i * window_days : (i + 1) * window_days]
+        excess = window - daily_rf
+        mean_e = excess.mean()
+        std_e = excess.std(ddof=1) if len(excess) > 1 else 1e-8
+        sharpe = float(mean_e / (std_e + 1e-8) * np.sqrt(252))
+        sharpes.append(sharpe)
+
+    mean_sharpe = float(np.mean(sharpes))
+    std_sharpe = float(np.std(sharpes, ddof=1)) if len(sharpes) > 1 else 0.0
+    stability_ratio = std_sharpe / (abs(mean_sharpe) + 1e-8)
+    n_profitable = int(sum(s > 0 for s in sharpes))
+
+    return {
+        "sharpes": sharpes,
+        "mean_sharpe": mean_sharpe,
+        "std_sharpe": std_sharpe,
+        "stability_ratio": stability_ratio,
+        "n_profitable": n_profitable,
+        "n_splits": actual_splits,
+    }
+
+
+def tune_alpha_blend(
+    val_returns: "pd.DataFrame",
+    model_signals_val: "np.ndarray",
+    alpha_candidates: list = None,
+    risk_free_rate: float = 0.03,
+) -> dict:
+    """Val set에서 최적 alpha_blend 탐색 (test set 미사용 — look-ahead bias 방지).
+
+    alpha_blend: final_weights = alpha * model + (1-alpha) * equal_weight
+
+    Args:
+        val_returns: (n_days, n_sectors) DataFrame — 검증 세트 섹터 수익률
+        model_signals_val: (n_days, n_sectors) ndarray — 검증 세트 모델 신호
+        alpha_candidates: 탐색할 alpha 값 목록 (기본: 0.0~1.0, 0.05 간격)
+        risk_free_rate: 연 무위험 수익률
+
+    Returns:
+        dict with:
+            best_alpha: 최적 alpha 값
+            best_sharpe: 해당 Sharpe
+            all_results: {alpha: sharpe} 전체 결과
+            recommendation: str 권고 메시지
+    """
+    if alpha_candidates is None:
+        alpha_candidates = [round(a * 0.05, 2) for a in range(21)]  # 0.0 ~ 1.0
+
+    n_sectors = val_returns.shape[1]
+    ew = np.ones(n_sectors) / n_sectors
+    daily_rf = risk_free_rate / 252
+
+    all_results = {}
+
+    for alpha in alpha_candidates:
+        # 블렌딩된 가중치로 일별 포트폴리오 수익률 계산
+        blended = alpha * model_signals_val + (1 - alpha) * ew
+        # 각 날짜별 섹터 수익률 가중합
+        port_returns = np.sum(blended * val_returns.values, axis=1)
+        excess = port_returns - daily_rf
+        mean_e = excess.mean()
+        std_e = excess.std(ddof=1) if len(excess) > 1 else 1e-8
+        sharpe = float(mean_e / (std_e + 1e-8) * np.sqrt(252))
+        all_results[alpha] = sharpe
+
+    best_alpha = max(all_results, key=all_results.get)
+    best_sharpe = all_results[best_alpha]
+
+    # 권고: val set 최적값과 현재 0.4 비교
+    current_sharpe = all_results.get(0.4, float("nan"))
+    if abs(best_alpha - 0.4) < 0.05:
+        rec = f"현재 alpha=0.4 적절 (val Sharpe={current_sharpe:.2f})"
+    else:
+        rec = (
+            f"alpha={best_alpha:.2f} 권장 (val Sharpe={best_sharpe:.2f}) "
+            f"vs 현재 0.4 (val Sharpe={current_sharpe:.2f}). "
+            f"config/settings_fast.yaml의 alpha_blend 값 업데이트 권장."
+        )
+
+    return {
+        "best_alpha":    best_alpha,
+        "best_sharpe":   best_sharpe,
+        "all_results":   all_results,
+        "recommendation": rec,
+    }
