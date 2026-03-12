@@ -58,6 +58,8 @@ class DailyRunner:
 
         self.execution_market = self.cfg["trading"]["execution_market"]
         self.alpha_blend = 0.4  # 40% model + 60% equal-weight (최적 설정)
+        self._kr_layer2_scales: dict = {}   # Layer 2 장중 신호 (KR)
+        self._us_layer2_scales: dict = {}   # Layer 2 장중 신호 (US)
 
         logger.info("DailyRunner 초기화 완료")
 
@@ -333,6 +335,7 @@ class DailyRunner:
         sector_top_tickers: dict = None,
         twap_wave: int = 1,
         market_filter: str = None,
+        layer2_scales: dict = None,
     ) -> list[dict]:
         """매일 실행: 신호 기반 리밸런싱 (TWAP 분할 주문).
 
@@ -341,6 +344,7 @@ class DailyRunner:
             sector_top_tickers: 섹터별 top 종목 정보
             twap_wave:          TWAP 파 번호
             market_filter:      None=전체, "domestic"=국내만, "overseas"=해외만
+            layer2_scales:      Layer 2 장중 신호 스케일
 
         장 휴장일(토/일)에는 스킵.
         """
@@ -362,7 +366,9 @@ class DailyRunner:
 
         try:
             executed = generator.execute_rebalance(
-                sector_weights, sector_top_tickers, market_filter=market_filter
+                sector_weights, sector_top_tickers,
+                market_filter=market_filter,
+                layer2_scales=layer2_scales,
             )
         except Exception as e:
             logger.error(f"주문 실행 실패 ({market_label}Wave {twap_wave}): {e}")
@@ -482,7 +488,8 @@ class DailyRunner:
         if weights is None or not top_tickers:
             logger.info("[KR] 메모리 신호 없음 → KR 전용 캐시에서 로드")
             weights, top_tickers = self._load_market_cache("kr")
-        self.step_order(weights, top_tickers, twap_wave=twap_wave, market_filter="domestic")
+        layer2 = self._kr_layer2_scales
+        self.step_order(weights, top_tickers, twap_wave=twap_wave, market_filter="domestic", layer2_scales=layer2)
 
     def _daemon_us_signal(self):
         """데몬용: NASDAQ 종가 직후 (06:10) 전체 추론 + 해외 신호 분리 저장.
@@ -515,7 +522,293 @@ class DailyRunner:
         if weights is None or not top_tickers:
             logger.info("[US] 메모리 신호 없음 → US 전용 캐시에서 로드")
             weights, top_tickers = self._load_market_cache("us")
-        self.step_order(weights, top_tickers, twap_wave=twap_wave, market_filter="overseas")
+        layer2 = self._us_layer2_scales
+        self.step_order(weights, top_tickers, twap_wave=twap_wave, market_filter="overseas", layer2_scales=layer2)
+
+    # ------------------------------------------------------------------
+    # 신호 경과 시간 계산
+    # ------------------------------------------------------------------
+
+    def _get_signal_age_hours(self, base_time_str: str = "06:10") -> float:
+        """신호 생성 시각부터 현재까지 경과 시간 (hours)."""
+        from datetime import datetime as _dt
+        now = _dt.now()
+        h, m = map(int, base_time_str.split(":"))
+        base = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if now < base:
+            base -= timedelta(days=1)
+        return (now - base).total_seconds() / 3600.0
+
+    # ------------------------------------------------------------------
+    # Layer 2: 장중 인트라데이 신호 (KIS/yfinance 현재가, 추론 없음)
+    # ------------------------------------------------------------------
+
+    def _compute_layer2_signal(self, sector_top_tickers: dict, market: str = "domestic") -> dict:
+        """Layer 2 장중 신호: KIS API 현재가 기반 인트라데이 모멘텀 계산 (수초).
+
+        Args:
+            market: "domestic" (KIS API) or "overseas" (yfinance)
+
+        Returns:
+            {ticker_normalized: scale_factor (0.0~1.5)}
+            1.0=중립, >1.0=모멘텀 강화, <1.0=약화
+        """
+        from broker.kis_api import KISApi
+        from utils.ticker_utils import kis_code, is_domestic
+
+        scales: dict = {}
+
+        if market == "domestic":
+            try:
+                api = KISApi(mode=self.cfg["broker"]["mode"], market_type="domestic")
+            except Exception as e:
+                logger.warning(f"Layer2 KIS API 초기화 실패: {e}")
+                return scales
+
+            for sector, tickers in sector_top_tickers.items():
+                for tkr_info in tickers:
+                    ticker = tkr_info["ticker"]
+                    if not is_domestic(ticker):
+                        continue
+                    norm = kis_code(ticker)
+                    try:
+                        d = api.get_domestic_price(norm)
+                        current    = float(d["price"])
+                        open_p     = float(d.get("open", current))
+                        change_pct = float(d.get("change_pct", 0)) / 100.0
+                        prev_close = current / (1 + change_pct) if abs(change_pct) > 1e-6 else current
+
+                        gap           = (open_p - prev_close) / prev_close if prev_close > 0 else 0
+                        intraday_move = (current - open_p) / open_p if open_p > 0 else 0
+
+                        # 갭 연속성
+                        if abs(gap) > 0.005:
+                            gap_cont = 1.2 if gap * intraday_move > 0 else 0.7
+                        else:
+                            gap_cont = 1.0
+
+                        # 장중 모멘텀 스케일
+                        if   intraday_move >  0.03: mom = 1.5
+                        elif intraday_move >  0.02: mom = 1.3
+                        elif intraday_move >  0.01: mom = 1.1
+                        elif intraday_move < -0.04: mom = 0.1  # 장중 -4% → 긴급
+                        elif intraday_move < -0.03: mom = 0.3
+                        elif intraday_move < -0.02: mom = 0.6
+                        elif intraday_move < -0.01: mom = 0.8
+                        else:                       mom = 1.0
+
+                        scales[norm] = round(min(gap_cont * mom, 1.5), 3)
+                    except Exception as e:
+                        logger.debug(f"Layer2 KR [{ticker}]: {e}")
+                        scales[norm] = 1.0
+
+        else:  # overseas — yfinance 5분봉 사용
+            import yfinance as yf
+            from utils.ticker_utils import kis_code, is_domestic
+            for sector, tickers in sector_top_tickers.items():
+                for tkr_info in tickers:
+                    ticker = tkr_info["ticker"]
+                    if is_domestic(ticker):
+                        continue
+                    try:
+                        df = yf.Ticker(ticker).history(period="1d", interval="5m")
+                        if df.empty:
+                            scales[ticker] = 1.0
+                            continue
+                        open_p  = float(df["Open"].iloc[0])
+                        current = float(df["Close"].iloc[-1])
+                        intraday_move = (current - open_p) / open_p if open_p > 0 else 0
+
+                        if   intraday_move >  0.03: mom = 1.5
+                        elif intraday_move >  0.02: mom = 1.3
+                        elif intraday_move >  0.01: mom = 1.1
+                        elif intraday_move < -0.04: mom = 0.1
+                        elif intraday_move < -0.03: mom = 0.3
+                        elif intraday_move < -0.02: mom = 0.6
+                        elif intraday_move < -0.01: mom = 0.8
+                        else:                       mom = 1.0
+
+                        scales[ticker] = round(min(mom, 1.5), 3)
+                    except Exception as e:
+                        logger.debug(f"Layer2 US [{ticker}]: {e}")
+                        scales[ticker] = 1.0
+
+        logger.info(f"Layer 2 [{market}] 계산 완료: {len(scales)}개 종목")
+        return scales
+
+    # ------------------------------------------------------------------
+    # KR Layer 2 장중 업데이트
+    # ------------------------------------------------------------------
+
+    def _daemon_kr_intraday_update(self, update_no: int = 1):
+        """데몬용: [KR] 장중 Layer 2 신호 업데이트 (10:00, 13:00).
+
+        KIS API로 현재가 조회 → 인트라데이 모멘텀 스케일 계산 → 메모리 저장.
+        다음 Wave 실행 시 이 스케일이 주문 수량에 반영됨.
+        """
+        logger.info(f"=== [KR] Layer 2 장중 업데이트 #{update_no} ===")
+        top_tickers = getattr(self, "_last_top_tickers", None)
+        if not top_tickers:
+            _, top_tickers = self._load_market_cache("kr")
+        if not top_tickers:
+            logger.info("[KR] Layer 2: 신호 없음 → 스킵")
+            return
+        try:
+            scales = self._compute_layer2_signal(top_tickers, market="domestic")
+            self._kr_layer2_scales = scales
+            strong = sum(1 for v in scales.values() if v >= 1.1)
+            weak   = sum(1 for v in scales.values() if v <= 0.7)
+            logger.info(
+                f"[KR] Layer 2 #{update_no}: 총 {len(scales)}개 "
+                f"(강화 {strong}개 ≥1.1 / 약화 {weak}개 ≤0.7)"
+            )
+        except Exception as e:
+            logger.error(f"[KR] Layer 2 업데이트 실패: {e}")
+
+    # ------------------------------------------------------------------
+    # US Layer 2 장중 업데이트
+    # ------------------------------------------------------------------
+
+    def _daemon_us_intraday_update(self, update_no: int = 1):
+        """데몬용: [US] 장중 Layer 2 신호 업데이트 (01:00, 03:30 KST)."""
+        logger.info(f"=== [US] Layer 2 장중 업데이트 #{update_no} ===")
+        top_tickers = getattr(self, "_us_top_tickers", None)
+        if not top_tickers:
+            _, top_tickers = self._load_market_cache("us")
+        if not top_tickers:
+            return
+        try:
+            scales = self._compute_layer2_signal(top_tickers, market="overseas")
+            self._us_layer2_scales = scales
+            strong = sum(1 for v in scales.values() if v >= 1.1)
+            weak   = sum(1 for v in scales.values() if v <= 0.7)
+            logger.info(
+                f"[US] Layer 2 #{update_no}: 총 {len(scales)}개 "
+                f"(강화 {strong}개 / 약화 {weak}개)"
+            )
+        except Exception as e:
+            logger.error(f"[US] Layer 2 업데이트 실패: {e}")
+
+    # ------------------------------------------------------------------
+    # KR 시간외 세션
+    # ------------------------------------------------------------------
+
+    def _daemon_kr_premarket(self):
+        """데몬용: [KR] 장전 시간외 단일가 (07:30) — 15% 선진입."""
+        logger.info("=== [KR] 장전 시간외 단일가 (07:30) ===")
+        weights, top_tickers = self._load_market_cache("kr")
+        if not top_tickers:
+            logger.info("[KR] 장전: 신호 없음 → 스킵")
+            return
+        from live.signal_to_order import OrderGenerator
+        generator   = OrderGenerator(config_path="config/live_config.yaml")
+        signal_age  = self._get_signal_age_hours("06:10")
+        try:
+            executed = generator.execute_extended_hours(
+                sector_weights=weights,
+                sector_top_tickers=top_tickers,
+                session="premarket_kr",
+                signal_age_hours=signal_age,
+                market_filter="domestic",
+            )
+            logger.info(f"[KR] 장전 완료: {len(executed)}건")
+        except Exception as e:
+            logger.error(f"[KR] 장전 시간외 실패: {e}")
+
+    def _daemon_kr_afterclose(self):
+        """데몬용: [KR] 장후 시간외 종가 (15:35) — 당일 모멘텀 강한 종목 5%."""
+        logger.info("=== [KR] 장후 시간외 종가 (15:35) ===")
+        weights, top_tickers = self._load_market_cache("kr")
+        if not top_tickers:
+            return
+        from live.signal_to_order import OrderGenerator
+        generator  = OrderGenerator(config_path="config/live_config.yaml")
+        signal_age = self._get_signal_age_hours("06:10")
+        layer2     = self._kr_layer2_scales
+        try:
+            executed = generator.execute_extended_hours(
+                sector_weights=weights,
+                sector_top_tickers=top_tickers,
+                session="afterclose_kr",
+                signal_age_hours=signal_age,
+                layer2_scales=layer2,
+                market_filter="domestic",
+            )
+            logger.info(f"[KR] 장후 종가 완료: {len(executed)}건")
+        except Exception as e:
+            logger.error(f"[KR] 장후 종가 실패: {e}")
+
+    def _daemon_kr_aftersingle(self):
+        """데몬용: [KR] 장후 시간외 단일가 (16:30) — 다음날 선포지션 5%."""
+        logger.info("=== [KR] 장후 시간외 단일가 (16:30) ===")
+        weights, top_tickers = self._load_market_cache("kr")
+        if not top_tickers:
+            return
+        from live.signal_to_order import OrderGenerator
+        generator  = OrderGenerator(config_path="config/live_config.yaml")
+        signal_age = self._get_signal_age_hours("06:10")
+        layer2     = self._kr_layer2_scales
+        try:
+            executed = generator.execute_extended_hours(
+                sector_weights=weights,
+                sector_top_tickers=top_tickers,
+                session="aftersingle_kr",
+                signal_age_hours=signal_age,
+                layer2_scales=layer2,
+                market_filter="domestic",
+            )
+            logger.info(f"[KR] 장후 단일가 완료: {len(executed)}건")
+        except Exception as e:
+            logger.error(f"[KR] 장후 단일가 실패: {e}")
+
+    # ------------------------------------------------------------------
+    # US 시간외 세션
+    # ------------------------------------------------------------------
+
+    def _daemon_us_premarket_order(self):
+        """데몬용: [US] Pre-market (18:30 KST) — 15% 선진입."""
+        logger.info("=== [US] Pre-market 주문 (18:30) ===")
+        weights, top_tickers = self._load_market_cache("us")
+        if not top_tickers:
+            return
+        from live.signal_to_order import OrderGenerator
+        generator  = OrderGenerator(config_path="config/live_config.yaml")
+        signal_age = self._get_signal_age_hours("06:10")
+        try:
+            executed = generator.execute_extended_hours(
+                sector_weights=weights,
+                sector_top_tickers=top_tickers,
+                session="premarket_us",
+                signal_age_hours=signal_age,
+                market_filter="overseas",
+            )
+            logger.info(f"[US] Pre-market 완료: {len(executed)}건")
+        except Exception as e:
+            logger.error(f"[US] Pre-market 실패: {e}")
+
+    def _daemon_us_afterhours_order(self):
+        """데몬용: [US] After-hours (05:10 KST) — 10% 추가 (장 마감 후 이벤트 반응)."""
+        logger.info("=== [US] After-hours 주문 (05:10) ===")
+        weights, top_tickers = self._load_market_cache("us")
+        if not top_tickers:
+            return
+        from live.signal_to_order import OrderGenerator
+        generator  = OrderGenerator(config_path="config/live_config.yaml")
+        # After-hours는 전날 06:10 신호 기준 → 약 23시간 경과
+        signal_age = self._get_signal_age_hours("06:10")
+        layer2     = self._us_layer2_scales
+        try:
+            executed = generator.execute_extended_hours(
+                sector_weights=weights,
+                sector_top_tickers=top_tickers,
+                session="afterhours_us",
+                signal_age_hours=signal_age,
+                layer2_scales=layer2,
+                market_filter="overseas",
+            )
+            logger.info(f"[US] After-hours 완료: {len(executed)}건")
+        except Exception as e:
+            logger.error(f"[US] After-hours 실패: {e}")
 
     def run_daemon(self):
         """스케줄러 데몬: NASDAQ 종가 직후 신호 생성 + KR/US TWAP 3-파."""
@@ -531,38 +824,118 @@ class DailyRunner:
         kr = sc["kr_order_waves"]
         us = sc["us_order_waves"]
 
-        # ── 데이터 수집 (KR + US 공통) ───────────────────────────────
+        # ── 데이터 수집 ────────────────────────────────────────────────
         schedule.every().day.at(sc["data_collect_time"]).do(self.step_collect)
 
-        # ── 미국: 신호 생성 (06:10) + TWAP 집행 (23:40/02:00/04:30) ──
-        schedule.every().day.at(sc["us_signal_time"]).do(self._daemon_us_signal)
-        schedule.every().day.at(us["wave1"]).do(lambda: self._daemon_us_order(twap_wave=1))
-        schedule.every().day.at(us["wave2"]).do(lambda: self._daemon_us_order(twap_wave=2))
-        schedule.every().day.at(us["wave3"]).do(lambda: self._daemon_us_order(twap_wave=3))
+        # ── [US] After-hours (05:10, 전날 신호 기반) ──────────────────
+        schedule.every().day.at(sc.get("us_afterhours_time", "05:10")).do(
+            self._daemon_us_afterhours_order
+        )
 
-        # ── 한국: 신호 생성 (06:30) + TWAP 집행 (09:10/11:00/13:30) ──
+        # ── [US] 신호 생성 (06:10) ────────────────────────────────────
+        schedule.every().day.at(sc["us_signal_time"]).do(self._daemon_us_signal)
+
+        # ── [KR] 신호 분리 + 하락 매도 (06:30) ───────────────────────
         schedule.every().day.at(sc["signal_gen_time"]).do(self._daemon_signal_and_sell)
-        schedule.every().day.at(kr["wave1"]).do(lambda: self._daemon_kr_order(twap_wave=1))
-        schedule.every().day.at(kr["wave2"]).do(lambda: self._daemon_kr_order(twap_wave=2))
-        schedule.every().day.at(kr["wave3"]).do(lambda: self._daemon_kr_order(twap_wave=3))
+
+        # ── [KR] 장전 시간외 단일가 (07:30) ──────────────────────────
+        schedule.every().day.at(sc.get("kr_premarket_time", "07:30")).do(
+            self._daemon_kr_premarket
+        )
+
+        # ── [KR] 정규장 Wave 1 (09:10) ────────────────────────────────
+        schedule.every().day.at(kr["wave1"]).do(
+            lambda: self._daemon_kr_order(twap_wave=1)
+        )
+
+        # ── [KR] Layer 2 업데이트 1차 (10:00) ────────────────────────
+        schedule.every().day.at(sc.get("kr_intraday_update_1", "10:00")).do(
+            lambda: self._daemon_kr_intraday_update(1)
+        )
+
+        # ── [KR] 정규장 Wave 2 (11:00) ────────────────────────────────
+        schedule.every().day.at(kr["wave2"]).do(
+            lambda: self._daemon_kr_order(twap_wave=2)
+        )
+
+        # ── [KR] Layer 2 업데이트 2차 (13:00) ────────────────────────
+        schedule.every().day.at(sc.get("kr_intraday_update_2", "13:00")).do(
+            lambda: self._daemon_kr_intraday_update(2)
+        )
+
+        # ── [KR] 정규장 Wave 3 (13:30) ────────────────────────────────
+        schedule.every().day.at(kr["wave3"]).do(
+            lambda: self._daemon_kr_order(twap_wave=3)
+        )
+
+        # ── [KR] 장후 시간외 종가 (15:35) ────────────────────────────
+        schedule.every().day.at(sc.get("kr_afterclose_time", "15:35")).do(
+            self._daemon_kr_afterclose
+        )
+
+        # ── EOD 기록 (16:00) ──────────────────────────────────────────
         schedule.every().day.at(sc["eod_record_time"]).do(self.step_eod)
 
-        # ── 로또 분석 (매주 수요일 10:00) ────────────────────────────
+        # ── [KR] 장후 시간외 단일가 (16:30) ──────────────────────────
+        schedule.every().day.at(sc.get("kr_aftersingle_time", "16:30")).do(
+            self._daemon_kr_aftersingle
+        )
+
+        # ── [US] Pre-market (18:30) ───────────────────────────────────
+        schedule.every().day.at(sc.get("us_premarket_time", "18:30")).do(
+            self._daemon_us_premarket_order
+        )
+
+        # ── [US] 정규장 Wave 1 (23:40) ────────────────────────────────
+        schedule.every().day.at(us["wave1"]).do(
+            lambda: self._daemon_us_order(twap_wave=1)
+        )
+
+        # ── [US] Layer 2 업데이트 1차 (01:00) ────────────────────────
+        schedule.every().day.at(sc.get("us_intraday_update_1", "01:00")).do(
+            lambda: self._daemon_us_intraday_update(1)
+        )
+
+        # ── [US] 정규장 Wave 2 (02:00) ────────────────────────────────
+        schedule.every().day.at(us["wave2"]).do(
+            lambda: self._daemon_us_order(twap_wave=2)
+        )
+
+        # ── [US] Layer 2 업데이트 2차 (03:30) ────────────────────────
+        schedule.every().day.at(sc.get("us_intraday_update_2", "03:30")).do(
+            lambda: self._daemon_us_intraday_update(2)
+        )
+
+        # ── [US] 정규장 Wave 3 (04:30) ────────────────────────────────
+        schedule.every().day.at(us["wave3"]).do(
+            lambda: self._daemon_us_order(twap_wave=3)
+        )
+
+        # ── 로또 분석 (매주 수요일 10:00) ─────────────────────────────
         if _lotto_available:
             schedule.every().wednesday.at("10:00").do(_lotto_runner.run)
 
-        logger.info("스케줄러 데몬 시작 (KR/US 각 신호 1회 + TWAP 3-파):")
-        logger.info(f"  {sc['data_collect_time']} 데이터 수집 (KR + US 전일 종가)")
-        logger.info(f"  {sc['us_signal_time']} [US] NASDAQ 종가 신호 생성 + 하락 매도")
-        logger.info(f"  {sc['signal_gen_time']} [KR] 신호 생성 + 하락 매도")
-        logger.info(f"  {kr['wave1']} [KR] Wave 1 (40%, domestic)")
-        logger.info(f"  {kr['wave2']} [KR] Wave 2 (35%, domestic)")
-        logger.info(f"  {kr['wave3']} [KR] Wave 3 (25%, domestic)")
-        logger.info(f"  {sc['eod_record_time']} EOD 기록")
-        logger.info(f"  {us['wave1']} [US] Wave 1 (40%, overseas)")
-        logger.info(f"  {us['wave2']} [US] Wave 2 (35%, overseas)")
-        logger.info(f"  {us['wave3']} [US] Wave 3 (25%, overseas)")
-        logger.info("  매주 수요일 10:00 [LOTTO] 로또 분석 + 텔레그램 발송")
+        logger.info("스케줄러 데몬 시작 (전 세션 + Layer 2 신호):")
+        logger.info(f"  {sc['data_collect_time']}  데이터 수집")
+        logger.info(f"  {sc.get('us_afterhours_time','05:10')}  [US] After-hours (10%)")
+        logger.info(f"  {sc['us_signal_time']}  [US] 신호 생성 + 하락 매도")
+        logger.info(f"  {sc['signal_gen_time']}  [KR] 신호 분리 + 하락 매도")
+        logger.info(f"  {sc.get('kr_premarket_time','07:30')}  [KR] 장전 시간외 단일가 (15%)")
+        logger.info(f"  {kr['wave1']}  [KR] Wave 1 (35%)")
+        logger.info(f"  {sc.get('kr_intraday_update_1','10:00')}  [KR] Layer 2 업데이트 #1")
+        logger.info(f"  {kr['wave2']}  [KR] Wave 2 (30%)")
+        logger.info(f"  {sc.get('kr_intraday_update_2','13:00')}  [KR] Layer 2 업데이트 #2")
+        logger.info(f"  {kr['wave3']}  [KR] Wave 3 (20%)")
+        logger.info(f"  {sc.get('kr_afterclose_time','15:35')}  [KR] 장후 종가 (5%)")
+        logger.info(f"  {sc['eod_record_time']}  EOD 기록")
+        logger.info(f"  {sc.get('kr_aftersingle_time','16:30')}  [KR] 장후 단일가 (5%)")
+        logger.info(f"  {sc.get('us_premarket_time','18:30')}  [US] Pre-market (15%)")
+        logger.info(f"  {us['wave1']}  [US] Wave 1 (35%)")
+        logger.info(f"  {sc.get('us_intraday_update_1','01:00')}  [US] Layer 2 업데이트 #1")
+        logger.info(f"  {us['wave2']}  [US] Wave 2 (30%)")
+        logger.info(f"  {sc.get('us_intraday_update_2','03:30')}  [US] Layer 2 업데이트 #2")
+        logger.info(f"  {us['wave3']}  [US] Wave 3 (20%)")
+        logger.info("  매주 수요일 10:00 [LOTTO] 로또 분석")
 
         while True:
             schedule.run_pending()

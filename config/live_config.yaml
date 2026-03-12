@@ -78,6 +78,13 @@ retrain:
   model_backup_count: 5        # 최근 5개 모델 버전 보관
 
 execution:
+  # TWAP 분배 비율 (합 = 1.0, premarket/afterhours 별도)
+  # premarket/afterhours는 SESSION_RISK.max_fraction으로 별도 관리
+  twap_wave_fractions:
+    wave1: 0.35    # 정규장 Wave 1: 35%
+    wave2: 0.30    # 정규장 Wave 2: 30%
+    wave3: 0.20    # 정규장 Wave 3: 20%
+    # 장전/장후: 각 15%/5%/5%/10% (SESSION_RISK 파라미터로 관리)
   # Phase A: 지정가 주문 + 미체결 재시도
   retry_wait_secs:       300      # 5분 후 미체결 확인
   # Phase B: TWAP 분할 (50만원 이상 주문을 3개 파로 나눔)
@@ -93,23 +100,31 @@ execution:
 
 schedule:
   # ── 공통 ────────────────────────────────────────────────────────────
-  # NASDAQ은 KST 06:00에 마감 → 06:00 수집에 전일 종가 포함
   data_collect_time:   "06:00"    # KR + US 전일 종가 수집
 
-  # ── 미국 장: NASDAQ 종가 직후 신호 생성 → 장 중 TWAP 집행 ──────────
+  # ── 미국 장: NASDAQ 종가 직후 신호 생성 → 프리마켓 + 정규장 집행 ──
   us_signal_time:      "06:10"    # NASDAQ 종가 기반 신호 생성 (1회, 캐시 무시)
+  us_premarket_time:   "18:30"    # [US] Pre-market 선진입 (15%, 04:30~09:30 ET)
   us_order_waves:
-    wave1:             "23:40"    # 40% — 미국 장 시작 10분 후
-    wave2:             "02:00"    # 35% — 미국 오전 중반
-    wave3:             "04:30"    # 25% — 미국 오후 장
+    wave1:             "23:40"    # 35% — 미국 장 시작 10분 후
+    wave2:             "02:00"    # 30% — 미국 오전 중반
+    wave3:             "04:30"    # 20% — 미국 오후 장
+  us_intraday_update_1: "01:00"  # [US] Layer 2 업데이트 1차
+  us_intraday_update_2: "03:30"  # [US] Layer 2 업데이트 2차
+  us_afterhours_time:  "05:10"   # [US] After-hours (10%, 16:00~20:00 ET = 05:00~09:00 KST)
 
   # ── 한국 장 (KST 09:00~15:30) ──────────────────────────────────────
-  signal_gen_time:     "06:30"
+  signal_gen_time:     "06:30"   # [KR] 신호 생성 + 하락 매도
+  kr_premarket_time:   "07:30"   # [KR] 장전 시간외 단일가 선진입 (15%)
   kr_order_waves:
-    wave1:             "09:10"    # 40% — 한국 장 시작 10분 후
-    wave2:             "11:00"    # 35% — 오전 중반
-    wave3:             "13:30"    # 25% — 오후 장
-  eod_record_time:     "16:00"
+    wave1:             "09:10"   # 35% — 한국 장 시작 10분 후
+    wave2:             "11:00"   # 30% — 오전 중반
+    wave3:             "13:30"   # 20% — 오후 장
+  kr_intraday_update_1: "10:00" # [KR] Layer 2 업데이트 1차
+  kr_intraday_update_2: "13:00" # [KR] Layer 2 업데이트 2차
+  kr_afterclose_time:  "15:35"  # [KR] 장후 시간외 종가 (5%, 15:35~15:40)
+  eod_record_time:     "16:00"  # EOD 기록
+  kr_aftersingle_time: "16:30"  # [KR] 장후 시간외 단일가 (5%, 16:00~18:00)
 
 logging:
   trade_log_db: "tracking/trades.db"

@@ -44,6 +44,31 @@ TWAP_THRESHOLD = 500_000  # 50만원
 # 미체결 재시도 대기 (초)
 RETRY_WAIT_SECS = 300  # 5분
 
+# 세션별 리스크 파라미터
+SESSION_RISK: dict = {
+    "premarket_kr":  {"max_fraction": 0.15, "min_score": 0.008, "order_session": "premarket"},
+    "afterclose_kr": {"max_fraction": 0.05, "min_score": 0.006, "order_session": "after_close"},
+    "aftersingle_kr":{"max_fraction": 0.05, "min_score": 0.006, "order_session": "after_single"},
+    "premarket_us":  {"max_fraction": 0.15, "min_score": 0.010, "order_session": "premarket"},
+    "afterhours_us": {"max_fraction": 0.10, "min_score": 0.008, "order_session": "afterhours"},
+}
+
+
+def alpha_decay_scale(signal_age_hours: float, signal_type: str = "daily") -> float:
+    """신호 생성 후 시간 경과에 따른 알파 붕괴 스케일.
+
+    Args:
+        signal_age_hours: 신호 생성 후 경과 시간
+        signal_type: "daily"(24h 반감), "intraday"(4h 반감), "event"(1h 반감)
+
+    Returns:
+        0.1 ~ 1.0 스케일 팩터
+    """
+    half_lives = {"daily": 24.0, "intraday": 4.0, "event": 1.0}
+    half_life = half_lives.get(signal_type, 24.0)
+    scale = 0.5 ** (signal_age_hours / half_life)
+    return max(float(scale), 0.1)
+
 
 class OrderGenerator:
     """모델 신호를 퀀트 방식으로 실행."""
@@ -175,7 +200,7 @@ class OrderGenerator:
     # Phase A: 지정가 / 시장가 주문 제출
     # ------------------------------------------------------------------
 
-    def _submit_limit_order(self, order: dict, price: float) -> dict:
+    def _submit_limit_order(self, order: dict, price: float, session: str = "regular") -> dict:
         """지정가 주문."""
         api = self._get_api(order["market"])
         if order["market"] == "domestic":
@@ -185,6 +210,7 @@ class OrderGenerator:
                 qty=order["qty"],
                 price=int(price),
                 order_type="00",  # 지정가
+                session=session,
             )
         else:
             return api.order_overseas(
@@ -193,6 +219,7 @@ class OrderGenerator:
                 qty=order["qty"],
                 price=round(price, 2),
                 exchange=order.get("exchange", "NASD"),
+                session=session,
             )
 
     def _submit_market_order(self, order: dict) -> dict:
@@ -223,7 +250,7 @@ class OrderGenerator:
     # Phase A: 지정가 → 미체결 시 재시도
     # ------------------------------------------------------------------
 
-    def _execute_with_retry(self, order: dict, urgency: str) -> dict:
+    def _execute_with_retry(self, order: dict, urgency: str, session: str = "regular") -> dict:
         """
         1차: 지정가 주문
         5분 후: 미체결 확인
@@ -236,7 +263,7 @@ class OrderGenerator:
             order["ticker"], order["market"], order["side"], urgency,
             order.get("exchange", ""),
         )
-        result   = self._submit_limit_order(order, price)
+        result   = self._submit_limit_order(order, price, session=session)
         order_no = result.get("order_no", "")
 
         logger.info(
@@ -279,7 +306,7 @@ class OrderGenerator:
         retry_order = {**order, "qty": remaining_qty}
 
         try:
-            result2   = self._submit_limit_order(retry_order, price2)
+            result2   = self._submit_limit_order(retry_order, price2, session=session)
             order_no2 = result2.get("order_no", "")
             logger.info(
                 f"[{urgency}] {order['ticker']}: 재주문 @ {price2:.0f} "
@@ -326,11 +353,13 @@ class OrderGenerator:
         sector_weights: np.ndarray,
         sector_top_tickers: dict = None,
         market_filter: str = None,
+        layer2_scales: dict = None,
     ) -> list[dict]:
         """모델 섹터 가중치로 리밸런싱 실행.
 
         Args:
             market_filter: None=전체, "domestic"=국내만, "overseas"=해외만
+            layer2_scales: Layer 2 장중 신호 스케일 {ticker_normalized: scale}
 
         Phase B: twap_wave에 따라 매수 수량 분할
           - 매도는 항상 즉시 전량 (리스크 우선)
@@ -406,6 +435,13 @@ class OrderGenerator:
             else:
                 # 대형 주문: 웨이브 비율만큼만 실행
                 wave_qty = max(1, int(order["qty"] * wave_fraction))
+
+            # Layer 2 스케일 적용 (장중 모멘텀 반영)
+            if layer2_scales:
+                from utils.ticker_utils import kis_code as _kc
+                _norm = _kc(order["ticker"])
+                _scale = layer2_scales.get(_norm, layer2_scales.get(order["ticker"], 1.0))
+                wave_qty = max(1, int(wave_qty * min(_scale, 1.5)))
 
             buy_order = {**order, "qty": wave_qty}
 
@@ -832,6 +868,117 @@ class OrderGenerator:
             logger.warning(f"매도 실패 {len(failed)}건: {failed} → 09:10 재시도")
 
         logger.info(f"하락 신호 매도: {len(executed)}/{len(sell_orders)}건")
+        return executed
+
+    def execute_extended_hours(
+        self,
+        sector_weights: np.ndarray,
+        sector_top_tickers: dict,
+        session: str,
+        signal_age_hours: float = 0.0,
+        layer2_scales: dict = None,
+        market_filter: str = None,
+    ) -> list[dict]:
+        """시간외 세션 실행 (장전/장후/프리마켓/에프터마켓).
+
+        Args:
+            session: "premarket_kr", "afterclose_kr", "aftersingle_kr",
+                     "premarket_us", "afterhours_us"
+            signal_age_hours: 신호 생성 후 경과 시간 (alpha decay 계산용)
+            layer2_scales: Layer 2 스케일 팩터 {ticker_normalized: scale}
+            market_filter: "domestic" or "overseas"
+
+        특징:
+            - 매도 없음 (추가 매수만)
+            - 강한 신호(min_score 이상) 종목만
+            - Alpha decay로 오래된 신호 자동 축소
+        """
+        risk = SESSION_RISK.get(session)
+        if risk is None:
+            logger.warning(f"알 수 없는 session: {session}")
+            return []
+
+        max_fraction  = risk["max_fraction"]
+        min_score     = risk["min_score"]
+        order_session = risk["order_session"]
+
+        # Alpha decay 적용
+        decay              = alpha_decay_scale(signal_age_hours)
+        effective_fraction = max_fraction * decay
+
+        market_label = f"[{session}|decay={decay:.2f}|frac={effective_fraction:.1%}]"
+        logger.info(f"=== {market_label} 시간외 실행 시작 ===")
+
+        # min_score 이상 강한 신호만 필터
+        filtered_tickers: dict = {}
+        for sector, tickers in sector_top_tickers.items():
+            kept = [t for t in tickers if float(t.get("score", 0)) >= min_score]
+            if kept:
+                filtered_tickers[sector] = kept
+
+        if not filtered_tickers:
+            logger.info(f"{market_label} min_score={min_score:.3f} 통과 종목 없음 → 스킵")
+            return []
+
+        # 목표 포지션: effective_fraction 비율만큼
+        weights          = self._validate_weights(sector_weights)
+        scaled_weights   = weights * effective_fraction
+        current_positions = self._get_current_positions()
+        portfolio_value  = self._get_portfolio_value(current_positions)
+
+        target_positions = self._compute_target_positions(
+            scaled_weights, portfolio_value, filtered_tickers
+        )
+
+        # Layer 2 스케일 적용
+        if layer2_scales:
+            for ticker in list(target_positions.keys()):
+                from utils.ticker_utils import kis_code as _kc
+                _norm  = _kc(ticker)
+                _scale = layer2_scales.get(_norm, layer2_scales.get(ticker, 1.0))
+                if _scale <= 0:
+                    del target_positions[ticker]
+                else:
+                    tgt = target_positions[ticker]
+                    tgt["target_qty"] = max(1, int(tgt["target_qty"] * min(_scale, 1.5)))
+
+        # 시장 필터
+        if market_filter:
+            target_positions = {
+                t: v for t, v in target_positions.items()
+                if v.get("market") == market_filter
+            }
+
+        # 매수 주문만 (시간외는 매도 없음)
+        orders     = self._compute_orders(current_positions, target_positions)
+        buy_orders = [o for o in orders if o["side"] == "buy"]
+
+        if not buy_orders:
+            logger.info(f"{market_label} 실행할 매수 주문 없음")
+            return []
+
+        if self._is_daily_loss_exceeded(current_positions):
+            logger.warning(f"{market_label} 일간 손실 한도 초과 → 시간외 거래 중단")
+            return []
+
+        executed = []
+        for order in buy_orders:
+            urgency = self._get_urgency(order.get("score", 0))
+            try:
+                if self.paper_trading and order["market"] == "overseas":
+                    result = self._execute_paper_trade(order)
+                else:
+                    result = self._execute_with_retry(order, urgency, session=order_session)
+                executed.append(result)
+                self.logger.log_trade(result)
+                logger.info(
+                    f"{market_label} {'[PAPER] ' if result.get('mode') == 'paper' else ''}"
+                    f"매수: {order['ticker']} {order['qty']}주 [{order_session}]"
+                )
+            except Exception as e:
+                logger.error(f"{market_label} 매수 실패 [{order['ticker']}]: {e}")
+
+        logger.info(f"=== {market_label} 완료: {len(executed)}/{len(buy_orders)}건 ===")
         return executed
 
     def _is_daily_loss_exceeded(self, positions: dict) -> bool:

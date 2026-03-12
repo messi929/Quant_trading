@@ -25,6 +25,25 @@ load_dotenv()
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
+# 국내 주문 유형 코드 (ORD_DVSN)
+DOMESTIC_ORDER_TYPES = {
+    "regular_limit":  "00",  # 정규장 지정가
+    "regular_market": "01",  # 정규장 시장가
+    "premarket":      "61",  # 장전 시간외 단일가 (07:30~08:30)
+    "after_close":    "62",  # 장후 시간외 종가   (15:35~15:40)
+    "after_single":   "63",  # 장후 시간외 단일가 (16:00~18:00)
+    "open_auction":   "81",  # 장개시 동시호가   (08:30~09:00)
+    "close_auction":  "82",  # 장마감 동시호가   (15:20~15:30)
+}
+
+# 해외 시간외 주문 유형 (ORD_DVSN)
+OVERSEAS_EXTENDED_TYPES = {
+    "regular":    "00",  # 정규장
+    "premarket":  "32",  # 미국 장전 (18:00~22:30 KST / 04:00~09:30 ET)
+    "afterhours": "33",  # 미국 장후 (05:00~09:00 KST / 16:00~20:00 ET)
+}
+
+
 class KISApi:
     """한국투자증권 REST API 클라이언트."""
 
@@ -506,6 +525,7 @@ class KISApi:
         qty: int,
         price: int = 0,      # 0 = 시장가
         order_type: str = "01",  # "00"=지정가, "01"=시장가
+        session: str = "regular",
     ) -> dict:
         """국내 주식/ETF 주문.
 
@@ -515,6 +535,8 @@ class KISApi:
             qty: 수량
             price: 주문가 (시장가=0)
             order_type: "00"=지정가, "01"=시장가
+            session: "regular", "premarket", "after_close", "after_single",
+                     "open_auction", "close_auction"
 
         Returns:
             주문 결과 dict
@@ -523,16 +545,26 @@ class KISApi:
         tr_id = (self.tr_ids["domestic_buy"] if side == "buy"
                  else self.tr_ids["domestic_sell"])
 
+        _session_ord = {
+            "regular":       order_type,  # "00" 지정가 or "01" 시장가
+            "premarket":     "61",
+            "after_close":   "62",
+            "after_single":  "63",
+            "open_auction":  "81",
+            "close_auction": "82",
+        }
+        ord_dvsn = _session_ord.get(session, order_type)
+
         body = {
             "CANO":         self.cano,
             "ACNT_PRDT_CD": self.acnt_prdt,
             "PDNO":         ticker,
-            "ORD_DVSN":     order_type,
+            "ORD_DVSN":     ord_dvsn,
             "ORD_QTY":      str(qty),
             "ORD_UNPR":     str(price),
         }
 
-        logger.info(f"주문: {side.upper()} {ticker} x{qty} (mode={self.mode})")
+        logger.info(f"주문: {side.upper()} {ticker} x{qty} @ {price} [{session}] (mode={self.mode})")
 
         resp = self._session.post(
             url,
@@ -570,6 +602,7 @@ class KISApi:
         qty: int,
         price: float = 0.0,
         exchange: str = "NASD",
+        session: str = "regular",
     ) -> dict:
         """해외 주식/ETF 주문 (나스닥 기본).
 
@@ -579,10 +612,18 @@ class KISApi:
             qty: 수량 (정수)
             price: 주문가 (0=시장가)
             exchange: 거래소 ("NASD"=나스닥, "NYSE"=뉴욕)
+            session: "regular", "premarket", "afterhours"
         """
         url = f"{self.base_url}/uapi/overseas-stock/v1/trading/order"
         tr_id = (self.tr_ids["overseas_buy"] if side == "buy"
                  else self.tr_ids["overseas_sell"])
+
+        _session_ord = {
+            "regular":    "00",
+            "premarket":  "32",
+            "afterhours": "33",
+        }
+        ord_dvsn = _session_ord.get(session, "00")
 
         order_type = "00" if price == 0 else "00"  # 해외는 00=지정가, 시장가 없음
         if price == 0:
@@ -595,13 +636,13 @@ class KISApi:
             "ACNT_PRDT_CD": self.acnt_prdt,
             "OVRS_EXCG_CD": exchange,
             "PDNO":         ticker,
-            "ORD_DVSN":     "00",
+            "ORD_DVSN":     ord_dvsn,
             "ORD_QTY":      str(qty),
             "OVRS_ORD_UNPR": f"{price:.2f}",
             "ORD_SVR_DVSN_CD": "0",
         }
 
-        logger.info(f"해외주문: {side.upper()} {ticker} x{qty} @{price} (mode={self.mode})")
+        logger.info(f"해외주문: {side.upper()} {ticker} x{qty} @{price} [{session}] (mode={self.mode})")
 
         resp = self._session.post(
             url,
