@@ -359,10 +359,13 @@ class TradeLogger:
         return float(mean / (std + 1e-8) * (252 ** 0.5))
 
     def _compute_cumulative_mdd(self) -> float:
-        """누적 최대낙폭 계산."""
+        """누적 최대낙폭 계산.
+
+        portfolio_value가 0 이하인 레코드는 제외 (데이터 오류 방어).
+        """
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT portfolio_value FROM daily_performance ORDER BY date"
+                "SELECT portfolio_value FROM daily_performance WHERE portfolio_value > 0 ORDER BY date"
             ).fetchall()
 
         if not rows:
@@ -373,5 +376,6 @@ class TradeLogger:
         mdd  = 0.0
         for v in values:
             peak = max(peak, v)
-            mdd  = min(mdd, (v - peak) / peak)
+            dd = (v - peak) / peak
+            mdd  = min(mdd, dd)
         return mdd

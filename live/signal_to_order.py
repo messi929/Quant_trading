@@ -29,10 +29,16 @@ from loguru import logger
 from broker.kis_api import KISApi
 from live.sector_instruments import get_sector_order
 from tracking.trade_log import TradeLogger
-from utils.ticker_utils import kis_code, is_domestic
+from utils.ticker_utils import kis_code, is_domestic, round_to_tick
 
 # 왕복 거래비용 (수수료 0.2%×2 + 슬리피지 0.1%×2)
 TRANSACTION_COST_RATE = 0.006
+
+# sandbox에서 매매 불가능한 종목 (모의투자 미지원)
+# 반복 실패 확인된 종목 자동 스킵
+SANDBOX_BLOCKLIST: set[str] = {
+    "003060",   # 매매불가 종목 (code=40070000)
+}
 
 # TWAP 웨이브별 실행 비율 (합=1.0)
 # None = 단일 실행 (100%, TWAP 없음)
@@ -193,18 +199,23 @@ class OrderGenerator:
 
         if side == "buy":
             if urgency == "aggressive":
-                return ask * 1.003        # ask+0.3%: 즉시 체결 우선
+                raw = ask * 1.003        # ask+0.3%: 즉시 체결 우선
             elif urgency == "normal":
-                return ask                # ask: 바로 체결
+                raw = ask                # ask: 바로 체결
             else:
-                return (bid + ask) / 2   # 중간값: 좋은 가격 대기
+                raw = (bid + ask) / 2   # 중간값: 좋은 가격 대기
         else:
             if urgency == "aggressive":
-                return bid * 0.997        # bid-0.3%
+                raw = bid * 0.997        # bid-0.3%
             elif urgency == "normal":
-                return bid                # bid: 바로 체결
+                raw = bid                # bid: 바로 체결
             else:
-                return (bid + ask) / 2   # 중간값
+                raw = (bid + ask) / 2   # 중간값
+
+        # 국내 종목: 호가단위(틱 사이즈) 라운딩 — 미적용 시 주문 거부
+        if market == "domestic":
+            return round_to_tick(raw, side)
+        return raw
 
     # ------------------------------------------------------------------
     # Phase A: 지정가 / 시장가 주문 제출
@@ -212,13 +223,19 @@ class OrderGenerator:
 
     def _submit_limit_order(self, order: dict, price: float, session: str = "regular") -> dict:
         """지정가 주문."""
+        if price <= 0:
+            raise ValueError(f"지정가 0원 주문 차단: {order['ticker']} (price={price})")
         api = self._get_api(order["market"])
         if order["market"] == "domestic":
+            # 호가단위 보정 (안전장치 — _get_limit_price에서 이미 적용하지만 이중 방어)
+            aligned_price = round_to_tick(price, order["side"])
+            if aligned_price <= 0:
+                raise ValueError(f"호가 라운딩 후 0원: {order['ticker']} (raw={price})")
             return api.order_domestic(
                 ticker=kis_code(order["ticker"]),  # KIS: 6자리 코드만 허용
                 side=order["side"],
                 qty=order["qty"],
-                price=int(price),
+                price=aligned_price,
                 order_type="00",  # 지정가
                 session=session,
             )
@@ -311,8 +328,10 @@ class OrderGenerator:
             logger.warning(f"취소 실패 ({order_no}): {e}")
             return result
 
-        # 가격 조정 (±0.5%)
+        # 가격 조정 (±0.5%) — 국내 종목은 호가단위 보정
         price2 = price * (1.005 if order["side"] == "buy" else 0.995)
+        if order["market"] == "domestic":
+            price2 = round_to_tick(price2, order["side"])
         retry_order = {**order, "qty": remaining_qty}
 
         try:
@@ -460,7 +479,7 @@ class OrderGenerator:
                 try:
                     api = self._get_api(order["market"])
                     if order["market"] == "domestic":
-                        p = float(api.get_domestic_price(order["ticker"])["price"])
+                        p = float(api.get_domestic_price(kis_code(order["ticker"]))["price"])
                     else:
                         try:
                             exch = order.get("exchange", "NAS")
@@ -692,6 +711,11 @@ class OrderGenerator:
                 ticker = tkr_info["ticker"]
                 market = tkr_info["market"]
                 score  = float(tkr_info.get("score", 0.0))
+
+                # sandbox 블랙리스트: 모의투자 매매 불가 종목 스킵
+                if self.cfg["broker"]["mode"] == "sandbox" and kis_code(ticker) in SANDBOX_BLOCKLIST:
+                    logger.debug(f"스킵 [{ticker}]: sandbox 블랙리스트 (매매불가)")
+                    continue
 
                 # Phase D: split 모드에서만 score 임계값 필터 적용 (ETF는 항상 거래)
                 if self.execution_market == "split" and score < self.score_cost_min:
