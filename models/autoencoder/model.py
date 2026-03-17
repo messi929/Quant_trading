@@ -105,6 +105,8 @@ class MarketVAE(nn.Module):
 
     def reparameterize(self, mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
         """Reparameterization trick: z = mu + sigma * epsilon."""
+        # Clamp log_var to prevent exp() overflow/underflow
+        log_var = torch.clamp(log_var, min=-10, max=10)
         if self.training:
             std = torch.exp(0.5 * log_var)
             eps = torch.randn_like(std)
@@ -123,7 +125,12 @@ class MarketVAE(nn.Module):
         batch_size = x.size(0)
         x_flat = x.reshape(batch_size, -1)
 
+        # Guard against NaN/inf in input
+        if torch.isnan(x_flat).any() or torch.isinf(x_flat).any():
+            x_flat = torch.nan_to_num(x_flat, nan=0.0, posinf=5.0, neginf=-5.0)
+
         mu, log_var = self.encoder(x_flat)
+        log_var = torch.clamp(log_var, min=-10, max=10)
         z = self.reparameterize(mu, log_var)
         x_recon = self.decoder(z)
 
@@ -173,6 +180,7 @@ class MarketVAE(nn.Module):
         recon_loss = F.mse_loss(recon_x, x, reduction="mean")
 
         # KL divergence: -0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
+        log_var = torch.clamp(log_var, min=-10, max=10)
         kl_loss = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
 
         total_loss = recon_loss + kl_weight * kl_loss

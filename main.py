@@ -70,6 +70,13 @@ def parse_args():
         help="Use walk-forward optimization",
     )
 
+    # LightGBM baseline
+    lgbm_parser = subparsers.add_parser("lgbm-baseline", help="Run LightGBM cross-sectional baseline")
+    lgbm_parser.add_argument(
+        "--config", default="config/settings.yaml",
+        help="Path to settings config",
+    )
+
     return parser.parse_args()
 
 
@@ -170,6 +177,7 @@ def cmd_backtest(args):
         commission_rate=config["backtest"]["commission_rate"],
         slippage_rate=config["backtest"]["slippage_rate"],
         rebalance_frequency=config["backtest"]["rebalance_frequency"],
+        rebalance_threshold=config["backtest"].get("rebalance_threshold", 0.05),
     )
 
     # --- Try to load trained ensemble for model-based signals ---
@@ -414,14 +422,65 @@ def cmd_backtest(args):
                     logger.info(f"  {key}: {val:.4f}")
 
 
+def cmd_lgbm_baseline(args):
+    """Run LightGBM cross-sectional baseline for comparison."""
+    import pandas as pd
+
+    with open(args.config, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
+    processed_path = Path(config["paths"]["processed_data"]) / "processed_data.parquet"
+    if not processed_path.exists():
+        logger.error(f"Processed data not found at {processed_path}. Run 'python main.py train' first.")
+        return
+
+    df = pd.read_parquet(processed_path)
+
+    _meta_cols = {"date", "open", "high", "low", "close", "volume", "ticker", "market", "sector"}
+    feature_cols = [c for c in df.columns if c not in _meta_cols]
+
+    try:
+        from models.lgbm_baseline import LGBMBaseline
+
+        lgbm = LGBMBaseline(
+            prediction_horizon=5,
+            n_rounds=300,
+        )
+
+        # Walk-forward cross-sectional backtest
+        result_df = lgbm.backtest_cross_sectional(
+            df, feature_cols,
+            train_window=252,
+            retrain_frequency=63,
+            top_k=5,
+        )
+
+        if not result_df.empty:
+            cum_ls = (1 + result_df["ls_return"]).cumprod()
+            sharpe = result_df["ls_return"].mean() / (result_df["ls_return"].std() + 1e-8) * np.sqrt(252)
+            logger.info(f"\n--- LightGBM Cross-Sectional Baseline ---")
+            logger.info(f"  Periods: {len(result_df)}")
+            logger.info(f"  Cumulative L/S Return: {cum_ls.iloc[-1] - 1:.2%}")
+            logger.info(f"  Annualized L/S Sharpe: {sharpe:.2f}")
+            logger.info(f"  Mean Daily L/S: {result_df['ls_return'].mean():.4%}")
+            logger.info(f"  Long Return: {result_df['long_return'].mean():.4%}/day")
+            logger.info(f"  Short Return: {result_df['short_return'].mean():.4%}/day")
+        else:
+            logger.warning("LightGBM baseline produced no results")
+
+    except ImportError:
+        logger.error("lightgbm not installed. Run: pip install lightgbm")
+
+
 def main():
     args = parse_args()
 
     if args.command is None:
         logger.info("No command specified. Use --help for options.")
-        logger.info("  python main.py train       # Full training pipeline")
-        logger.info("  python main.py infer       # Run inference")
-        logger.info("  python main.py backtest    # Run backtest")
+        logger.info("  python main.py train          # Full training pipeline")
+        logger.info("  python main.py infer          # Run inference")
+        logger.info("  python main.py backtest       # Run backtest")
+        logger.info("  python main.py lgbm-baseline  # LightGBM benchmark")
         return
 
     with open(getattr(args, "config", "config/settings.yaml"), "r", encoding="utf-8") as f:
@@ -437,6 +496,7 @@ def main():
         "train": cmd_train,
         "infer": cmd_infer,
         "backtest": cmd_backtest,
+        "lgbm-baseline": cmd_lgbm_baseline,
     }
 
     cmd_func = commands.get(args.command)

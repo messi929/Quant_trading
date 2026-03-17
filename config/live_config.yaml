@@ -43,6 +43,21 @@ trading:
     utilities:               "337140"  # KODEX 유틸리티
     real_estate:             "395400"  # KODEX 리츠부동산인프라
 
+  # KOSDAQ 섹터 ETF (KOSPI ETF와 동일 — KOSDAQ 전용 섹터 ETF 없음)
+  # 코스닥 종목은 개별종목 매매 (ticker 기반), ETF는 대체 헤지용
+  kosdaq_etf_map:
+    energy:                  "117460"  # KODEX 에너지화학
+    materials:               "117460"  # KODEX 에너지화학
+    industrials:             "214830"  # KODEX 건설
+    consumer_discretionary:  "091220"  # KODEX 소비재
+    consumer_staples:        "091220"  # KODEX 소비재
+    healthcare:              "266410"  # KODEX 헬스케어
+    financials:              "091160"  # KODEX 금융
+    information_technology:  "261110"  # KODEX IT
+    communication_services:  "261110"  # KODEX IT
+    utilities:               "337140"  # KODEX 유틸리티
+    real_estate:             "395400"  # KODEX 리츠부동산인프라
+
   # 미국 섹터 ETF (해외주식 계좌)
   nasdaq_etf_map:
     energy:                  "XLE"
@@ -81,14 +96,14 @@ execution:
   # TWAP 분배 비율 (합 = 1.0, premarket/afterhours 별도)
   # premarket/afterhours는 SESSION_RISK.max_fraction으로 별도 관리
   twap_wave_fractions:
-    wave1: 0.35    # 정규장 Wave 1: 35%
+    wave1: 0.50    # 정규장 Wave 1: 50% (기존 35% → 상향, 후속 Wave 미실행 시 유휴 현금 축소)
     wave2: 0.30    # 정규장 Wave 2: 30%
     wave3: 0.20    # 정규장 Wave 3: 20%
     # 장전/장후: 각 15%/5%/5%/10% (SESSION_RISK 파라미터로 관리)
   # Phase A: 지정가 주문 + 미체결 재시도
   retry_wait_secs:       300      # 5분 후 미체결 확인
-  # Phase B: TWAP 분할 (50만원 이상 주문을 3개 파로 나눔)
-  twap_threshold:        500000   # 50만원 이상 → 3-파 TWAP
+  # Phase B: TWAP 분할 (100만원 이상 주문을 3개 파로 나눔)
+  twap_threshold:        1000000  # 100만원 이상 → 3-파 TWAP (기존 50만원 → 상향)
   # Phase C: 신호 강도 → 긴급도 매핑
   urgency_thresholds:
     aggressive: 0.008             # score ≥ 0.008 → 공격적 (ask+0.3%, 시장가 폴백) — 실제 score 상위 30%

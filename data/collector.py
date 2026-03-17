@@ -40,21 +40,44 @@ class MarketDataCollector:
     # Ticker listing
     # ------------------------------------------------------------------
 
-    def get_kospi_tickers(self) -> pd.DataFrame:
-        """Get all KOSPI listed tickers from KRX.
+    def get_kospi_tickers(self, kospi200_only: bool = False) -> pd.DataFrame:
+        """Get KOSPI listed tickers from KRX.
 
         get_market_ticker_list(date)는 OHLCV 기반 엔드포인트라 장 미개장 시 0건 반환.
         상장종목검색 API는 날짜 무관하게 현재 상장 목록을 반환하므로 이를 사용.
+
+        Args:
+            kospi200_only: If True, filter to KOSPI200 constituents only.
+                          Reduces universe for better signal concentration.
         """
         try:
             from pykrx.website.krx.market.core import 상장종목검색
             raw = 상장종목검색().fetch("STK")  # STK = 유가증권(KOSPI)
             if raw.empty:
                 raise ValueError("상장종목검색 빈 결과")
+
+            # KOSPI200 필터링: 유동성 높은 대형주 집중
+            kospi200_tickers = set()
+            if kospi200_only:
+                try:
+                    # pykrx로 KOSPI200 구성종목 조회
+                    from datetime import datetime as _dt
+                    _today = _dt.now().strftime("%Y%m%d")
+                    k200_list = krx.get_index_portfolio_deposit_file("1028", _today)
+                    if k200_list is not None and len(k200_list) > 0:
+                        kospi200_tickers = set(k200_list)
+                        logger.info(f"KOSPI200 constituents: {len(kospi200_tickers)}")
+                    else:
+                        logger.warning("KOSPI200 구성종목 조회 실패 — 전체 KOSPI 사용")
+                except Exception as e:
+                    logger.warning(f"KOSPI200 필터 실패: {e} — 전체 KOSPI 사용")
+
             records = []
             for _, row in raw.iterrows():
                 ticker = row["short_code"]
                 name = row["codeName"]
+                if kospi200_only and kospi200_tickers and ticker not in kospi200_tickers:
+                    continue
                 records.append(
                     {
                         "ticker": ticker,
@@ -64,10 +87,63 @@ class MarketDataCollector:
                     }
                 )
             df = pd.DataFrame(records)
-            logger.info(f"KOSPI tickers: {len(df)}")
+            logger.info(f"KOSPI tickers: {len(df)}" + (" (KOSPI200 only)" if kospi200_only and kospi200_tickers else ""))
             return df
         except Exception as e:
             logger.error(f"Failed to get KOSPI tickers: {e}")
+            raise
+
+    def get_kosdaq_tickers(self, kosdaq150_only: bool = False) -> pd.DataFrame:
+        """Get KOSDAQ listed tickers from KRX.
+
+        Args:
+            kosdaq150_only: If True, filter to KOSDAQ150 constituents only.
+                          KOSDAQ150 = 시가총액 상위 150종목, 유동성 충분.
+        """
+        try:
+            from pykrx.website.krx.market.core import 상장종목검색
+            raw = 상장종목검색().fetch("KSQ")  # KSQ = 코스닥
+            if raw.empty:
+                raise ValueError("코스닥 상장종목검색 빈 결과")
+
+            # KOSDAQ150 필터링
+            kosdaq150_tickers = set()
+            if kosdaq150_only:
+                try:
+                    from datetime import datetime as _dt
+                    _today = _dt.now().strftime("%Y%m%d")
+                    # KOSDAQ150 지수 코드: 1150
+                    kq150_list = krx.get_index_portfolio_deposit_file("1150", _today)
+                    if kq150_list is not None and len(kq150_list) > 0:
+                        kosdaq150_tickers = set(kq150_list)
+                        logger.info(f"KOSDAQ150 constituents: {len(kosdaq150_tickers)}")
+                    else:
+                        logger.warning("KOSDAQ150 구성종목 조회 실패 — 전체 KOSDAQ 사용")
+                except Exception as e:
+                    logger.warning(f"KOSDAQ150 필터 실패: {e} — 전체 KOSDAQ 사용")
+
+            records = []
+            for _, row in raw.iterrows():
+                ticker = row["short_code"]
+                name = row["codeName"]
+                if kosdaq150_only and kosdaq150_tickers and ticker not in kosdaq150_tickers:
+                    continue
+                records.append(
+                    {
+                        "ticker": ticker,
+                        "name": name,
+                        "yf_ticker": f"{ticker}.KQ",
+                        "market": "KOSDAQ",
+                    }
+                )
+            df = pd.DataFrame(records)
+            logger.info(
+                f"KOSDAQ tickers: {len(df)}"
+                + (" (KOSDAQ150 only)" if kosdaq150_only and kosdaq150_tickers else "")
+            )
+            return df
+        except Exception as e:
+            logger.error(f"Failed to get KOSDAQ tickers: {e}")
             raise
 
     def get_nasdaq_tickers(self) -> pd.DataFrame:
@@ -307,8 +383,20 @@ class MarketDataCollector:
     # Full collection
     # ------------------------------------------------------------------
 
-    def collect_all(self, save: bool = True) -> dict[str, pd.DataFrame]:
+    def collect_all(
+        self,
+        save: bool = True,
+        kospi200_only: bool = False,
+        include_kosdaq: bool = False,
+        kosdaq150_only: bool = False,
+    ) -> dict[str, pd.DataFrame]:
         """Collect data for all markets.
+
+        Args:
+            save: Whether to save to parquet files
+            kospi200_only: If True, only collect KOSPI200 constituents
+            include_kosdaq: If True, also collect KOSDAQ data
+            kosdaq150_only: If True, filter KOSDAQ to KOSDAQ150 only
 
         Returns:
             Dict mapping market name to DataFrame
@@ -317,11 +405,21 @@ class MarketDataCollector:
 
         # KOSPI
         logger.info("=== Collecting KOSPI data ===")
-        kospi_info = self.get_kospi_tickers()
+        kospi_info = self.get_kospi_tickers(kospi200_only=kospi200_only)
         kospi_data = self.download_ohlcv(
             kospi_info["yf_ticker"].tolist(), "KOSPI"
         )
         results["KOSPI"] = kospi_data
+
+        # KOSDAQ
+        kosdaq_info = pd.DataFrame()
+        if include_kosdaq:
+            logger.info("=== Collecting KOSDAQ data ===")
+            kosdaq_info = self.get_kosdaq_tickers(kosdaq150_only=kosdaq150_only)
+            kosdaq_data = self.download_ohlcv(
+                kosdaq_info["yf_ticker"].tolist(), "KOSDAQ"
+            )
+            results["KOSDAQ"] = kosdaq_data
 
         # NASDAQ / US
         logger.info("=== Collecting NASDAQ data ===")
@@ -374,8 +472,10 @@ class MarketDataCollector:
                 kospi_combined.to_parquet(path, engine="pyarrow", compression="snappy")
                 logger.info(f"Saved KOSPI+delisted: {path} ({len(kospi_combined)} rows)")
 
-            # Save ticker info (including delisted)
+            # Save ticker info (including delisted + kosdaq)
             all_info = [kospi_info, nasdaq_info]
+            if not kosdaq_info.empty:
+                all_info.append(kosdaq_info)
             if not delisted_info.empty:
                 all_info.append(delisted_info)
             ticker_info = pd.concat(all_info, ignore_index=True)
@@ -433,6 +533,21 @@ class DataCollector:
                 results.append(kospi_data)
         except Exception as e:
             logger.warning(f"KOSPI 수집 실패 (계속 진행): {e}")
+
+        # KOSDAQ
+        include_kosdaq = self.settings.get("data", {}).get("markets", [])
+        if "KOSDAQ" in include_kosdaq:
+            try:
+                kosdaq150_only = self.settings.get("training", {}).get("kosdaq150_only", True)
+                kosdaq_info = collector.get_kosdaq_tickers(kosdaq150_only=kosdaq150_only)
+                kosdaq_data = collector.download_ohlcv(
+                    kosdaq_info["yf_ticker"].tolist(), "KOSDAQ"
+                )
+                if not kosdaq_data.empty:
+                    kosdaq_data["market"] = "KOSDAQ"
+                    results.append(kosdaq_data)
+            except Exception as e:
+                logger.warning(f"KOSDAQ 수집 실패 (계속 진행): {e}")
 
         try:
             nasdaq_info = collector.get_nasdaq_tickers()

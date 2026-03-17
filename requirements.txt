@@ -27,6 +27,9 @@ stable-baselines3>=2.2.0
 # Scikit-learn (for metrics, preprocessing)
 scikit-learn>=1.4.0
 
+# LightGBM (cross-sectional baseline model)
+lightgbm>=4.3.0
+
 # Logging & monitoring
 tensorboard>=2.16.0
 tqdm>=4.66.0

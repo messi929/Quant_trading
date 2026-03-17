@@ -92,7 +92,14 @@ class VAETrainer:
                 accumulation_step=is_accumulating,
             )
 
-            total_loss += losses["total_loss"].item()
+            loss_val = losses["total_loss"].item()
+            # NaN loss detection: skip batch and reset optimizer
+            if not (loss_val == loss_val):  # NaN check
+                logger.warning(f"NaN loss at step {step}, skipping batch")
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
+
+            total_loss += loss_val
             total_recon += losses["recon_loss"].item()
             total_kl += losses["kl_loss"].item()
             n_batches += 1
@@ -179,6 +186,15 @@ class VAETrainer:
                 f"Val Loss: {val_metrics['val_loss']:.4f} | "
                 f"KL weight: {train_metrics['kl_weight']:.5f}"
             )
+
+            # Skip if train or val loss is NaN
+            if train_metrics["loss"] != train_metrics["loss"] or val_metrics["val_loss"] != val_metrics["val_loss"]:
+                logger.warning(f"Epoch {epoch}: NaN in metrics, skipping checkpoint")
+                patience_counter += 1
+                if patience_counter >= patience:
+                    logger.error(f"Early stopping due to persistent NaN at epoch {epoch}")
+                    break
+                continue
 
             # Early stopping
             if val_metrics["val_loss"] < best_val_loss:

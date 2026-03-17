@@ -99,6 +99,7 @@ class TrainPipeline:
         seq_len = self.config["data"]["sequence_length"]
         batch_size = self.config["training"]["physical_batch_size"]
 
+        cross_sectional = self.config["data"].get("cross_sectional_target", True)
         train_loader, val_loader, test_loader = create_dataloaders(
             df, feature_cols, sector_map,
             seq_length=seq_len,
@@ -108,6 +109,7 @@ class TrainPipeline:
             val_ratio=self.config["data"]["val_ratio"],
             num_workers=self.config["training"]["num_workers"],
             pin_memory=self.config["training"]["pin_memory"],
+            cross_sectional_target=cross_sectional,
         )
 
         n_features = len(feature_cols)
@@ -328,18 +330,64 @@ class TrainPipeline:
         raw_dir = Path(self.config["paths"]["raw_data"])
 
         if not skip_collection or not (raw_dir / "kospi_ohlcv.parquet").exists():
+            kospi200_only = self.config["training"].get("kospi200_only", False)
+            include_kosdaq = self.config["training"].get("include_kosdaq", False)
+            kosdaq150_only = self.config["training"].get("kosdaq150_only", True)
             collector = MarketDataCollector(
                 save_dir=str(raw_dir),
                 history_years=self.config["data"]["history_years"],
             )
-            market_data = collector.collect_all()
+            market_data = collector.collect_all(
+                kospi200_only=kospi200_only,
+                include_kosdaq=include_kosdaq,
+                kosdaq150_only=kosdaq150_only,
+            )
             raw_df = pd.concat(market_data.values(), ignore_index=True)
+
+            # Collect institutional/foreign flow data (KOSPI + KOSDAQ)
+            if self.config["backtest"].get("use_flow_data", False):
+                try:
+                    from data.flow_data import FlowDataCollector
+                    flow_collector = FlowDataCollector()
+                    # KRX 수급 데이터는 KOSPI/KOSDAQ 모두 지원
+                    krx_tickers = raw_df[
+                        raw_df["market"].isin(["KOSPI", "KOSDAQ"])
+                    ]["ticker"].unique()
+                    start_yyyymmdd = collector.start_date.replace("-", "")
+                    end_yyyymmdd = collector.end_date.replace("-", "")
+                    flow_df = flow_collector.collect_flow_data(
+                        krx_tickers.tolist(), start_yyyymmdd, end_yyyymmdd
+                    )
+                    if not flow_df.empty:
+                        flow_path = raw_dir / "flow_data.parquet"
+                        flow_df.to_parquet(flow_path)
+                        logger.info(f"Flow data saved: {flow_path} ({len(flow_df):,} rows)")
+                except Exception as e:
+                    logger.warning(f"Flow data collection failed (continuing): {e}")
         else:
             logger.info("Loading existing raw data...")
             dfs = []
             for f in raw_dir.glob("*_ohlcv.parquet"):
                 dfs.append(pd.read_parquet(f))
             raw_df = pd.concat(dfs, ignore_index=True)
+
+        # Merge flow data if available
+        flow_path = raw_dir / "flow_data.parquet"
+        if flow_path.exists():
+            try:
+                flow_df = pd.read_parquet(flow_path)
+                flow_df["date"] = pd.to_datetime(flow_df["date"])
+                raw_df["date"] = pd.to_datetime(raw_df["date"])
+                raw_df = raw_df.merge(
+                    flow_df, on=["date", "ticker"], how="left"
+                )
+                # Fill missing flow data with 0 (NASDAQ tickers have no KRX flow)
+                for col in ["foreign_net_buy", "inst_net_buy", "trading_value"]:
+                    if col in raw_df.columns:
+                        raw_df[col] = raw_df[col].fillna(0)
+                logger.info(f"Flow data merged: {flow_df['ticker'].nunique()} tickers with flow")
+            except Exception as e:
+                logger.warning(f"Flow data merge failed: {e}")
 
         # Process
         processor = DataProcessor(
@@ -363,6 +411,7 @@ class TrainPipeline:
             ticker_info["name"] = ticker_info["ticker"]
 
         kospi_tickers = ticker_info[ticker_info["market"] == "KOSPI"]
+        kosdaq_tickers = ticker_info[ticker_info["market"] == "KOSDAQ"]
         nasdaq_tickers = ticker_info[ticker_info["market"] == "NASDAQ"]
 
         if len(kospi_tickers) > 0:
@@ -370,13 +419,18 @@ class TrainPipeline:
         else:
             kospi_classified = pd.DataFrame()
 
+        if len(kosdaq_tickers) > 0:
+            kosdaq_classified = self.sector_classifier.classify_kosdaq(kosdaq_tickers)
+        else:
+            kosdaq_classified = pd.DataFrame()
+
         if len(nasdaq_tickers) > 0:
             nasdaq_classified = self.sector_classifier.classify_nasdaq(nasdaq_tickers)
         else:
             nasdaq_classified = pd.DataFrame()
 
         classified = pd.concat(
-            [kospi_classified, nasdaq_classified], ignore_index=True
+            [kospi_classified, kosdaq_classified, nasdaq_classified], ignore_index=True
         )
         sector_mapping = dict(zip(classified["ticker"], classified["sector"]))
         df["sector"] = df["ticker"].map(sector_mapping).fillna("unknown")
@@ -408,6 +462,18 @@ class TrainPipeline:
 
         # Normalize
         df = processor.normalize(df, feature_cols, fit=True)
+
+        # Post-normalization validation: replace inf, drop residual NaN
+        n_pre = len(df)
+        df[feature_cols] = df[feature_cols].replace([np.inf, -np.inf], np.nan)
+        df = df.dropna(subset=feature_cols)
+        if len(df) < n_pre:
+            logger.warning(f"Post-normalization cleanup: {n_pre - len(df)} rows dropped (inf/NaN)")
+
+        # Sanity check: warn if any column has extreme values
+        feat_abs_max = df[feature_cols].abs().max().max()
+        if feat_abs_max > 100:
+            logger.warning(f"Feature abs max = {feat_abs_max:.1f} — consider tighter clipping")
 
         # Save processed data
         processed_dir = Path(self.config["paths"]["processed_data"])

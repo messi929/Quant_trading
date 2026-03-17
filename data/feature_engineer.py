@@ -57,6 +57,17 @@ class FeatureEngineer:
         except Exception as e:
             logger.warning(f"Alternative feature computation failed: {e}")
 
+        # Institutional/foreign flow features (KOSPI only)
+        if "foreign_net_buy" in df.columns:
+            try:
+                from data.flow_data import FlowFeatureEngineer
+                flow_fe = FlowFeatureEngineer()
+                df = flow_fe.compute_flow_features(df)
+            except ImportError:
+                logger.debug("flow_data module not available — skipping flow features")
+            except Exception as e:
+                logger.warning(f"Flow feature computation failed: {e}")
+
         # Record feature columns (exclude metadata)
         meta_cols = {
             "date", "open", "high", "low", "close", "volume",
@@ -67,9 +78,18 @@ class FeatureEngineer:
         # Drop rows with NaN from rolling computations
         n_before = len(df)
         df = df.dropna(subset=self.feature_cols)
+
+        # Replace any remaining inf values with NaN then drop
+        inf_mask = np.isinf(df[self.feature_cols].values)
+        if inf_mask.any():
+            n_inf = inf_mask.sum()
+            logger.warning(f"Found {n_inf} inf values in features — replacing with NaN and dropping")
+            df[self.feature_cols] = df[self.feature_cols].replace([np.inf, -np.inf], np.nan)
+            df = df.dropna(subset=self.feature_cols)
+
         logger.info(
             f"Features computed: {len(self.feature_cols)} features, "
-            f"{n_before - len(df)} rows dropped (warmup period)"
+            f"{n_before - len(df)} rows dropped (warmup period + inf cleanup)"
         )
         return df
 
@@ -82,12 +102,12 @@ class FeatureEngineer:
         volume = df["volume"]
 
         # --- Returns ---
-        df["return_1d"] = close.pct_change()
-        df["log_return_1d"] = np.log(close / close.shift(1))
+        df["return_1d"] = close.pct_change().clip(-1, 10)
+        df["log_return_1d"] = np.log((close / close.shift(1)).clip(lower=1e-8))
 
         for w in self.WINDOWS:
-            df[f"return_{w}d"] = close.pct_change(w)
-            df[f"log_return_{w}d"] = np.log(close / close.shift(w))
+            df[f"return_{w}d"] = close.pct_change(w).clip(-1, 10)
+            df[f"log_return_{w}d"] = np.log((close / close.shift(w)).clip(lower=1e-8))
 
         # --- Volatility (realized) ---
         for w in self.WINDOWS:

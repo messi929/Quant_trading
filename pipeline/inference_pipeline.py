@@ -84,7 +84,22 @@ class InferencePipeline:
             n_features = flat_dim // seq_length
             logger.info(f"Checkpoint n_features detected: {n_features} (flat_dim={flat_dim})")
         else:
-            n_features = 34  # fallback
+            # Auto-detect from processed data instead of hardcoding
+            try:
+                from pathlib import Path as _P
+                processed_path = _P(self.config["paths"]["processed_data"]) / "processed_data.parquet"
+                if processed_path.exists():
+                    import pandas as _pd
+                    _cols = _pd.read_parquet(processed_path, columns=None).columns
+                    _meta = {"date", "open", "high", "low", "close", "volume", "ticker", "market", "sector"}
+                    n_features = len([c for c in _cols if c not in _meta])
+                    logger.info(f"n_features detected from processed data: {n_features}")
+                else:
+                    n_features = 72  # current feature count
+                    logger.warning(f"No checkpoint or processed data, using n_features={n_features}")
+            except Exception:
+                n_features = 72
+                logger.warning(f"Feature detection failed, using n_features={n_features}")
             ckpt = None
 
         vae = MarketVAE(

@@ -26,6 +26,7 @@ class MarketSequenceDataset(Dataset):
         seq_length: int = 60,
         prediction_horizon: int = 5,
         sector_map: Optional[dict[str, int]] = None,
+        cross_sectional_target: bool = True,
     ):
         """
         Args:
@@ -34,25 +35,45 @@ class MarketSequenceDataset(Dataset):
             seq_length: Lookback window length
             prediction_horizon: Days ahead for target return
             sector_map: Mapping from sector name to integer ID
+            cross_sectional_target: If True, target is relative rank instead of
+                absolute return. This makes the model predict which stocks will
+                outperform peers, not whether the market goes up.
         """
         self.seq_length = seq_length
         self.prediction_horizon = prediction_horizon
         self.feature_cols = feature_cols
         self.sector_map = sector_map or {}
+        self.cross_sectional_target = cross_sectional_target
+
+        # Pre-compute cross-sectional targets if enabled
+        self._date_market_return = {}
+        if cross_sectional_target:
+            # Compute per-date market average return for relative targeting
+            df = df.sort_values(["ticker", "date"]).copy()
+            df["_fwd_return"] = df.groupby("ticker")["close"].transform(
+                lambda x: x.shift(-prediction_horizon) / x - 1
+            )
+            # Per-date mean forward return (equal-weight market return)
+            date_avg = df.groupby("date")["_fwd_return"].mean()
+            self._date_market_return = date_avg.to_dict()
+            df = df.drop(columns=["_fwd_return"])
 
         # Build index of valid (ticker, start_idx) pairs
         self.samples = []
-        self.data = {}  # ticker -> (features_array, close_array, sector_id)
+        self.data = {}  # ticker -> (features_array, close_array, sector_id, dates_array)
 
         for ticker, group in df.groupby("ticker"):
             group = group.sort_values("date").reset_index(drop=True)
 
             features = group[feature_cols].values.astype(np.float32)
+            # Replace any residual NaN/inf (safety net after normalization)
+            features = np.nan_to_num(features, nan=0.0, posinf=5.0, neginf=-5.0)
             closes = group["close"].values.astype(np.float32)
+            dates = group["date"].values  # for cross-sectional lookup
             sector = group["sector"].iloc[0] if "sector" in group.columns else "unknown"
             sector_id = self.sector_map.get(sector, 0)
 
-            self.data[ticker] = (features, closes, sector_id)
+            self.data[ticker] = (features, closes, sector_id, dates)
 
             # Valid start indices: need seq_length + prediction_horizon rows
             n_valid = len(group) - seq_length - prediction_horizon
@@ -63,6 +84,7 @@ class MarketSequenceDataset(Dataset):
             f"Dataset: {len(self.samples)} samples from "
             f"{len(self.data)} tickers, "
             f"seq_len={seq_length}, horizon={prediction_horizon}"
+            f"{', cross-sectional target' if cross_sectional_target else ''}"
         )
 
     def __len__(self) -> int:
@@ -70,7 +92,7 @@ class MarketSequenceDataset(Dataset):
 
     def __getitem__(self, idx: int) -> tuple:
         ticker, start = self.samples[idx]
-        features, closes, sector_id = self.data[ticker]
+        features, closes, sector_id, dates = self.data[ticker]
 
         # Extract sequence
         end = start + self.seq_length
@@ -79,7 +101,20 @@ class MarketSequenceDataset(Dataset):
         # Target: future log return
         current_close = closes[end - 1]
         future_close = closes[end - 1 + self.prediction_horizon]
-        target = np.log(future_close / current_close) if current_close > 0 else 0.0
+        abs_return = np.log(future_close / current_close) if current_close > 0 else 0.0
+
+        if self.cross_sectional_target:
+            # Relative return: stock return minus market average return
+            # This makes the model predict outperformance, not direction
+            current_date = dates[end - 1]
+            market_return = self._date_market_return.get(current_date, 0.0)
+            if np.isnan(market_return):
+                market_return = 0.0
+            # Convert market return to log scale for consistency
+            market_log_return = np.log(1 + market_return) if market_return > -1 else 0.0
+            target = abs_return - market_log_return
+        else:
+            target = abs_return
 
         return (
             torch.from_numpy(seq),
@@ -139,6 +174,7 @@ def create_dataloaders(
     val_ratio: float = 0.15,
     num_workers: int = 4,
     pin_memory: bool = True,
+    cross_sectional_target: bool = True,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Create train/val/test DataLoaders with time-based splitting.
 
@@ -161,13 +197,16 @@ def create_dataloaders(
     )
 
     train_ds = MarketSequenceDataset(
-        train_df, feature_cols, seq_length, prediction_horizon, sector_map
+        train_df, feature_cols, seq_length, prediction_horizon, sector_map,
+        cross_sectional_target=cross_sectional_target,
     )
     val_ds = MarketSequenceDataset(
-        val_df, feature_cols, seq_length, prediction_horizon, sector_map
+        val_df, feature_cols, seq_length, prediction_horizon, sector_map,
+        cross_sectional_target=cross_sectional_target,
     )
     test_ds = MarketSequenceDataset(
-        test_df, feature_cols, seq_length, prediction_horizon, sector_map
+        test_df, feature_cols, seq_length, prediction_horizon, sector_map,
+        cross_sectional_target=cross_sectional_target,
     )
 
     train_loader = DataLoader(

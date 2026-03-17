@@ -97,6 +97,13 @@ markets:
     trading_hours: "09:00-15:30"
     timezone: "Asia/Seoul"
 
+  kosdaq:
+    exchange: "KRX"
+    suffix: ".KQ"
+    currency: "KRW"
+    trading_hours: "09:00-15:30"
+    timezone: "Asia/Seoul"
+
   nasdaq:
     exchange: "NASDAQ"
     suffix: ""

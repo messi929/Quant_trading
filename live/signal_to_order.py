@@ -5,10 +5,10 @@ Phase A: 지정가 주문 + 미체결 시 재시도
   - 5분 대기 후 미체결 → 가격 조정 재주문
   - aggressive: 추가 5분 후 미체결 → 시장가 전환
 
-Phase B: TWAP 분할 실행 (50만원 이상 매수 주문)
-  - Wave 1 (09:10): 40%
-  - Wave 2 (11:00): 35%
-  - Wave 3 (13:30): 25%
+Phase B: TWAP 분할 실행 (100만원 이상 매수 주문)
+  - Wave 1 (09:10): 50%
+  - Wave 2 (11:00): 30%
+  - Wave 3 (13:30): 20%
   - 매도는 항상 즉시 전량 (리스크 우선)
 
 Phase C: 신호 강도 기반 긴급도
@@ -40,12 +40,14 @@ SANDBOX_BLOCKLIST: set[str] = {
     "003060",   # 매매불가 종목 (code=40070000)
 }
 
-# TWAP 웨이브별 실행 비율 (합=1.0)
+# TWAP 웨이브별 실행 비율 기본값 (live_config.yaml의 twap_wave_fractions로 오버라이드)
 # None = 단일 실행 (100%, TWAP 없음)
-TWAP_FRACTIONS = {None: 1.00, 1: 0.40, 2: 0.35, 3: 0.25}
+# Wave 1 비율 상향: 35% → 50% (후속 Wave 미실행 시 유휴 현금 축소)
+TWAP_FRACTIONS = {None: 1.00, 1: 0.50, 2: 0.30, 3: 0.20}
 
 # 분할 실행 기준 금액 (이상이면 TWAP, 미만이면 Wave 1에서 전량)
-TWAP_THRESHOLD = 500_000  # 50만원
+# 100만원 미만은 분할 불필요 (기존 50만원 → 100만원 상향)
+TWAP_THRESHOLD = 1_000_000  # 100만원
 
 # 미체결 재시도 대기 (초)
 RETRY_WAIT_SECS = 300  # 5분
@@ -102,7 +104,7 @@ class OrderGenerator:
         self.urg_normal     = urg_cfg.get("normal", 0.2)
 
         # Phase D
-        self.score_cost_min = exec_cfg.get("score_cost_threshold", 0.05)
+        self.score_cost_min = exec_cfg.get("score_cost_threshold", 0.001)
 
         # Kelly position sizing toggle (default: enabled)
         self.use_kelly_sizing = exec_cfg.get("use_kelly_sizing", True)
@@ -531,13 +533,34 @@ class OrderGenerator:
     # ------------------------------------------------------------------
 
     def _validate_weights(self, weights: np.ndarray) -> np.ndarray:
-        weights   = np.clip(weights, 0, self.max_sector_wt)
+        """비중 검증: 클리핑 초과분을 다른 섹터에 재배분하여 현금 유휴 방지."""
+        weights = np.maximum(weights, 0.0)
         investable = 1.0 - self.cash_buffer
-        total      = weights.sum()
+
+        # 반복적 클리핑 + 재배분 (최대 10회, 수렴 보장)
+        for _ in range(10):
+            over_mask = weights > self.max_sector_wt
+            if not over_mask.any():
+                break
+            excess = (weights[over_mask] - self.max_sector_wt).sum()
+            weights[over_mask] = self.max_sector_wt
+            # 클리핑 안 된 양수 섹터에 비례 재배분
+            under_mask = (~over_mask) & (weights > 1e-8)
+            if under_mask.any():
+                under_total = weights[under_mask].sum()
+                weights[under_mask] += excess * (weights[under_mask] / under_total)
+            else:
+                break  # 재배분 대상 없음
+
+        total = weights.sum()
         if total > investable:
             weights = weights / total * investable
         elif total < 1e-8:
             weights = np.zeros(len(weights))
+        else:
+            # 총합이 investable 미만이면 비례 스케일업 (유휴 현금 최소화)
+            weights = weights / total * investable
+
         return weights
 
     def _get_current_positions(self) -> dict[str, dict]:
@@ -644,8 +667,8 @@ class OrderGenerator:
         normalized_score = min(score / 0.008, 2.0)  # 0.008 = 기준 score (aggressive 임계값)
         kelly_f = 0.5 * normalized_score / (vol * 100 + 1e-8)
 
-        # 0.3 ~ 1.5로 클리핑 (과도한 배율 방지)
-        return float(np.clip(kelly_f, 0.3, 1.5))
+        # 0.5 ~ 1.5로 클리핑 (최소 50% 투자 보장, 유휴 현금 축소)
+        return float(np.clip(kelly_f, 0.5, 1.5))
 
     def _compute_target_positions(
         self,

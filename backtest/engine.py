@@ -28,11 +28,13 @@ class BacktestEngine:
         commission_rate: float = 0.00015,
         slippage_rate: float = 0.001,
         rebalance_frequency: str = "weekly",
+        rebalance_threshold: float = 0.05,
     ):
         self.initial_capital = initial_capital
         self.commission_rate = commission_rate
         self.slippage_rate = slippage_rate
         self.rebalance_frequency = rebalance_frequency
+        self.rebalance_threshold = rebalance_threshold  # Min drift to trigger rebalance
 
         self.signal_gen = SignalGenerator()
         # Allow up to 50% per sector so that top-3 signals (each ~33%) are not clipped
@@ -107,15 +109,33 @@ class BacktestEngine:
                     continue
 
                 # Portfolio optimization
+                # Use risk_parity when sufficient history, signal_weighted otherwise
                 lookback = sector_returns.iloc[max(0, day - 60) : day]
-                target_weights = self.portfolio_opt.optimize(
-                    target_signal, lookback, method="signal_weighted"
-                )
+                if len(lookback) >= 20 and lookback.std().mean() > 1e-8:
+                    target_weights = self.portfolio_opt.optimize(
+                        target_signal, lookback, method="risk_parity"
+                    )
+                    # Tilt risk-parity base toward model signal
+                    signal_tilt = self.portfolio_opt.optimize(
+                        target_signal, lookback, method="signal_weighted"
+                    )
+                    # Blend: 60% risk-parity base + 40% signal tilt
+                    target_weights = 0.6 * target_weights + 0.4 * signal_tilt
+                else:
+                    target_weights = self.portfolio_opt.optimize(
+                        target_signal, lookback, method="signal_weighted"
+                    )
 
                 # Risk management
                 target_weights, risk_report = self.risk_mgr.check_and_adjust(
                     target_weights, portfolio_value, lookback
                 )
+
+                # Drift-based rebalancing: only trade if drift exceeds threshold
+                # This reduces unnecessary turnover and trading costs
+                drift = np.abs(target_weights - positions).max()
+                if drift < self.rebalance_threshold:
+                    continue  # Skip rebalance — positions close enough
 
                 # Trading costs
                 turnover = np.abs(target_weights - positions)

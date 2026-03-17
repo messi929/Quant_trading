@@ -65,6 +65,52 @@ class SectorClassifier:
         )
         return df
 
+    def classify_kosdaq(
+        self,
+        ticker_info: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Classify KOSDAQ tickers by name keyword matching.
+
+        Uses the same kospi_keywords since KOSDAQ companies share
+        similar Korean naming conventions. KOSDAQ has more biotech/IT,
+        which maps well to existing healthcare/IT sector keywords.
+
+        Args:
+            ticker_info: DataFrame with 'ticker' and 'name' columns
+
+        Returns:
+            DataFrame with added 'sector' column
+        """
+        df = ticker_info.copy()
+
+        # Reuse KOSPI keywords — Korean company naming conventions are the same
+        sector_keywords: dict[str, list[str]] = {
+            sector_key: sector_def.get("kospi_keywords", [])
+            for sector_key, sector_def in self.sectors.items()
+            if sector_def.get("kospi_keywords")
+        }
+
+        def _best_sector(name: str) -> str:
+            if not isinstance(name, str) or not name:
+                return "unknown"
+            best_sector = "unknown"
+            best_count = 0
+            for sector_key, keywords in sector_keywords.items():
+                count = sum(1 for kw in keywords if kw in name)
+                if count > best_count:
+                    best_count = count
+                    best_sector = sector_key
+            return best_sector
+
+        df["sector"] = df["name"].apply(_best_sector)
+
+        classified = (df["sector"] != "unknown").sum()
+        logger.info(
+            f"KOSDAQ sector classification: {classified}/{len(df)} "
+            f"({classified / len(df) * 100:.1f}%)"
+        )
+        return df
+
     def classify_nasdaq(
         self,
         ticker_info: pd.DataFrame,

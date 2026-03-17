@@ -38,11 +38,15 @@ training:
   seed: 42
   num_workers: 0   # 0 for Windows shared memory compatibility
   pin_memory: true
-  max_tickers: 400  # 200 KOSPI + 200 NASDAQ (양 시장 개별 종목 포함)
+  max_tickers: 350  # KOSPI200 + KOSDAQ150 + NASDAQ100 미만 (유동성 높은 종목 집중)
+  kospi200_only: true    # KOSPI200 구성종목만 사용 (노이즈 제거, 유동성 확보)
+  include_kosdaq: true   # 코스닥 매매 대상 포함
+  kosdaq150_only: true   # KOSDAQ150 구성종목만 사용 (바이오/IT 집중, 유동성 확보)
 
 data:
   markets:
     - "KOSPI"
+    - "KOSDAQ"
     - "NASDAQ"
   history_years: 5       # 5 years - recent data is more predictive for short-term test period
   min_history_days: 250  # ~1 year minimum
@@ -52,16 +56,24 @@ data:
   test_ratio: 0.15
   chunk_size: 10000
   sequence_length: 60
+  cross_sectional_target: true  # 상대 수익률 예측 (시장 대비 outperformance)
 
 backtest:
   initial_capital: 100_000_000
   commission_rate: 0.0002    # 실제 수준: 국내 0.015~0.05% → 평균 0.02% 사용
-  slippage_rate: 0.003       # 실제 수준: KOSPI 소형주 0.3~1.0%, 평균 0.3%
+  slippage_rate: 0.003       # 기본 슬리피지 (KOSPI 대형주 기준 0.3%)
+  # 시장별 슬리피지 차등 (백테스트 엔진에서 사용)
+  slippage_by_market:
+    KOSPI:  0.003    # KOSPI200 대형주: 0.3%
+    KOSDAQ: 0.005    # KOSDAQ150: 0.5% (스프레드 넓음, 유동성 낮음)
+    NASDAQ: 0.001    # 미국 대형주: 0.1% (유동성 풍부)
   max_position_pct: 0.1
   rebalance_frequency: "weekly"
   # alpha_blend: model/equal-weight 블렌딩 비율 (val set으로 튜닝, test set 미사용)
   # python main.py backtest --tune-alpha 로 val set 기준 최적값 자동 탐색
   alpha_blend: 0.4
+  rebalance_threshold: 0.05  # 최소 5% drift시에만 리밸런싱 (불필요 거래 방지)
+  use_flow_data: true  # 외국인/기관 수급 데이터 활용
 
 logging:
   level: "INFO"
