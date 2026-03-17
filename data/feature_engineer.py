@@ -87,6 +87,17 @@ class FeatureEngineer:
             df[self.feature_cols] = df[self.feature_cols].replace([np.inf, -np.inf], np.nan)
             df = df.dropna(subset=self.feature_cols)
 
+        # Clip extreme outliers to prevent NaN during training
+        # Some alternative features (vol_skew, amihud, overnight_ratio) can explode
+        for col in self.feature_cols:
+            col_std = df[col].std()
+            if col_std > 0:
+                clip_val = max(10.0, col_std * 10)  # 10 sigma or 10.0, whichever is larger
+                n_clipped = ((df[col].abs() > clip_val).sum())
+                if n_clipped > 0:
+                    df[col] = df[col].clip(-clip_val, clip_val)
+                    logger.debug(f"Clipped {col}: {n_clipped} values beyond ±{clip_val:.1f}")
+
         logger.info(
             f"Features computed: {len(self.feature_cols)} features, "
             f"{n_before - len(df)} rows dropped (warmup period + inf cleanup)"
