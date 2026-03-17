@@ -1,8 +1,8 @@
 # Alpha Signal Discovery Engine - 기술 상세 문서
 
-**버전**: 2026-03-13 (Phase 17: 호가단위 라운딩 + 주문 안전장치 + MDD 계산 수정)
-**현재 최고 성과**: Sharpe **2.03**, MDD **-4.30%**, Return **+17.82%** (기준선 대비 +0.21 Sharpe)
-**배포 상태**: Hetzner Cloud `77.42.78.9` systemd 데몬 실행 중 (Phase 17 배포 완료 — 2026-03-13 22:09 KST 재기동)
+**버전**: 2026-03-18 (Phase 18: KOSDAQ 확장 + 크로스섹셔널 타겟 + NaN 근본 해결)
+**현재 학습 성과**: VAE Loss **0.67**, Transformer Dir Acc **52.95%** / IC **0.096**, RL Return **+8.17%** ± 6.59%
+**배포 상태**: Hetzner Cloud `77.42.78.9` systemd 데몬 실행 중 (Phase 18 배포 완료 — 2026-03-18 01:09 KST 재기동)
 
 ---
 
@@ -10,7 +10,7 @@
 
 1. [시스템 개요](#1-시스템-개요)
 2. [데이터 파이프라인](#2-데이터-파이프라인)
-3. [피처 엔지니어링 (34개 피처)](#3-피처-엔지니어링)
+3. [피처 엔지니어링 (72개 피처)](#3-피처-엔지니어링)
 4. [VAE - 잠재 지표 발견](#4-vae---잠재-지표-발견)
 5. [Temporal Transformer - 시간 패턴 학습](#5-temporal-transformer---시간-패턴-학습)
 6. [Conditional WGAN-GP - 시장 시뮬레이션](#6-conditional-wgan-gp---시장-시뮬레이션)
@@ -32,6 +32,7 @@
 22. [Phase 15: 티커 형식 불일치 + daemon 안정성 수정](#22-phase-15-티커-형식-불일치--daemon-안정성-수정)
 23. [Phase 16: 근본 원인 최종 수정 — 티커 정규화 유틸 + urgency 임계값](#23-phase-16-근본-원인-최종-수정--티커-정규화-유틸--urgency-임계값)
 24. [Phase 17: 호가단위 라운딩 + 주문 안전장치 + MDD 계산 수정](#24-phase-17-호가단위-라운딩--주문-안전장치--mdd-계산-수정)
+25. [Phase 18: KOSDAQ 확장 + 크로스섹셔널 타겟 + NaN 근본 해결](#25-phase-18-kosdaq-확장--크로스섹셔널-타겟--nan-근본-해결)
 
 ---
 
@@ -65,15 +66,17 @@
 
 ### 시장 유니버스
 
-| 시장 | 데이터 소스 | 수집 종목 수 | 학습 적용 |
-|------|-----------|------------|---------|
-| KOSPI | pykrx + yfinance | 950종목 수집 | **203종목** (21.6% 섹터 분류 성공) |
-| NASDAQ/S&P500 | yfinance | S&P500 + NQ100 = 517종목 | 상위 200종목 |
-| **합계** | | **1,467종목** | **max_tickers=400** |
+| 시장 | 데이터 소스 | 수집 종목 수 | 학습 적용 | 슬리피지 |
+|------|-----------|------------|---------|---------|
+| KOSPI | pykrx + yfinance | KOSPI200 필터 | **200종목** | 0.3% |
+| KOSDAQ | pykrx + yfinance | KOSDAQ150 필터 | **150종목** (Phase 18 신규) | 0.5% |
+| NASDAQ | yfinance | S&P500 + NQ100 | 상위 100종목 미만 | 0.1% |
+| **합계** | | | **max_tickers=350** | |
 
-**Phase 12 데이터 규모**: 1,466 ticker × 5년치, 358,454행 × 34 피처
-**Phase 11 이전**: 200 ticker (NASDAQ 위주), 238,202행
-**섹터 분류**: GICS 11개 섹터 (config/sectors.yaml 정의)
+**Phase 18 데이터 규모**: 400 ticker × 5년치, 477,722행 × 72 피처
+**Phase 17 이전**: 400 ticker, 477,722행 × 72 피처 (NaN 발산 문제)
+**Phase 12 이전**: 400 ticker, 358,454행 × 34 피처
+**섹터 분류**: GICS 11개 섹터 (config/sectors.yaml 정의, KOSPI 30.5% 분류율)
 
 ---
 
@@ -2114,3 +2117,140 @@ SANDBOX_BLOCKLIST: set[str] = {
 - **체결률**: Wave당 30% → 80%+ (호가 오류 6건 해소)
 - **불필요 에러 로그**: Wave당 2~3건 감소 (003060 스킵, price=0 차단)
 - **MDD 지표**: -100% → 실제 값 (-1.7% 수준)으로 정상화
+
+---
+
+## 25. Phase 18: KOSDAQ 확장 + 크로스섹셔널 타겟 + NaN 근본 해결
+
+> 작업: 2026-03-17 ~ 2026-03-18
+> 커밋: `4eeb94f`, `f00fafd`
+> 서버 배포: 2026-03-18 01:09 KST
+
+### 배경
+
+Phase 17 학습(2026-03-13 01:37)에서 VAE/Transformer가 전 Epoch NaN으로 발산. 원인은 두 가지:
+1. Phase 17 코드(NaN batch skip 등)가 학습 **이후**에 커밋됨 (학습 01:37 → 코드 커밋 02:03)
+2. `processed_data.parquet`에 극단값 피처 존재 (alt_vol_skew_20d: max 420만 등)
+
+### 수정 1: KOSDAQ 시장 추가 (`data/collector.py`, `config/`)
+
+```python
+# data/collector.py
+def get_kosdaq_tickers(self, kosdaq150_only: bool = False) -> pd.DataFrame:
+    raw = 상장종목검색().fetch("KSQ")  # KSQ = 코스닥
+    # KOSDAQ150 지수 코드: 1150
+    kq150_list = krx.get_index_portfolio_deposit_file("1150", _today)
+```
+
+- `config/sectors.yaml`: KOSDAQ 마켓 추가 (suffix `.KQ`)
+- `config/live_config.yaml`: KOSDAQ 섹터 ETF 매핑 (KOSPI ETF 공유)
+- `config/settings_fast.yaml`: `include_kosdaq: true`, `kosdaq150_only: true`
+- `collect_all()`: `include_kosdaq` 파라미터로 KOSDAQ 수집 통합
+
+### 수정 2: 크로스섹셔널 타겟 (`data/dataset.py`)
+
+절대 수익률 예측 → **시장 대비 상대 수익률(outperformance)** 예측으로 전환.
+
+```python
+# cross_sectional_target=True 시:
+# target = ticker_fwd_return - market_avg_fwd_return
+df["_fwd_return"] = df.groupby("ticker")["close"].transform(
+    lambda x: x.shift(-prediction_horizon) / x - 1
+)
+date_avg = df.groupby("date")["_fwd_return"].mean()
+```
+
+- 시장 전체가 하락해도 상대적 승자를 식별 가능
+- `settings_fast.yaml`: `cross_sectional_target: true`
+
+### 수정 3: NaN 안전 처리 (`dataset.py`, `autoencoder/trainer.py`)
+
+```python
+# dataset.py — 피처 로드 시 NaN/inf 사전 제거
+features = np.nan_to_num(features, nan=0.0, posinf=5.0, neginf=-5.0)
+
+# autoencoder/trainer.py — NaN loss batch skip
+if not (loss_val == loss_val):  # NaN check
+    logger.warning(f"NaN loss at step {step}, skipping batch")
+    self.optimizer.zero_grad(set_to_none=True)
+    continue
+```
+
+### 수정 4: 극단값 클리핑 (`data/feature_engineer.py`)
+
+**근본 원인 진단**: 3개 피처에 극단값 존재
+
+| 피처 | max 값 | 원인 |
+|------|--------|------|
+| `alt_vol_skew_20d` | 4,205,884 | 변동성 비율 발산 |
+| `alt_amihud_illiq_20d` | 365,272 | 비유동성 종목 |
+| `alt_overnight_ratio_10d` | 10,307,776 | overnight/intraday 비율 발산 |
+
+**해결 (2단계)**:
+
+1. `processed_data.parquet` 직접 정리:
+   - Winsorize at 0.1% / 99.9% percentile
+   - Z-score 정규화 (per feature)
+   - ±5 하드 클리핑
+   - 결과: 모든 피처 [-5, +5] 범위, NaN 0건, Inf 0건
+
+2. `feature_engineer.py`에 10-sigma 클리핑 추가 (향후 수집 시 자동 적용):
+```python
+for col in self.feature_cols:
+    col_std = df[col].std()
+    if col_std > 0:
+        clip_val = max(10.0, col_std * 10)
+        df[col] = df[col].clip(-clip_val, clip_val)
+```
+
+### 수정 5: 백테스트 엔진 개선 (`backtest/engine.py`)
+
+- **리스크패리티 블렌딩**: 충분한 히스토리(20일+) 시 60% risk-parity + 40% signal tilt
+- **Drift 기반 리밸런싱**: `rebalance_threshold=0.05` — 최대 drift 5% 미만이면 리밸런싱 스킵
+- 시장별 슬리피지 차등: `slippage_by_market` (KOSPI 0.3%, KOSDAQ 0.5%, NASDAQ 0.1%)
+
+### 수정 6: 기타
+
+- **LightGBM 베이스라인** 모델 추가 (`models/lgbm_baseline.py`)
+- **수급 데이터 모듈** 추가 (`data/flow_data.py`) — 외국인/기관 매매 데이터
+- **TWAP 최적화**: Wave 1 비중 35%→50%, TWAP 임계값 50만→100만원
+- **스케줄러**: `scheduler/lotto_runner.py` 추가
+
+### 학습 결과 비교
+
+| 모델 | Phase 17 (NaN) | Phase 18 (정리 후) |
+|------|---------------|-------------------|
+| VAE | ❌ 전 Epoch NaN | ✅ Loss 0.81→**0.67** (30 epoch, NaN 0건) |
+| Transformer | ❌ NaN, Dir Acc 48.9%, IC 0.0 | ✅ Dir Acc **52.95%**, IC **0.096** |
+| GAN | W-dist 10.13 | W-dist **9.69** |
+| RL (PPO) | Return +7.37% ± 8.73% | Return **+8.17%** ± 6.59% |
+
+### 수정 파일 요약
+
+| 파일 | 변경 |
+|------|------|
+| `data/collector.py` | KOSDAQ 수집 (`get_kosdaq_tickers`, `collect_all` 확장) |
+| `data/dataset.py` | 크로스섹셔널 타겟, `nan_to_num` 안전 처리 |
+| `data/feature_engineer.py` | 10-sigma 극단값 클리핑 |
+| `data/sector_classifier.py` | KOSDAQ 종목 분류 지원 |
+| `data/flow_data.py` | 신규 — 외국인/기관 수급 데이터 |
+| `models/autoencoder/model.py` | Autoencoder 개선 |
+| `models/autoencoder/trainer.py` | NaN loss batch skip + persistent NaN early stop |
+| `models/lgbm_baseline.py` | 신규 — LightGBM 베이스라인 모델 |
+| `backtest/engine.py` | 리스크패리티 블렌딩, drift 리밸런싱 |
+| `config/live_config.yaml` | KOSDAQ ETF 매핑, TWAP 파라미터 |
+| `config/sectors.yaml` | KOSDAQ 마켓 설정 |
+| `config/settings_fast.yaml` | KOSDAQ 포함, 크로스섹셔널 타겟, 슬리피지 차등 |
+| `pipeline/train_pipeline.py` | KOSDAQ 데이터 통합 |
+| `pipeline/inference_pipeline.py` | KOSDAQ 추론 지원 |
+| `live/signal_to_order.py` | TWAP 최적화 |
+| `main.py` | KOSDAQ 관련 CLI 옵션 |
+| `scheduler/lotto_runner.py` | 신규 |
+| `requirements.txt` | 의존성 추가 |
+| `docs/CHANGELOG_v2.md` | Phase 18 변경사항 추가 |
+
+### 배포 현황
+
+- 2026-03-18 01:09 KST: `ensemble.pt` + `processed_data.parquet` 서버 전송
+- `systemctl restart quant-trading` → `active (running)` 확인
+- 다음 스케줄(06:00 KST)부터 Phase 18 모델로 신호 생성 및 매매 자동 실행
