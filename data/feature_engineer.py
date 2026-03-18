@@ -254,6 +254,17 @@ class FeatureEngineer:
         Returns:
             df with additional market-regime columns merged in-place.
         """
+        # Drop pre-existing market-regime columns to avoid merge suffix conflicts
+        # (processed_data.parquet may already contain these from training)
+        regime_cols = [
+            "market_return_1d", "market_vol_1d", "market_breadth",
+            "market_momentum_5d", "market_momentum_20d",
+            "relative_return_1d", "relative_return_5d",
+        ]
+        existing = [c for c in regime_cols if c in df.columns]
+        if existing:
+            df = df.drop(columns=existing)
+
         # Equal-weight market return for each date
         market_ret = (
             df.groupby("date")["return_1d"]
