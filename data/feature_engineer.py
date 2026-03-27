@@ -87,16 +87,28 @@ class FeatureEngineer:
             df[self.feature_cols] = df[self.feature_cols].replace([np.inf, -np.inf], np.nan)
             df = df.dropna(subset=self.feature_cols)
 
-        # Clip extreme outliers to prevent NaN during training
-        # Some alternative features (vol_skew, amihud, overnight_ratio) can explode
+        # Two-stage outlier clipping:
+        # 1) Winsorize at 0.1%/99.9% to remove extreme outliers
+        # 2) Then apply robust 5-sigma clipping based on cleaned distribution
+        # This fixes features like alt_vol_skew, alt_amihud, alt_overnight_ratio
+        # which can have values >100,000 that poison std-based clipping.
         for col in self.feature_cols:
+            series = df[col]
+            q_low = series.quantile(0.001)
+            q_high = series.quantile(0.999)
+            n_winsorized = ((series < q_low) | (series > q_high)).sum()
+            if n_winsorized > 0:
+                df[col] = series.clip(q_low, q_high)
+
+            # After winsorize, apply sigma-based hard clipping
             col_std = df[col].std()
+            col_mean = df[col].mean()
             if col_std > 0:
-                clip_val = max(10.0, col_std * 10)  # 10 sigma or 10.0, whichever is larger
+                clip_val = max(5.0, col_std * 5)
                 n_clipped = ((df[col].abs() > clip_val).sum())
                 if n_clipped > 0:
                     df[col] = df[col].clip(-clip_val, clip_val)
-                    logger.debug(f"Clipped {col}: {n_clipped} values beyond ±{clip_val:.1f}")
+                    logger.debug(f"Clipped {col}: {n_winsorized} winsorized + {n_clipped} sigma-clipped")
 
         logger.info(
             f"Features computed: {len(self.feature_cols)} features, "

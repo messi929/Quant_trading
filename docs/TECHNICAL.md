@@ -1,8 +1,8 @@
 # Alpha Signal Discovery Engine - 기술 상세 문서
 
-**버전**: 2026-03-18 (Phase 18: KOSDAQ 확장 + 크로스섹셔널 타겟 + NaN 근본 해결)
-**현재 학습 성과**: VAE Loss **0.67**, Transformer Dir Acc **52.95%** / IC **0.096**, RL Return **+8.17%** ± 6.59%
-**배포 상태**: Hetzner Cloud `77.42.78.9` systemd 데몬 실행 중 (Phase 18 배포 완료 — 2026-03-18 01:09 KST 재기동)
+**버전**: 2026-03-27 (Phase 20: 수익률 구조 결함 수정 + RL 재설계)
+**현재 학습 성과**: VAE 30ep, Transformer 16ep (72feat), RL Reward **-3.64** (Phase 19 -5.20 대비 30% 개선)
+**배포 상태**: Hetzner Cloud `77.42.78.9` systemd 데몬 실행 중 (Phase 20 배포 완료 — 2026-03-27 01:26 KST 재기동)
 
 ---
 
@@ -33,6 +33,8 @@
 23. [Phase 16: 근본 원인 최종 수정 — 티커 정규화 유틸 + urgency 임계값](#23-phase-16-근본-원인-최종-수정--티커-정규화-유틸--urgency-임계값)
 24. [Phase 17: 호가단위 라운딩 + 주문 안전장치 + MDD 계산 수정](#24-phase-17-호가단위-라운딩--주문-안전장치--mdd-계산-수정)
 25. [Phase 18: KOSDAQ 확장 + 크로스섹셔널 타겟 + NaN 근본 해결](#25-phase-18-kosdaq-확장--크로스섹셔널-타겟--nan-근본-해결)
+26. [Phase 19: KOSPI 섹터 매핑 + 시장별 비례 학습](#26-phase-19-kospi-섹터-매핑--시장별-비례-학습)
+27. [Phase 20: 수익률 구조 결함 수정 + RL 재설계](#27-phase-20-수익률-구조-결함-수정--rl-재설계)
 
 ---
 
@@ -2254,3 +2256,178 @@ for col in self.feature_cols:
 - 2026-03-18 01:09 KST: `ensemble.pt` + `processed_data.parquet` 서버 전송
 - `systemctl restart quant-trading` → `active (running)` 확인
 - 다음 스케줄(06:00 KST)부터 Phase 18 모델로 신호 생성 및 매매 자동 실행
+
+---
+
+## 26. Phase 19: KOSPI 섹터 매핑 + 시장별 비례 학습
+
+> 작업: 2026-03-19
+> 커밋: `c9a7881`
+> 서버 배포: 2026-03-19 09:34 KST
+
+### 배경
+
+KOSPI 종목이 키워드 매칭 30.7%로 `filter_unknown_sectors: true`에 의해 전량 탈락, NASDAQ only 학습 문제.
+
+### 수정 사항
+
+1. **`config/kr_sector_map.yaml`** (신규) — 1,084개 KOSPI/KOSDAQ 정적 섹터 매핑
+2. **`data/sector_classifier.py`** — kr_sector_map.yaml primary → 키워드 fallback 공통화
+3. **`pipeline/train_pipeline.py`** — max_tickers 시장별 비례 배분 (기존 data coverage top-N → NASDAQ 독점)
+4. **`data/feature_engineer.py`** — Winsorize(0.1%/99.9%) → 5-sigma 2단계 클리핑
+5. **`models/autoencoder/trainer.py`** — n_batches=0 ZeroDivisionError 방어
+6. **`config/sectors.yaml`** — 키워드 대폭 확장
+
+### 학습 결과
+
+| 항목 | Phase 18 (NASDAQ only) | Phase 19 (KR+US) |
+|------|----------------------|-----------------|
+| 학습 데이터 | 400 NASDAQ | 348 (KOSPI 133 + KOSDAQ 105 + NASDAQ 110) |
+| KOSPI 섹터 분류율 | 30.7% | 65.9% |
+| RL Return | +8.17% ± 6.59% | +4.44% ± 10.57% |
+| MDD | — | -16.8% |
+
+---
+
+## 27. Phase 20: 수익률 구조 결함 수정 + RL 재설계
+
+> 작업: 2026-03-26 ~ 2026-03-27
+> 서버 배포: 2026-03-27 01:26 KST
+
+### 배경
+
+Phase 19 배포 후 21일간 sandbox 실가동 결과:
+- **포트폴리오**: 101,011,681원 → 100,400,881원 (**-0.60%**)
+- **Sharpe 30d**: -0.76, MDD: -1.79%
+- **매수 편향**: 매수 1,067건(91%) vs 매도 105건(9%)
+- **총 거래**: 1,172건
+
+서버 로그 및 코드 분석을 통해 수익률 저하의 구조적 원인 8건 확인.
+
+### 수정 1: RL 고정 배분 → 모델 신호 전환 (`strategy/signal.py`)
+
+**문제**: 추론 시 RL agent에 `np.zeros(85)` 입력 → 5개 섹터 20%씩 고정, 6개 0% 출력.
+이 고정 배분이 `alpha=0.6` 가중치로 최종 신호의 60%를 지배.
+
+```
+실측 결과: 11개 섹터 중 6개에서 모델 예측과 반대 방향 투자
+  energy:       RL=SHORT, Model=BULLISH → 반전
+  materials:    RL=LONG,  Model=BEARISH → 반전
+  industrials:  RL=SHORT, Model=BULLISH → 반전
+  consumer_stap:RL=LONG,  Model=BEARISH → 반전
+  financials:   RL=SHORT, Model=BULLISH → 반전
+  IT:           RL=LONG,  Model=BEARISH → 반전
+```
+
+**수정**: `alpha = 0.6` → `alpha = 0.0` (RL 비활성화, 모델 신호만 사용)
+
+```python
+# strategy/signal.py:51
+alpha = 0.0  # Weight on RL allocation (0.6→0.0: RL disabled until retrained)
+raw_signal = alpha * rl_allocation + (1 - alpha) * pred_signal
+```
+
+### 수정 2: TWAP Wave 복리 감소 → 원본 목표 기준 (`live/signal_to_order.py`)
+
+**문제**: `wave_qty = int(order["qty"] * wave_fraction)` — `order["qty"]`가 매 wave마다 재계산된 remaining diff → 복리 감소.
+
+```
+기존: Wave1=50, Wave2=15(50의30%), Wave3=7(35의20%) → 72% 도달
+수정: Wave1=50, Wave2=30(100의30%), Wave3=20(100의20%) → 100% 도달
+```
+
+**수정**: `_compute_orders`에 `full_target_qty` 추가, `execute_rebalance`에서 원본 기준 적용.
+
+```python
+# _compute_orders: 매수 주문에 full_target_qty 포함
+orders.append({**base, "side": "buy", "qty": diff_qty, "full_target_qty": target_qty})
+
+# execute_rebalance: 원본 목표 기준 wave fraction
+full_target = order.get("full_target_qty", order["qty"])
+wave_qty = max(1, int(full_target * wave_fraction))
+wave_qty = min(wave_qty, order["qty"])  # 부족분 초과 방지
+```
+
+### 수정 3: RL Double Tanh 제거 + Squash Correction (`models/rl/agent.py`)
+
+**문제**: `forward()`에서 `tanh(actor_mean)` + `get_action()`에서 `tanh(action)` → 이중 적용으로 PPO log_prob 무효.
+
+**수정**:
+- `forward()`: tanh 제거 → unbounded mean 출력
+- `get_action()`: tanh squash + Jacobian correction
+
+```python
+# forward(): unbounded
+action_mean = self.actor_mean(features)  # tanh 제거
+
+# get_action(): proper squash
+action = torch.tanh(raw_action)
+log_prob = dist.log_prob(raw_action).sum(-1)
+log_prob -= torch.log(1 - torch.tanh(raw_action).pow(2) + 1e-6).sum(-1)
+```
+
+### 수정 4: Action Space Softmax 변환 (`models/rl/environment.py`)
+
+**문제**: `clip(action, 0, None) + normalize` → non-injective (다른 action이 동일 position), agent가 크기 학습 불가.
+
+**수정**: softmax projection (미분 가능, 정보 보존)
+
+```python
+# 기존: clip(0) + normalize (정보 소실)
+# 수정: softmax (수치 안정, injective)
+exp_action = np.exp(action - np.max(action))
+action = exp_action / exp_action.sum()
+action = np.clip(action, 0, self.max_position)
+action = action / action.sum()
+```
+
+### 수정 5: RL 추론 시 실제 Market Features 전달 (`pipeline/inference_pipeline.py`)
+
+**문제**: `dummy_state = np.zeros(85)` → 학습 분포와 완전히 다른 입력.
+
+**수정**: 섹터 예측값 + equal-weight 포지션 + 기본 메트릭으로 state 구성.
+
+```python
+rl_features = np.zeros(n_feature_dim, dtype=np.float32)
+rl_features[:len(sector_features)] = predictions
+positions = np.ones(n_sectors, dtype=np.float32) / n_sectors
+rl_state = np.concatenate([rl_features, positions, [1.0, 0.5]])
+```
+
+### 수정 6: 실매매 시스템 버그 5건 (`live/signal_to_order.py` + `config/settings_fast.yaml`)
+
+| # | 버그 | 수정 |
+|---|------|------|
+| 6a | US Wave에서 KR 13종목 매도 시도 | `current_positions`도 `market_filter`로 필터링 |
+| 6b | 미체결 조회 404 매 5분 반복 | `is_sandbox`일 때 retry 스킵 |
+| 6c | 002070, 258830 매매불가 반복 | `SANDBOX_BLOCKLIST` 추가 + 동적 블랙리스트 |
+| 6d | 신호 ±0.1 포화 (11섹터 균등화) | `max_position_pct: 0.1 → 0.30` |
+
+### 수정 파일 요약
+
+| 파일 | 변경 |
+|------|------|
+| `strategy/signal.py` | RL alpha 0.6→0.0 (6/11 방향 반전 해소) |
+| `live/signal_to_order.py` | TWAP full_target_qty + 시장 필터 + blocklist + sandbox 최적화 |
+| `models/rl/agent.py` | double tanh 제거 + tanh squash log_prob correction |
+| `models/rl/environment.py` | clip+normalize → softmax projection |
+| `pipeline/inference_pipeline.py` | zero state → 실제 market features |
+| `config/settings_fast.yaml` | `max_position_pct: 0.30` |
+| `saved_models/ensemble.pt` | 재학습 (VAE 30ep + Transformer 16ep + GAN 1ep + RL 82ep) |
+
+### 검증 결과
+
+| 항목 | 수정 전 | 수정 후 |
+|------|---------|---------|
+| 섹터 방향 반전 | 6/11 | **0/11** |
+| TWAP 목표 도달 | 72% | **100%** |
+| RL state-dependent | diff=0.000 (고정) | **diff=0.155** (상태 반응) |
+| log_prob NaN | 발생 가능 | **없음** |
+| max_position 차별화 | ±0.1 (3배 미만) | **±0.3 (9배)** |
+| 일간 시스템 에러 | ~26건 | **0건** |
+
+### 배포 현황
+
+- 2026-03-27 01:26 KST: 7개 파일 서버 전송
+- `systemctl restart quant-trading` → `active (running)` 확인
+- 다음 신호 생성(06:10 US, 06:30 KR)부터 Phase 20 모델 적용

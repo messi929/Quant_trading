@@ -122,15 +122,13 @@ class SectorTradingEnv(gym.Env):
         Returns:
             observation, reward, terminated, truncated, info
         """
-        action = np.clip(action, -self.max_position, self.max_position)
-
-        # Project action onto simplex: long-only, weights sum to 1 (no leverage)
-        action = np.clip(action, 0, None)
-        action_sum = action.sum()
-        if action_sum > 1e-8:
-            action = action / action_sum
-        else:
-            action = np.ones(self.n_sectors, dtype=np.float32) / self.n_sectors
+        # Softmax projection: 연속 행동 → long-only simplex (미분 가능)
+        # 기존 clip+normalize는 non-injective → agent가 크기를 학습 불가
+        exp_action = np.exp(action - np.max(action))  # 수치 안정성
+        action = exp_action / exp_action.sum()
+        # max_position 제한 (과집중 방지)
+        action = np.clip(action, 0, self.max_position)
+        action = action / action.sum()  # 재정규화
 
         # Compute trading costs
         position_change = np.abs(action - self.positions)

@@ -55,15 +55,28 @@ class ActorCritic(nn.Module):
             state: (batch, state_dim) observation
 
         Returns:
-            action_dist: Normal distribution over actions
+            action_dist: Normal distribution over UNBOUNDED actions
             value: (batch, 1) state value estimate
         """
         features = self.backbone(state)
-        action_mean = torch.tanh(self.actor_mean(features))
+        # tanh 제거: forward는 unbounded mean 출력, tanh는 get_action에서만 적용
+        action_mean = self.actor_mean(features)
         action_std = torch.exp(self.actor_log_std.clamp(-5, 2))
         action_dist = Normal(action_mean, action_std)
         value = self.critic(features)
         return action_dist, value
+
+    @staticmethod
+    def _tanh_squash_log_prob(dist: Normal, raw_action: torch.Tensor) -> torch.Tensor:
+        """Tanh squashing에 대한 올바른 log_prob 보정.
+
+        log π(a|s) = log μ(u|s) - Σ log(1 - tanh²(u))
+        where a = tanh(u), u ~ Normal(mean, std)
+        """
+        log_prob = dist.log_prob(raw_action).sum(dim=-1)
+        # Jacobian correction for tanh transform
+        log_prob -= torch.log(1 - torch.tanh(raw_action).pow(2) + 1e-6).sum(dim=-1)
+        return log_prob
 
     def get_action(
         self,
@@ -73,15 +86,15 @@ class ActorCritic(nn.Module):
         """Sample action and compute log probability.
 
         Returns:
-            action, log_prob, value
+            action (tanh-bounded [-1,1]), log_prob, value
         """
         dist, value = self.forward(state)
         if deterministic:
-            action = dist.mean
+            raw_action = dist.mean
         else:
-            action = dist.sample()
-        action = torch.tanh(action)  # Bound to [-1, 1]
-        log_prob = dist.log_prob(action).sum(dim=-1)
+            raw_action = dist.sample()
+        action = torch.tanh(raw_action)
+        log_prob = self._tanh_squash_log_prob(dist, raw_action)
         return action, log_prob, value.squeeze(-1)
 
     def evaluate_actions(
@@ -91,11 +104,12 @@ class ActorCritic(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Evaluate actions for PPO update.
 
-        Returns:
-            log_prob, value, entropy
+        actions는 tanh-squashed 값 → atanh로 원복 후 log_prob 계산.
         """
         dist, value = self.forward(states)
-        log_prob = dist.log_prob(actions).sum(dim=-1)
+        # tanh-squashed action → unbounded space 복원
+        raw_actions = torch.atanh(actions.clamp(-0.999, 0.999))
+        log_prob = self._tanh_squash_log_prob(dist, raw_actions)
         entropy = dist.entropy().sum(dim=-1)
         return log_prob, value.squeeze(-1), entropy
 

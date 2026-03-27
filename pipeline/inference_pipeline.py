@@ -203,20 +203,35 @@ class InferencePipeline:
         feature_cols = self.feature_eng.get_feature_names()
         df = self.processor.normalize(df, feature_cols, fit=True)
 
-        # Assign sector column from training data mapping (avoid slow API calls)
-        if "sector" not in df.columns:
-            processed_path = Path("data/processed/processed_data.parquet")
-            if processed_path.exists():
-                ticker_sector = (
-                    pd.read_parquet(processed_path, columns=["ticker", "sector"])
-                    .drop_duplicates("ticker")
-                    .set_index("ticker")["sector"]
+        # Assign sector column: kr_sector_map.yaml primary → parquet fallback
+        if "sector" not in df.columns or (df["sector"] == "unknown").all():
+            from data.sector_classifier import load_kr_sector_map
+            static_map = load_kr_sector_map()
+
+            if static_map:
+                df["sector"] = df["ticker"].map(static_map).fillna("unknown")
+                classified = (df["sector"] != "unknown").sum()
+                total = len(df["ticker"].unique())
+                classified_tickers = df[df["sector"] != "unknown"]["ticker"].nunique()
+                logger.info(
+                    f"Sector assigned from kr_sector_map.yaml: "
+                    f"{classified_tickers}/{total} tickers, "
+                    f"{df['sector'].nunique()} sectors"
                 )
-                df["sector"] = df["ticker"].map(ticker_sector).fillna("unknown")
-                logger.info(f"Sector assigned from training data: {df['sector'].nunique()} sectors")
             else:
-                df["sector"] = "unknown"
-                logger.warning("No sector mapping found, all tickers assigned to 'unknown'")
+                # Fallback to parquet
+                processed_path = Path("data/processed/processed_data.parquet")
+                if processed_path.exists():
+                    ticker_sector = (
+                        pd.read_parquet(processed_path, columns=["ticker", "sector"])
+                        .drop_duplicates("ticker")
+                        .set_index("ticker")["sector"]
+                    )
+                    df["sector"] = df["ticker"].map(ticker_sector).fillna("unknown")
+                    logger.info(f"Sector assigned from parquet fallback: {df['sector'].nunique()} sectors")
+                else:
+                    df["sector"] = "unknown"
+                    logger.warning("No sector mapping found, all tickers assigned to 'unknown'")
 
         # Build training-time sector ID map (fixes sector_id always=0 bug)
         sector_id_map = self._build_sector_id_map()
@@ -279,10 +294,23 @@ class InferencePipeline:
             signals_per_sector[s]["prediction"] for s in sector_list
         ])
 
-        # Get RL allocation
-        dummy_state = np.zeros(self.ensemble.rl_agent.policy.backbone[0].in_features)
+        # Get RL allocation — 실제 market features로 state 구성
+        # RL state = [sector_features(72), positions(11), value_ratio, step_ratio]
+        state_dim = self.ensemble.rl_agent.policy.backbone[0].in_features
+        n_feature_dim = state_dim - n_sectors - 2  # features part
+        # 최근 시장 피처 평균을 RL state의 feature 부분으로 사용
+        sector_features = predictions  # (n_sectors,) — 섹터별 수익률 예측
+        # feature vector 구성: predictions를 n_feature_dim으로 확장
+        if len(sector_features) < n_feature_dim:
+            rl_features = np.zeros(n_feature_dim, dtype=np.float32)
+            rl_features[:len(sector_features)] = sector_features
+        else:
+            rl_features = sector_features[:n_feature_dim].astype(np.float32)
+        # positions: equal-weight 초기값 (실제 포지션 정보 없음)
+        positions = np.ones(n_sectors, dtype=np.float32) / n_sectors
+        rl_state = np.concatenate([rl_features, positions, [1.0, 0.5]])
         rl_alloc, _, _ = self.ensemble.rl_agent.select_action(
-            dummy_state, deterministic=True
+            rl_state, deterministic=True
         )
         rl_alloc = rl_alloc[:n_sectors]
 

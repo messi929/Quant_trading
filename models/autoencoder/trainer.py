@@ -110,6 +110,14 @@ class VAETrainer:
                 kl=f"{losses['kl_loss'].item():.4f}",
             )
 
+        if n_batches == 0:
+            logger.error("All batches produced NaN loss — check data for extreme values")
+            return {
+                "loss": float("inf"),
+                "recon_loss": float("inf"),
+                "kl_loss": float("inf"),
+                "kl_weight": kl_weight,
+            }
         return {
             "loss": total_loss / n_batches,
             "recon_loss": total_recon / n_batches,
@@ -144,6 +152,8 @@ class VAETrainer:
             total_recon += losses["recon_loss"].item()
             n_batches += 1
 
+        if n_batches == 0:
+            return {"val_loss": float("inf"), "val_recon_loss": float("inf")}
         return {
             "val_loss": total_loss / n_batches,
             "val_recon_loss": total_recon / n_batches,

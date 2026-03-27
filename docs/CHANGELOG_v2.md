@@ -49,7 +49,7 @@
 
 ### `data/alternative_data.py` — 대체 데이터 피처
 - `AlternativeDataFeatures`: OHLCV 기반 17개 프록시 피처
-  - Parkinson Volatility (5d, 20d) — IV 프록시
+  - Parkinson Volatility (5d, 20d) — IV 프록시2
   - Garman-Klass Volatility (5d, 20d) — 고효율 IV 프록시
   - Vol Skew Proxy (20d, 60d) — 풋-콜 비율 대용
   - Return Kurtosis (20d, 60d) — 테일 리스크
@@ -374,13 +374,83 @@
 
 ---
 
-## 11. 향후 개선 방향
+---
 
-1. **VAE 재학습**: NaN 수정 + cross-sectional 타겟으로 재학습 → alpha > 0 확인
-2. **FinBERT 뉴스 감성**: 현재 키워드 기반 → 사전학습 모델로 업그레이드
-3. **오더북 데이터**: KIS API 호가창 조회 → 호가 불균형 피처
-4. **멀티 타임프레임**: 일봉 + 주봉 + 월봉 시계열 병합
-5. **GPU 추론**: 서버 GPU 상시화 (현재 CPU only)
-6. **Black-Litterman**: 모델 예측을 view로 사용하는 BL 포트폴리오 최적화
-7. **TWAP 완료율 모니터링**: Wave 2/3 미실행 시 자동 보상 매수 (catch-up 주문)
+## 11. v3.0 수익률 구조 결함 수정 + RL 재설계 (2026-03-27)
+
+> 작업: 2026-03-26 ~ 2026-03-27
+> 서버 배포: 2026-03-27 01:26 KST
+
+### 11.1 배경: Sandbox 21일 실가동 결과 분석
+
+Phase 19 배포(3/19) 후 21일간 sandbox 실가동 결과:
+
+| 항목 | 수치 |
+|------|------|
+| 포트폴리오 변화 | 101,011,681원 → 100,400,881원 (**-0.60%**) |
+| Sharpe 30d | -0.76 |
+| MDD | -1.79% |
+| 총 거래 | 1,172건 (매수 91%, 매도 9%) |
+
+### 11.2 근본 원인 분석
+
+코드 분석 + 실측 검증으로 확인된 구조적 결함:
+
+| # | 문제 | 영향 | 검증 방법 |
+|---|------|------|-----------|
+| 1 | RL zero-state 고정 배분 (6/11 섹터 반전) | **CRITICAL** — 알파 상쇄 | ensemble.pt에서 실제 출력 확인 |
+| 2 | TWAP wave 복리 감소 (72%만 도달) | HIGH — 매수 편향 | 수학적 시뮬레이션 |
+| 3 | Double Tanh (PPO 학습 무효) | HIGH — RL 정책 garbage | agent.py 코드 분석 |
+| 4 | Action Space non-injective | HIGH — 크기 학습 불가 | environment.py 코드 분석 |
+| 5 | US Wave에서 KR 매도 시도 | HIGH — 매일 26건 에러 | 서버 로그 실측 |
+| 6 | 미체결 조회 404 반복 | MEDIUM — 5분 불필요 대기 | 서버 로그 실측 |
+| 7 | 매매불가 종목 반복 시도 | MEDIUM — Wave당 2건 에러 | 서버 로그 실측 |
+| 8 | 신호 ±0.1 포화 | HIGH — 섹터 차별화 불가 | DB 신호 데이터 확인 |
+
+### 11.3 수정 사항 (8건)
+
+**수익률 구조 수정 (재학습 포함):**
+- `strategy/signal.py`: RL alpha 0.6→0.0 (모델 신호만 사용)
+- `models/rl/agent.py`: double tanh 제거 + tanh squash log_prob correction
+- `models/rl/environment.py`: clip+normalize → softmax projection
+- `pipeline/inference_pipeline.py`: zero state → 실제 market features
+- `config/settings_fast.yaml`: `max_position_pct: 0.1 → 0.30`
+
+**실매매 시스템 수정:**
+- `live/signal_to_order.py`: TWAP full_target_qty + current_positions 시장 필터 + SANDBOX_BLOCKLIST(002070, 258830) + 동적 블랙리스트 + sandbox 미체결 스킵
+
+### 11.4 변경 파일
+
+| 파일 | 변경 |
+|------|------|
+| `strategy/signal.py` | RL alpha 0.6→0.0 |
+| `live/signal_to_order.py` | TWAP 100% + 시장 필터 + blocklist + sandbox 최적화 |
+| `models/rl/agent.py` | double tanh 제거 + squash correction |
+| `models/rl/environment.py` | softmax action projection |
+| `pipeline/inference_pipeline.py` | zero state → market features |
+| `config/settings_fast.yaml` | max_position_pct 0.30 |
+| `saved_models/ensemble.pt` | 재학습 (VAE 30 + Trans 16 + GAN 1 + RL 82 epochs) |
+
+### 11.5 검증 결과
+
+| 항목 | 수정 전 | 수정 후 |
+|------|---------|---------|
+| 섹터 방향 반전 | 6/11 | **0/11** |
+| TWAP 목표 도달 | 72% | **100%** |
+| RL state-dependent | 고정 출력 | **상태 반응 (diff=0.155)** |
+| max_position 차별화 | ±0.1 | **±0.3** |
+| 시스템 에러/일 | ~26건 | **0건** |
+
+---
+
+## 12. 향후 개선 방향
+
+1. ~~**TWAP 완료율 모니터링**: Wave 2/3 미실행 시 자동 보상 매수~~ → v3.0에서 full_target_qty로 해결
+2. **RL alpha 점진적 복원**: RL 재학습 결과 검증 후 alpha 0.0→0.3→0.6 단계적 상향
+3. **FinBERT 뉴스 감성**: 현재 키워드 기반 → 사전학습 모델로 업그레이드
+4. **오더북 데이터**: KIS API 호가창 조회 → 호가 불균형 피처
+5. **멀티 타임프레임**: 일봉 + 주봉 + 월봉 시계열 병합
+6. **GPU 추론**: 서버 GPU 상시화 (현재 CPU only)
+7. **Black-Litterman**: 모델 예측을 view로 사용하는 BL 포트폴리오 최적화
 8. **동적 cash_buffer**: 레짐별 현금 버퍼 조정 (bear 10%, bull 3%)
+9. **RL 리워드 개선**: Sharpe 60일 윈도우의 불연속 → smooth reward function

@@ -448,12 +448,24 @@ class TrainPipeline:
             logger.info(f"Filtered unknown sectors: {before} -> {after} tickers")
 
         # Limit tickers per market for fast training if configured
+        # Allocate proportionally across markets to prevent one market dominating
         max_tickers = self.config["training"].get("max_tickers")
         if max_tickers and df["ticker"].nunique() > max_tickers:
-            # Keep tickers with most data points (proxy for liquidity)
-            ticker_counts = df.groupby("ticker").size().nlargest(max_tickers)
-            df = df[df["ticker"].isin(ticker_counts.index)]
-            logger.info(f"Limited to top {max_tickers} tickers by data coverage")
+            market_tickers = df.groupby("market")["ticker"].nunique()
+            total = market_tickers.sum()
+            selected = []
+            for market, count in market_tickers.items():
+                # Proportional allocation, at least 10% per market
+                alloc = max(int(max_tickers * 0.1), int(max_tickers * count / total))
+                market_df = df[df["market"] == market]
+                top = market_df.groupby("ticker").size().nlargest(alloc).index
+                selected.extend(top)
+            # If over budget, trim the largest market
+            if len(selected) > max_tickers:
+                selected = selected[:max_tickers]
+            df = df[df["ticker"].isin(selected)]
+            market_dist = df.groupby("market")["ticker"].nunique().to_dict()
+            logger.info(f"Limited to {df['ticker'].nunique()} tickers: {market_dist}")
 
         # Feature engineering
         feature_eng = FeatureEngineer()

@@ -1,10 +1,33 @@
-"""Sector classification using GICS taxonomy for KOSPI and NASDAQ."""
+"""Sector classification using GICS taxonomy for KOSPI, KOSDAQ, and NASDAQ.
+
+Primary source: config/kr_sector_map.yaml (static ticker→sector mapping).
+Fallback: keyword matching from config/sectors.yaml.
+"""
 
 from pathlib import Path
 
 import pandas as pd
 import yaml
 from loguru import logger
+
+
+def load_kr_sector_map(
+    map_path: str = "config/kr_sector_map.yaml",
+) -> dict[str, str]:
+    """Load static Korean ticker→sector mapping.
+
+    Returns:
+        Dict mapping yf_ticker (e.g. '005930.KS') to sector key.
+    """
+    p = Path(map_path)
+    if not p.exists():
+        logger.warning(f"kr_sector_map.yaml not found at {p}")
+        return {}
+    with open(p, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    mapping = data.get("mapping", {})
+    logger.info(f"Loaded {len(mapping)} static sector mappings from {p.name}")
+    return mapping
 
 
 class SectorClassifier:
@@ -16,116 +39,97 @@ class SectorClassifier:
         self.sectors = self.config["sectors"]
         self.sector_names = list(self.sectors.keys())
         self.n_sectors = len(self.sector_names)
+
+        # Load static mapping as primary source
+        self._static_map = load_kr_sector_map()
+
         logger.info(f"Loaded {self.n_sectors} sector definitions")
+
+    def _keyword_classify(self, name: str) -> str:
+        """Fallback: classify by keyword matching."""
+        if not isinstance(name, str) or not name:
+            return "unknown"
+        best_sector = "unknown"
+        best_count = 0
+        for sector_key, sector_def in self.sectors.items():
+            keywords = sector_def.get("kospi_keywords", [])
+            count = sum(1 for kw in keywords if kw in name)
+            if count > best_count:
+                best_count = count
+                best_sector = sector_key
+        return best_sector
+
+    def _classify_kr(
+        self,
+        ticker_info: pd.DataFrame,
+        market_label: str,
+    ) -> pd.DataFrame:
+        """Classify Korean tickers: static map first, keyword fallback.
+
+        Args:
+            ticker_info: DataFrame with 'ticker' and 'name' columns.
+                         'ticker' may be raw code or yf_ticker format.
+            market_label: 'KOSPI' or 'KOSDAQ' for logging.
+
+        Returns:
+            DataFrame with added 'sector' column.
+        """
+        df = ticker_info.copy()
+
+        # Determine yf_ticker column for static map lookup
+        if "yf_ticker" in df.columns:
+            yf_col = "yf_ticker"
+        else:
+            yf_col = "ticker"
+
+        def _resolve(row):
+            # 1) Static map lookup
+            yf_ticker = row.get(yf_col, "")
+            if yf_ticker in self._static_map:
+                return self._static_map[yf_ticker]
+            # Also try with suffix if ticker is raw code
+            ticker = row.get("ticker", "")
+            suffix = ".KS" if market_label == "KOSPI" else ".KQ"
+            if ticker and not ticker.endswith(suffix):
+                candidate = f"{ticker}{suffix}"
+                if candidate in self._static_map:
+                    return self._static_map[candidate]
+            # 2) Keyword fallback
+            return self._keyword_classify(row.get("name", ""))
+
+        df["sector"] = df.apply(_resolve, axis=1)
+
+        classified = (df["sector"] != "unknown").sum()
+        logger.info(
+            f"{market_label} sector classification: {classified}/{len(df)} "
+            f"({classified / len(df) * 100:.1f}%)"
+        )
+        return df
 
     def classify_kospi(
         self,
         ticker_info: pd.DataFrame,
     ) -> pd.DataFrame:
-        """Classify KOSPI tickers by name keyword matching.
-
-        When a company name matches keywords from multiple sectors, the sector
-        with the highest number of matching keywords wins (best-match logic).
-        Ties are broken by GICS sector order (lower gics_code wins).
-
-        Args:
-            ticker_info: DataFrame with 'ticker' and 'name' columns
-
-        Returns:
-            DataFrame with added 'sector' column
-        """
-        df = ticker_info.copy()
-
-        # Build per-sector keyword lists once
-        sector_keywords: dict[str, list[str]] = {
-            sector_key: sector_def.get("kospi_keywords", [])
-            for sector_key, sector_def in self.sectors.items()
-            if sector_def.get("kospi_keywords")
-        }
-
-        def _best_sector(name: str) -> str:
-            """Return the sector with the most keyword hits for a company name."""
-            if not isinstance(name, str) or not name:
-                return "unknown"
-            best_sector = "unknown"
-            best_count = 0
-            for sector_key, keywords in sector_keywords.items():
-                count = sum(1 for kw in keywords if kw in name)
-                if count > best_count:
-                    best_count = count
-                    best_sector = sector_key
-            return best_sector
-
-        df["sector"] = df["name"].apply(_best_sector)
-
-        classified = (df["sector"] != "unknown").sum()
-        logger.info(
-            f"KOSPI sector classification: {classified}/{len(df)} "
-            f"({classified / len(df) * 100:.1f}%)"
-        )
-        return df
+        """Classify KOSPI tickers: static map → keyword fallback."""
+        return self._classify_kr(ticker_info, "KOSPI")
 
     def classify_kosdaq(
         self,
         ticker_info: pd.DataFrame,
     ) -> pd.DataFrame:
-        """Classify KOSDAQ tickers by name keyword matching.
-
-        Uses the same kospi_keywords since KOSDAQ companies share
-        similar Korean naming conventions. KOSDAQ has more biotech/IT,
-        which maps well to existing healthcare/IT sector keywords.
-
-        Args:
-            ticker_info: DataFrame with 'ticker' and 'name' columns
-
-        Returns:
-            DataFrame with added 'sector' column
-        """
-        df = ticker_info.copy()
-
-        # Reuse KOSPI keywords — Korean company naming conventions are the same
-        sector_keywords: dict[str, list[str]] = {
-            sector_key: sector_def.get("kospi_keywords", [])
-            for sector_key, sector_def in self.sectors.items()
-            if sector_def.get("kospi_keywords")
-        }
-
-        def _best_sector(name: str) -> str:
-            if not isinstance(name, str) or not name:
-                return "unknown"
-            best_sector = "unknown"
-            best_count = 0
-            for sector_key, keywords in sector_keywords.items():
-                count = sum(1 for kw in keywords if kw in name)
-                if count > best_count:
-                    best_count = count
-                    best_sector = sector_key
-            return best_sector
-
-        df["sector"] = df["name"].apply(_best_sector)
-
-        classified = (df["sector"] != "unknown").sum()
-        logger.info(
-            f"KOSDAQ sector classification: {classified}/{len(df)} "
-            f"({classified / len(df) * 100:.1f}%)"
-        )
-        return df
+        """Classify KOSDAQ tickers: static map → keyword fallback."""
+        return self._classify_kr(ticker_info, "KOSDAQ")
 
     def classify_nasdaq(
         self,
         ticker_info: pd.DataFrame,
     ) -> pd.DataFrame:
-        """Classify NASDAQ tickers using yfinance sector info.
-
-        Falls back to ETF-based sector proxy if individual
-        sector info is unavailable.
-        """
+        """Classify NASDAQ tickers using yfinance sector info."""
         import yfinance as yf
 
         df = ticker_info.copy()
         df["sector"] = "unknown"
 
-        # Map yfinance sector names to our sector keys
         yf_sector_map = {
             "Energy": "energy",
             "Basic Materials": "materials",
@@ -141,7 +145,6 @@ class SectorClassifier:
             "Real Estate": "real_estate",
         }
 
-        # Batch fetch sector info
         batch_size = 100
         tickers = df["ticker"].tolist()
 
