@@ -1,9 +1,14 @@
-"""Transformer training with gradient checkpointing and cosine warmup."""
+"""Transformer training with gradient checkpointing and cosine warmup.
+
+Phase 21: Ranking loss 추가 — Huber(수익률 크기) + Pairwise Ranking(순위 일관성) 혼합.
+RenTech 원칙: "정확한 수익률 예측보다 순위 예측이 실현 가능"
+"""
 
 import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import LambdaLR
 from loguru import logger
@@ -12,6 +17,46 @@ from tqdm import tqdm
 from models.transformer.model import TemporalTransformer
 from utils.device import DeviceManager
 from utils.storage import StorageManager
+
+
+class PairwiseRankingLoss(nn.Module):
+    """Pairwise ranking loss for learning relative order.
+
+    배치 내에서 (pred_i - pred_j)와 (target_i - target_j)의 부호가
+    일치하도록 학습. ListNet보다 단순하고 배치 구조에 무관하게 적용 가능.
+
+    Loss = -mean(log(sigmoid(sigma * (pred_i - pred_j) * sign(target_i - target_j))))
+    """
+
+    def __init__(self, sigma: float = 1.0, n_pairs: int = 256):
+        super().__init__()
+        self.sigma = sigma
+        self.n_pairs = n_pairs  # 배치당 비교할 쌍 수
+
+    def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        batch_size = preds.shape[0]
+        if batch_size < 2:
+            return torch.tensor(0.0, device=preds.device)
+
+        # 랜덤 페어 샘플링 (전체 조합 대신 효율적)
+        n_pairs = min(self.n_pairs, batch_size * (batch_size - 1) // 2)
+        idx_i = torch.randint(0, batch_size, (n_pairs,), device=preds.device)
+        idx_j = torch.randint(0, batch_size, (n_pairs,), device=preds.device)
+        # i != j 보장
+        mask = idx_i != idx_j
+        idx_i, idx_j = idx_i[mask], idx_j[mask]
+
+        if len(idx_i) == 0:
+            return torch.tensor(0.0, device=preds.device)
+
+        pred_diff = preds[idx_i] - preds[idx_j]
+        target_diff = targets[idx_i] - targets[idx_j]
+        target_sign = torch.sign(target_diff)
+
+        # 부호가 일치하면 loss 감소
+        logits = self.sigma * pred_diff * target_sign
+        loss = -F.logsigmoid(logits).mean()
+        return loss
 
 
 def cosine_warmup_scheduler(
@@ -55,7 +100,10 @@ class TransformerTrainer:
             lr=learning_rate,
             weight_decay=weight_decay,
         )
-        self.criterion = nn.HuberLoss(delta=0.5)  # Robust to outlier returns
+        # Phase 21: Huber(크기) + Pairwise Ranking(순위) 혼합 손실
+        self.criterion_huber = nn.HuberLoss(delta=0.5)
+        self.criterion_rank = PairwiseRankingLoss(sigma=1.0, n_pairs=256)
+        self.rank_weight = 0.5  # Ranking loss 비중 (0.5 = 동등)
 
     def train_epoch(
         self,
@@ -76,7 +124,10 @@ class TransformerTrainer:
 
             with self.dm.autocast():
                 output = self.model(sequences, sectors)
-                loss = self.criterion(output["prediction"], targets)
+                preds = output["prediction"]
+                huber_loss = self.criterion_huber(preds, targets)
+                rank_loss = self.criterion_rank(preds.squeeze(), targets.squeeze())
+                loss = (1 - self.rank_weight) * huber_loss + self.rank_weight * rank_loss
                 loss = loss / self.grad_accum
 
             is_accumulating = (step + 1) % self.grad_accum != 0
@@ -112,7 +163,10 @@ class TransformerTrainer:
 
             with self.dm.autocast():
                 output = self.model(sequences, sectors)
-                loss = self.criterion(output["prediction"], targets)
+                preds = output["prediction"]
+                huber_loss = self.criterion_huber(preds, targets)
+                rank_loss = self.criterion_rank(preds.squeeze(), targets.squeeze())
+                loss = (1 - self.rank_weight) * huber_loss + self.rank_weight * rank_loss
 
             total_loss += loss.item()
             all_preds.append(output["prediction"].cpu())
