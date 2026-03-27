@@ -443,14 +443,109 @@ Phase 19 배포(3/19) 후 21일간 sandbox 실가동 결과:
 
 ---
 
-## 12. 향후 개선 방향
+## 12. v3.1 Phase 21 — RenTech/Two Sigma 원칙 적용 (2026-03-27)
 
-1. ~~**TWAP 완료율 모니터링**: Wave 2/3 미실행 시 자동 보상 매수~~ → v3.0에서 full_target_qty로 해결
-2. **RL alpha 점진적 복원**: RL 재학습 결과 검증 후 alpha 0.0→0.3→0.6 단계적 상향
-3. **FinBERT 뉴스 감성**: 현재 키워드 기반 → 사전학습 모델로 업그레이드
-4. **오더북 데이터**: KIS API 호가창 조회 → 호가 불균형 피처
-5. **멀티 타임프레임**: 일봉 + 주봉 + 월봉 시계열 병합
-6. **GPU 추론**: 서버 GPU 상시화 (현재 CPU only)
-7. **Black-Litterman**: 모델 예측을 view로 사용하는 BL 포트폴리오 최적화
-8. **동적 cash_buffer**: 레짐별 현금 버퍼 조정 (bear 10%, bull 3%)
-9. **RL 리워드 개선**: Sharpe 60일 윈도우의 불연속 → smooth reward function
+> 작업: 2026-03-27
+> 서버 배포: 2026-03-27 22:37 KST
+> 커밋: `13c0390` (구조 개혁) + `41b7604` (Ranking Loss + RL 재학습)
+
+### 12.1 배경: 근본 문제 진단
+
+22일간 sandbox 실가동 데이터 분석 → 매수 94% / 매도 6% 극심한 편향 발견.
+Renaissance Technologies, Two Sigma 투자원칙과 대비 분석 실시.
+
+**핵심 문제**: EW(Equal-Weight) 60% blending이 모든 섹터를 양수로 만들어 **매도 신호 자체가 구조적으로 불가능**.
+```
+worst case: 0.4 × (-0.1) + 0.6 × (1/11) = +0.0145 → 항상 양수
+```
+시스템이 Long-only 지수 추종기로 퇴화, 알파 없이 비용만 발생.
+
+### 12.2 수정 사항 (총 10건 + 재학습 2건)
+
+#### [Phase A] 구조적 매수 편향 제거 (재학습 불필요)
+
+| # | 파일 | 변경 | 원칙 |
+|---|------|------|------|
+| A-1 | `strategy/signal.py` | EW 60% 폐지 → cross-sectional z-score rank (top 3 Long, bottom 3 Short, 5 Neutral) | RenTech: Market neutrality |
+| A-1 | `scheduler/daily_runner.py` | `alpha_blend 0.4` 제거, long/short 분리 가중치 계산, 5% cash buffer | |
+| A-2 | `live/signal_to_order.py` | target=0 즉시 전량 매도, 매도 threshold 2% (매수 3%) | |
+| A-3 | `live/signal_to_order.py` | ICR 게이트: `score >= 0.012`만 매수 (비용의 2배 이상) | RenTech: Signal-to-cost ratio |
+| A-4 | `live/signal_to_order.py` | 일일 턴오버 15% 제한, 양방향 누적 추적 | Two Sigma: Cost control |
+
+#### [Phase B] 포트폴리오 구성 개혁
+
+| # | 파일 | 변경 | 원칙 |
+|---|------|------|------|
+| B-1 | `backtest/engine.py` | cross-sectional rank 동기화, short 섹터 0% 강제, 매도 drift 별도 threshold | |
+| B-2 | `live/signal_to_order.py` | Kelly 사이징 → Risk Parity (변동성 역비례, target vol 15%) | Two Sigma: Risk parity |
+
+#### [Phase C] 신호 품질 개선
+
+| # | 파일 | 변경 | 원칙 |
+|---|------|------|------|
+| C-1 | `scheduler/daily_runner.py` | Signal Decay: Wave별 감쇠 (Wave1=0.917, Wave2=0.866, Wave3=0.805, 반감기 24h) | RenTech: Signal decay |
+| C-2 | `models/transformer/trainer.py` | **PairwiseRankingLoss** 도입: Huber 50% + Ranking 50% 혼합 | RenTech: 순위 > 크기 |
+
+#### [Phase D] 실행 품질 개선
+
+| # | 파일 | 변경 | 원칙 |
+|---|------|------|------|
+| D-1 | `live/signal_to_order.py` | Volume 참여율 5% 강제 제한 (impact model 실패와 무관) | RenTech: Market impact |
+| D-2 | `tracking/trade_log.py` | `compute_turnover`: 매수만 → 매수+매도 양방향 | Two Sigma: 측정 = 개선 |
+| D-2 | `scheduler/daily_runner.py` | `step_eod`: 정확한 턴오버 기록 | |
+
+#### 설정 변경
+
+| 파일 | 변경 |
+|------|------|
+| `config/live_config.yaml` | `icr_min: 2.0`, `max_daily_turnover: 0.15` 추가 |
+| `config/settings_fast.yaml` | `rebalance_threshold: 0.05 → 0.03`, `alpha_blend` deprecated |
+| `main.py` | EW blending → long/short 분리 + 5% cash buffer |
+| `backtest/metrics.py` | `tune_alpha_blend` deprecated 마킹 |
+
+### 12.3 재학습 결과
+
+**Transformer (Huber + Pairwise Ranking Loss):**
+
+| 지표 | Phase 19 (Huber only) | Phase 21 (Huber + Ranking) | 변화 |
+|------|----------------------|---------------------------|------|
+| Dir Accuracy | 48.9% | **52.9%** (peak ep12) | +4.0%p |
+| Rank IC | ~0.01 | **0.082** (peak ep12) | 8x |
+| Best val_loss | — | 0.3467 (epoch 4) | — |
+| Early stop | — | epoch 19 (patience 15) | — |
+
+**RL Agent (softmax + squash correction):**
+
+| 지표 | Phase 19 | Phase 21 | 변화 |
+|------|---------|---------|------|
+| Return | +4.44% ± 10.57% | **+10.68% ± 10.77%** | +6.2%p |
+| MDD | -16.8% | **-10.8%** | -6.0%p |
+| Best Episode | — | +35.3% | — |
+| PPO Updates | — | 97 (200K timesteps) | — |
+
+### 12.4 예상 효과
+
+| 지표 | Phase 20 | Phase 21 예상 |
+|------|---------|---------------|
+| 매수/매도 비율 | 94% / 6% | **~55% / 45%** |
+| 일일 거래 건수 | 80~160건 | **20~40건** |
+| 시장 방향 편향 | 100% Long | **Dollar-neutral** |
+| 일일 턴오버 | 무제한 | **최대 15%** |
+| Transformer Dir Acc | 48.9% | **52.9%** |
+| RL Return | +4.44% | **+10.68%** |
+
+---
+
+## 13. 향후 개선 방향
+
+1. ~~**TWAP 완료율 모니터링**~~ → v3.0 full_target_qty로 해결
+2. ~~**매수 편향 (91%/9%)**~~ → v3.1 cross-sectional rank + 매도 강화로 해결
+3. ~~**Transformer dir_acc 48.9%**~~ → v3.1 Ranking Loss로 52.9% 달성
+4. **RL alpha 점진적 복원**: 현재 alpha=0.0, Phase 21 재학습 결과 검증 후 0.0→0.3 상향
+5. **Factor Decomposition**: reversal, momentum, volume, volatility 독립 팩터 분해
+6. **Alpha-Portfolio 분리**: cvxpy optimizer, dollar-neutral constraint
+7. **FinBERT 뉴스 감성**: 키워드 기반 → 사전학습 모델 업그레이드
+8. **오더북 데이터**: KIS API 호가창 → 호가 불균형 피처
+9. **멀티 타임프레임**: 일봉 + 주봉 + 월봉 시계열 병합
+10. **GPU 추론**: 서버 GPU 상시화 (현재 CPU only, 10~15분)
+11. **Black-Litterman**: 모델 예측을 view로 사용하는 BL 포트폴리오 최적화

@@ -1,8 +1,8 @@
 # Alpha Signal Discovery Engine - 기술 상세 문서
 
-**버전**: 2026-03-27 (Phase 20: 수익률 구조 결함 수정 + RL 재설계)
-**현재 학습 성과**: VAE 30ep, Transformer 16ep (72feat), RL Reward **-3.64** (Phase 19 -5.20 대비 30% 개선)
-**배포 상태**: Hetzner Cloud `77.42.78.9` systemd 데몬 실행 중 (Phase 20 배포 완료 — 2026-03-27 01:26 KST 재기동)
+**버전**: 2026-03-27 (Phase 21: RenTech/Two Sigma 원칙 적용 + Ranking Loss + RL 재학습)
+**현재 학습 성과**: VAE 30ep, Transformer 4ep (Ranking Loss, Dir Acc 52.9%, IC 0.082), RL Return **+10.68%** (MDD -10.8%)
+**배포 상태**: Hetzner Cloud `77.42.78.9` systemd 데몬 실행 중 (Phase 21 배포 완료 — 2026-03-27 22:37 KST 재기동)
 
 ---
 
