@@ -212,7 +212,7 @@ def compute_walkforward_stability(
     }
 
 
-def tune_alpha_blend(
+def tune_alpha_blend(  # DEPRECATED: Phase 21에서 EW blending 폐지 → cross-sectional rank 사용
     val_returns: "pd.DataFrame",
     model_signals_val: "np.ndarray",
     alpha_candidates: list = None,

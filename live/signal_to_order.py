@@ -38,6 +38,8 @@ TRANSACTION_COST_RATE = 0.006
 # 반복 실패 확인된 종목 자동 스킵
 SANDBOX_BLOCKLIST: set[str] = {
     "003060",   # 매매불가 종목 (code=40070000)
+    "002070",   # 매매불가 종목 (code=40070000)
+    "258830",   # 시세 조회 불가 (price=0 반복)
 }
 
 # TWAP 웨이브별 실행 비율 기본값 (live_config.yaml의 twap_wave_fractions로 오버라이드)
@@ -103,8 +105,10 @@ class OrderGenerator:
         self.urg_aggressive = urg_cfg.get("aggressive", 0.5)
         self.urg_normal     = urg_cfg.get("normal", 0.2)
 
-        # Phase D
+        # Phase D: 거래비용 게이트
         self.score_cost_min = exec_cfg.get("score_cost_threshold", 0.001)
+        # Phase D+: ICR (Information-to-Cost Ratio) — 비용의 N배 이상 알파만 거래
+        self.icr_min = exec_cfg.get("icr_min", 2.0)
 
         # Kelly position sizing toggle (default: enabled)
         self.use_kelly_sizing = exec_cfg.get("use_kelly_sizing", True)
@@ -134,6 +138,15 @@ class OrderGenerator:
 
         # 하위 호환: self.api는 국내 기본 (pending/cancel 등 국내 전용 메서드용)
         self.api = self.api_domestic
+        self.is_sandbox = (_mode == "sandbox")
+
+        # 세션 내 동적 블랙리스트 (반복 실패 종목 자동 스킵)
+        self._session_blocklist: set[str] = set()
+
+        # Phase 21: 일일 턴오버 제한
+        self.max_daily_turnover = exec_cfg.get("max_daily_turnover", 0.15)  # 15%
+        self._daily_traded_amount: float = 0.0  # 당일 누적 거래 금액
+        self._turnover_date: str = ""  # 날짜 변경 감지
 
         self.logger  = TradeLogger(self.cfg["logging"]["trade_log_db"])
         self.sectors = get_sector_order()
@@ -301,7 +314,8 @@ class OrderGenerator:
         )
 
         # patient: 모니터링 없이 반환 (당일 미체결 → 장 마감 후 자동 취소)
-        if urgency == "patient" or not order_no:
+        # sandbox: 미체결 조회 API 미지원 (404) → patient처럼 즉시 반환
+        if urgency == "patient" or not order_no or self.is_sandbox:
             return result
 
         # ── 5분 대기 후 미체결 확인 ──────────────────────────────────
@@ -399,14 +413,38 @@ class OrderGenerator:
         weights           = self._validate_weights(sector_weights)
         current_positions = self._get_current_positions()
         portfolio_value   = self._get_portfolio_value(current_positions)
+
+        # ── 일일 턴오버 리셋 (날짜 변경 시) ──────────────────────────
+        from datetime import date as _date
+        today_str = _date.today().isoformat()
+        if self._turnover_date != today_str:
+            self._daily_traded_amount = 0.0
+            self._turnover_date = today_str
+
+        # ── 턴오버 한도 초과 체크 ─────────────────────────────────────
+        turnover_limit = portfolio_value * self.max_daily_turnover
+        if self._daily_traded_amount >= turnover_limit:
+            logger.warning(
+                f"일일 턴오버 한도 도달: "
+                f"{self._daily_traded_amount:,.0f} / {turnover_limit:,.0f} "
+                f"({self.max_daily_turnover:.0%}) → 리밸런싱 중단"
+            )
+            return []
+
         target_positions  = self._compute_target_positions(
             weights, portfolio_value, sector_top_tickers
         )
         # market_filter 적용: 지정 시장 종목만 주문
+        # target과 current 모두 필터링해야 다른 시장 종목 매도 방지
         if market_filter:
             target_positions = {
                 t: v for t, v in target_positions.items()
                 if v.get("market") == market_filter
+            }
+            current_positions = {
+                t: v for t, v in current_positions.items()
+                if (market_filter == "domestic" and is_domestic(t))
+                or (market_filter == "overseas" and not is_domestic(t))
             }
         orders = self._compute_orders(current_positions, target_positions)
 
@@ -430,9 +468,14 @@ class OrderGenerator:
                 result = self._execute_with_retry(order, urgency)
                 executed.append(result)
                 self.logger.log_trade(result)
+                self._daily_traded_amount += abs(result.get("amount", 0))
             except Exception as e:
                 failed_sell_tickers.add(order["ticker"])
                 logger.error(f"매도 실패 [{order['ticker']}]: {e}")
+                # 매매불가/시세불가 에러 → 세션 블랙리스트 등록
+                err_str = str(e)
+                if "40070000" in err_str or "price=0" in err_str:
+                    self._session_blocklist.add(kis_code(order["ticker"]))
 
         if failed_sell_tickers:
             logger.warning(f"매도 실패: {failed_sell_tickers} → 익일 재시도")
@@ -453,10 +496,21 @@ class OrderGenerator:
 
         # ── Phase B: 매수 TWAP 분할 ─────────────────────────────────────
         wave_fraction = TWAP_FRACTIONS.get(self.twap_wave, 1.0)
+        icr_min = getattr(self, "icr_min", 2.0)  # Information-to-Cost Ratio 최소값
+        buy_skipped_icr = 0
 
         for order in buy_orders:
             target_amount = order.get("target_amount", 0)
             urgency       = self._get_urgency(order.get("score", 0.3))
+
+            # ── Phase D+: ICR 게이트 (비용 대비 알파 검증) ──────────
+            # ICR = |signal_score| / transaction_cost_rate
+            # ICR < icr_min → 거래비용 대비 신호가 약하므로 스킵
+            score = order.get("score", 0.0)
+            icr = abs(score) / TRANSACTION_COST_RATE if TRANSACTION_COST_RATE > 0 else float("inf")
+            if icr < icr_min:
+                buy_skipped_icr += 1
+                continue
 
             # 소액 주문: Wave 1에서만 전량 실행, 이후 웨이브는 스킵
             if target_amount < self.twap_threshold:
@@ -464,8 +518,12 @@ class OrderGenerator:
                     continue
                 wave_qty = order["qty"]
             else:
-                # 대형 주문: 웨이브 비율만큼만 실행
-                wave_qty = max(1, int(order["qty"] * wave_fraction))
+                # 대형 주문: 원본 목표 수량 기준 웨이브 비율 적용
+                # (remaining diff 기준이면 복리 감소로 72%만 도달)
+                full_target = order.get("full_target_qty", order["qty"])
+                wave_qty = max(1, int(full_target * wave_fraction))
+                # 실제 부족분을 초과하지 않도록 제한
+                wave_qty = min(wave_qty, order["qty"])
 
             # Layer 2 스케일 적용 (장중 모멘텀 반영)
             if layer2_scales:
@@ -511,6 +569,8 @@ class OrderGenerator:
                     result = self._execute_with_retry(buy_order, urgency)
                 executed.append(result)
                 self.logger.log_trade(result)
+                trade_amount = abs(result.get("amount", 0))
+                self._daily_traded_amount += trade_amount
                 if available_cash != float("inf"):
                     available_cash -= required
                 logger.info(
@@ -518,13 +578,20 @@ class OrderGenerator:
                     f"{order['ticker']} {wave_qty}주 "
                     f"[Wave{self.twap_wave} {wave_fraction:.0%} / {urgency}]"
                 )
+                # 턴오버 한도 초과 시 나머지 매수 중단
+                if self._daily_traded_amount >= turnover_limit:
+                    logger.warning(f"턴오버 한도 도달 → 잔여 매수 중단")
+                    break
             except Exception as e:
                 logger.error(f"매수 실패 [{order['ticker']}]: {e}")
+                err_str = str(e)
+                if "40070000" in err_str or "price=0" in err_str:
+                    self._session_blocklist.add(kis_code(order["ticker"]))
 
         logger.info(
             f"[Wave{self.twap_wave}] 리밸런싱 완료: "
             f"{len(executed)}/{len(orders)} 실행 "
-            f"(매도 실패 {len(failed_sell_tickers)}건)"
+            f"(매도 실패 {len(failed_sell_tickers)}건, ICR 스킵 {buy_skipped_icr}건)"
         )
         return executed
 
@@ -631,18 +698,21 @@ class OrderGenerator:
             "note":      f"wave{self.twap_wave}",
         }
 
-    def _kelly_scale(self, ticker: str, score: float, market: str) -> float:
-        """Half-Kelly 스케일 팩터 계산.
+    def _risk_parity_scale(self, ticker: str, score: float, market: str) -> float:
+        """Risk-parity 기반 포지션 사이징 (변동성 역비례).
+
+        RenTech/Two Sigma 원칙: 변동성이 높은 종목은 작게, 낮은 종목은 크게.
+        Kelly 대비 추정 오차에 robust함.
 
         Args:
             ticker: 종목 코드
-            score: 모델 신호 강도 (0 ~ 0.05 범위)
+            score: 모델 신호 강도
             market: "domestic" or "overseas"
 
         Returns:
-            0.3 ~ 1.5 범위 스케일 팩터
+            0.5 ~ 1.5 범위 스케일 팩터 (변동성 역비례)
         """
-        if not self.use_kelly_sizing:
+        if not self.use_kelly_sizing:  # 설정 재사용 (use_risk_parity_sizing과 동일)
             return 1.0
 
         # 변동성 조회 (캐시 사용)
@@ -662,13 +732,13 @@ class OrderGenerator:
         if vol is None or vol < 1e-8:
             return 1.0
 
-        # Half-Kelly: f = signal_edge / variance (scaled down by 0.5)
-        # signal_edge: score 범위 0.001~0.011 → 정규화
-        normalized_score = min(score / 0.008, 2.0)  # 0.008 = 기준 score (aggressive 임계값)
-        kelly_f = 0.5 * normalized_score / (vol * 100 + 1e-8)
+        # Risk-parity: 목표 변동성 대비 실제 변동성 비율
+        # 목표 일일 변동성 = 15% / sqrt(252) ≈ 0.945%
+        target_daily_vol = 0.15 / (252 ** 0.5)
+        rp_scale = target_daily_vol / (vol + 1e-8)
 
-        # 0.5 ~ 1.5로 클리핑 (최소 50% 투자 보장, 유휴 현금 축소)
-        return float(np.clip(kelly_f, 0.5, 1.5))
+        # 0.5 ~ 1.5로 클리핑
+        return float(np.clip(rp_scale, 0.5, 1.5))
 
     def _compute_target_positions(
         self,
@@ -736,8 +806,9 @@ class OrderGenerator:
                 score  = float(tkr_info.get("score", 0.0))
 
                 # sandbox 블랙리스트: 모의투자 매매 불가 종목 스킵
-                if self.cfg["broker"]["mode"] == "sandbox" and kis_code(ticker) in SANDBOX_BLOCKLIST:
-                    logger.debug(f"스킵 [{ticker}]: sandbox 블랙리스트 (매매불가)")
+                _norm_code = kis_code(ticker)
+                if self.is_sandbox and _norm_code in (SANDBOX_BLOCKLIST | self._session_blocklist):
+                    logger.debug(f"스킵 [{ticker}]: 블랙리스트 (매매불가)")
                     continue
 
                 # Phase D: split 모드에서만 score 임계값 필터 적용 (ETF는 항상 거래)
@@ -798,7 +869,7 @@ class OrderGenerator:
 
                 # Half-Kelly 포지션 조정 (신호 강도 반영)
                 if self.use_kelly_sizing and score > 0:
-                    kelly_s = self._kelly_scale(ticker, score, market)
+                    kelly_s = self._risk_parity_scale(ticker, score, market)
                     qty = max(1, int(qty * kelly_s))
                     if kelly_s != 1.0:
                         logger.debug(
@@ -806,7 +877,9 @@ class OrderGenerator:
                             f"kelly_scale={kelly_s:.2f}, qty={qty}"
                         )
 
-                # 시장 충격 조정 (거래량 대비 주문 크기 제한)
+                # 시장 충격 조정 + Volume Participation Rate 제한
+                # RenTech 원칙: 평균 거래량의 5% 이하만 참여
+                max_participation = 0.05  # 5%
                 try:
                     import yfinance as yf
                     _vol_data = yf.Ticker(ticker if '.' in ticker else f"{ticker}.KS" if market == 'domestic' else ticker)
@@ -821,6 +894,14 @@ class OrderGenerator:
                             market_cap_tier=tier,
                             market="KOSPI" if market == "domestic" else "NASDAQ",
                         )
+                        # 강제 참여율 제한 (impact model 실패와 무관)
+                        max_qty_by_vol = max(1, int(avg_vol * max_participation))
+                        if qty > max_qty_by_vol:
+                            logger.debug(
+                                f"{ticker} 참여율 제한: {qty} → {max_qty_by_vol} "
+                                f"(avg_vol={avg_vol:,.0f}, max={max_participation:.0%})"
+                            )
+                            qty = max_qty_by_vol
                 except Exception:
                     pass  # 충격 모델 실패 시 원래 수량 유지
 
@@ -848,15 +929,14 @@ class OrderGenerator:
     ) -> list[dict]:
         """현재 포지션 vs 목표 포지션 → 주문 목록.
 
-        KIS balance API는 6자리 숫자 ticker 반환 (예: "005930").
-        sector_top_tickers(parquet 기준)는 ".KS"/".KQ" suffix 포함 (예: "005930.KS").
-        suffix 제거 후 매칭하여 동일 종목 중복 주문(매도+재매수) 방지.
+        Phase 21 개선:
+        - target=0 포지션은 즉시 전량 매도 (rebal_threshold 무시)
+        - 매도 주문에 별도의 낮은 threshold 적용 (매수 편향 방지)
+        - ICR(Information-to-Cost Ratio) 게이트로 비용 대비 알파 검증
         """
         orders = []
+        sell_rebal_threshold = min(self.rebal_threshold, 0.02)  # 매도는 2% drift만으로 발동
 
-        # 정규화 키(suffix 제거) → 원본 키 매핑
-        # current: KIS balance → 이미 정규화된 6자리 코드 또는 US 심볼
-        # targets: parquet → ".KS"/".KQ" suffix 포함 가능
         norm_to_curr = {k: k for k in current}
         norm_to_tgt  = {kis_code(k): k for k in targets}
 
@@ -885,15 +965,32 @@ class OrderGenerator:
                     })
                 continue
 
-            # tgt_key(suffix 포함) 기준으로 주문 생성 — market/exchange 정보 보유
             ticker        = tgt_key
             diff_qty      = target_qty - curr_qty
             target_amount = tgt_info["target_amount"]
             curr_amount   = curr_qty * tgt_info.get("current_price", 0)
-            amount_diff   = abs(target_amount - curr_amount) / max(target_amount, 1)
 
-            # 허용 범위 내 → 스킵 (거래비용 절약)
-            if amount_diff < self.rebal_threshold:
+            # target_qty == 0: 전량 매도 (threshold 무시)
+            if target_qty == 0 and curr_qty > 0:
+                sell_ticker = curr_key if curr_key else ticker
+                orders.append({
+                    "ticker":        sell_ticker,
+                    "side":          "sell",
+                    "qty":           curr_qty,
+                    "sector":        tgt_info["sector"],
+                    "market":        tgt_info["market"],
+                    "exchange":      tgt_info.get("exchange", ""),
+                    "score":         0.0,
+                    "target_amount": 0,
+                })
+                continue
+
+            amount_diff = abs(target_amount - curr_amount) / max(target_amount, 1)
+
+            # 매도: 낮은 threshold (2%), 매수: 기본 threshold
+            if diff_qty < 0 and amount_diff < sell_rebal_threshold:
+                continue
+            if diff_qty > 0 and amount_diff < self.rebal_threshold:
                 continue
 
             score = tgt_info.get("score", 0.3)
@@ -907,9 +1004,9 @@ class OrderGenerator:
             }
 
             if diff_qty > 0:
-                orders.append({**base, "side": "buy", "qty": diff_qty})
+                orders.append({**base, "side": "buy", "qty": diff_qty,
+                               "full_target_qty": target_qty})
             elif diff_qty < 0:
-                # 매도 시: curr_key(6자리) 사용 — KIS order API 호환
                 sell_ticker = curr_key if curr_key else ticker
                 orders.append({
                     **base,

@@ -269,7 +269,9 @@ class TradeLogger:
         }
 
     def compute_turnover(self, date_str: str = None) -> float:
-        """일별 턴오버 계산: sum(매수 금액) / 포트폴리오 가치.
+        """일별 턴오버 계산: sum(매수+매도 금액) / 포트폴리오 가치.
+
+        Phase 21: 매도 포함한 양방향 턴오버 (기존: 매수만)
 
         Args:
             date_str: 계산할 날짜 (ISO 형식, None이면 오늘).
@@ -281,14 +283,14 @@ class TradeLogger:
             date_str = date.today().isoformat()
 
         with self._conn() as conn:
-            # 해당 날짜 매수 총액
+            # 해당 날짜 매수+매도 총액 (양방향)
             row = conn.execute(
                 """SELECT COALESCE(SUM(amount), 0)
                    FROM trades
-                   WHERE DATE(timestamp) = ? AND side = 'buy'""",
+                   WHERE DATE(timestamp) = ?""",
                 (date_str,),
             ).fetchone()
-            buy_total = row[0] if row else 0.0
+            trade_total = row[0] if row else 0.0
 
             # 해당 날짜 포트폴리오 가치
             pv_row = conn.execute(
@@ -299,7 +301,7 @@ class TradeLogger:
 
         if portfolio_value <= 0:
             return 0.0
-        return buy_total / portfolio_value
+        return trade_total / portfolio_value
 
     def get_turnover_stats(self, days: int = 30) -> dict:
         """최근 N일 턴오버 통계.

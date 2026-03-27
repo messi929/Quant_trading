@@ -67,12 +67,12 @@ backtest:
     KOSPI:  0.003    # KOSPI200 대형주: 0.3%
     KOSDAQ: 0.005    # KOSDAQ150: 0.5% (스프레드 넓음, 유동성 낮음)
     NASDAQ: 0.001    # 미국 대형주: 0.1% (유동성 풍부)
-  max_position_pct: 0.1
+  max_position_pct: 0.30   # live_config max_sector_weight(0.30)와 일치 — 기존 0.1은 11섹터에서 차별화 불가
   rebalance_frequency: "weekly"
-  # alpha_blend: model/equal-weight 블렌딩 비율 (val set으로 튜닝, test set 미사용)
-  # python main.py backtest --tune-alpha 로 val set 기준 최적값 자동 탐색
-  alpha_blend: 0.4
-  rebalance_threshold: 0.05  # 최소 5% drift시에만 리밸런싱 (불필요 거래 방지)
+  # Phase 21: EW blending 제거 → cross-sectional rank (dollar-neutral)
+  # alpha_blend는 더 이상 사용하지 않음 (signal.py에서 rank normalize)
+  # alpha_blend: 0.4  # DEPRECATED — 모델 신호 직접 사용
+  rebalance_threshold: 0.03  # 매수 3% drift 시 리밸런싱 (매도는 2%로 별도 적용)
   use_flow_data: true  # 외국인/기관 수급 데이터 활용
 
 logging:

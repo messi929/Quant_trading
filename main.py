@@ -323,14 +323,19 @@ def cmd_backtest(args):
                         weights = np.ones(n_sectors) / n_sectors
                 else:
                     weights = np.ones(n_sectors) / n_sectors
-                # Blend model signal with equal-weight: model adds tilts on top of
-                # equal-weight base, reducing concentration risk
-                # alpha_blend은 val set으로 튜닝된 값 (config에서 로드)
-                # ⚠️  test set으로 재튜닝 금지 — look-ahead bias 발생
-                alpha = config["backtest"].get("alpha_blend", 0.4)
-                ew = np.ones(n_sectors) / n_sectors
-                weights = alpha * weights + (1.0 - alpha) * ew
-                model_signals[t_idx] = weights
+                # Phase 21: cross-sectional rank (signal.py가 long/short 분리)
+                # EW blending 폐지 → long 섹터만 투자, short 섹터 0%
+                long_mask = weights > 0
+                if long_mask.any():
+                    final_w = np.zeros(n_sectors)
+                    final_w[long_mask] = weights[long_mask]
+                    wsum = final_w.sum()
+                    if wsum > 1e-8:
+                        final_w /= wsum
+                    final_w *= 0.95  # 5% cash buffer
+                    model_signals[t_idx] = final_w
+                else:
+                    model_signals[t_idx] = np.ones(n_sectors) / n_sectors
 
             # Apply daily risk management pre-filter to signals
             # This complements the weekly-rebalancing engine's own RiskManager

@@ -31,7 +31,10 @@ class SignalGenerator:
         rl_allocation: np.ndarray,
         sector_returns: pd.DataFrame = None,
     ) -> dict:
-        """Generate final trading signals.
+        """Generate final trading signals using cross-sectional ranking.
+
+        Dollar-neutral 구조: 상위 섹터 long, 하위 섹터 short(=비중 축소).
+        RenTech 원칙: 시장 방향에 베팅하지 않고, 상대 순위에서 알파 추출.
 
         Args:
             model_prediction: (n_sectors,) return predictions from transformer
@@ -41,17 +44,18 @@ class SignalGenerator:
         Returns:
             Dict with signal details
         """
-        # Normalize predictions to [-1, 1]
-        if np.std(model_prediction) > 1e-8:
-            pred_signal = model_prediction / (np.abs(model_prediction).max() + 1e-8)
+        # ── Step 1: Cross-sectional z-score (시장 방향 제거) ──────────
+        std = np.std(model_prediction)
+        if std > 1e-8:
+            pred_signal = (model_prediction - np.mean(model_prediction)) / std
         else:
             pred_signal = np.zeros(self.n_sectors)
 
-        # Combine model prediction and RL allocation
-        alpha = 0.6  # Weight on RL allocation
+        # RL agent는 재학습 전까지 비활성화
+        alpha = 0.0
         raw_signal = alpha * rl_allocation + (1 - alpha) * pred_signal
 
-        # Add momentum overlay if available
+        # Momentum overlay (cross-sectional)
         if sector_returns is not None and len(sector_returns) >= self.momentum_window:
             momentum = self._compute_momentum(sector_returns)
             raw_signal = 0.7 * raw_signal + 0.3 * momentum
@@ -62,20 +66,37 @@ class SignalGenerator:
             self.signal_history = self.signal_history[-self.smoothing_window:]
         smoothed = np.mean(self.signal_history, axis=0)
 
-        # Apply threshold
+        # ── Step 2: Rank-based allocation (dollar-neutral) ────────────
+        # 상위 top_n개 Long, 하위 top_n개 Short, 나머지 0
+        top_n = self.n_sectors // 3  # 11섹터 → top/bottom 3개씩
+        ranked_indices = np.argsort(smoothed)  # ascending: [worst ... best]
+
+        final_signal = np.zeros(self.n_sectors)
+        # Long: 가장 높은 top_n개 (신호 강도에 비례)
+        long_idx = ranked_indices[-top_n:]
+        long_raw = smoothed[long_idx]
+        long_sum = np.abs(long_raw).sum()
+        if long_sum > 1e-8:
+            final_signal[long_idx] = np.abs(long_raw) / long_sum
+        else:
+            final_signal[long_idx] = 1.0 / top_n
+
+        # Short(=비중 축소): 가장 낮은 top_n개 → 음수 가중치
+        short_idx = ranked_indices[:top_n]
+        short_raw = smoothed[short_idx]
+        short_sum = np.abs(short_raw).sum()
+        if short_sum > 1e-8:
+            final_signal[short_idx] = -np.abs(short_raw) / short_sum
+        else:
+            final_signal[short_idx] = -1.0 / top_n
+
+        # Long sum = 1.0, Short sum = -1.0 → dollar-neutral
+        # Apply threshold: 약한 신호 제거
         final_signal = np.where(
-            np.abs(smoothed) > self.signal_threshold,
-            smoothed,
+            np.abs(final_signal) > self.signal_threshold,
+            final_signal,
             0.0,
         )
-
-        # Normalize to sum to <= 1 (long) and >= -1 (short)
-        long_sum = final_signal[final_signal > 0].sum()
-        short_sum = abs(final_signal[final_signal < 0].sum())
-        if long_sum > 1.0:
-            final_signal[final_signal > 0] /= long_sum
-        if short_sum > 1.0:
-            final_signal[final_signal < 0] /= short_sum
 
         return {
             "signal": final_signal,

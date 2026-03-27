@@ -112,6 +112,10 @@ execution:
   # Phase D: 거래비용 임계값
   transaction_cost_rate: 0.006    # 왕복 0.6% (수수료 0.2%×2 + 슬리피지 0.1%×2)
   score_cost_threshold:  0.001    # 최소 양수 신호만 통과 (0 이하 차단)
+  # Phase D+: ICR (Information-to-Cost Ratio) — 비용의 N배 이상 알파만 거래
+  icr_min:               2.0     # ICR = |score| / 0.006 ≥ 2.0 → score ≥ 0.012
+  # Phase 21: 일일 턴오버 제한 (RenTech 원칙: 불필요 거래 억제)
+  max_daily_turnover:    0.15    # 포트폴리오 대비 15% (1.5천만원/1억)
 
 schedule:
   # ── 공통 ────────────────────────────────────────────────────────────

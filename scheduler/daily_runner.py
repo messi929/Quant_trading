@@ -57,7 +57,8 @@ class DailyRunner:
         set_seed(self.settings["training"]["seed"])
 
         self.execution_market = self.cfg["trading"]["execution_market"]
-        self.alpha_blend = 0.4  # 40% model + 60% equal-weight (최적 설정)
+        # Phase 21: EW blending 제거 → cross-sectional rank (dollar-neutral)
+        # 모델 신호를 직접 사용 (signal.py에서 rank normalize)
         self._kr_layer2_scales: dict = {}   # Layer 2 장중 신호 (KR)
         self._us_layer2_scales: dict = {}   # Layer 2 장중 신호 (US)
 
@@ -116,11 +117,36 @@ class DailyRunner:
                 processor = DataProcessor(min_history_days=1)
                 new_df = processor.process(raw_df)
 
+                # 새 데이터에 sector 할당 (kr_sector_map.yaml primary)
+                from data.sector_classifier import load_kr_sector_map
+                static_map = load_kr_sector_map()
+
                 if processed_path.exists():
                     old_df = pd.read_parquet(processed_path)
-                    # 중복 제거 후 합치기
+
+                    # 기존 데이터에서 ticker→sector 매핑 보존
+                    if "sector" in old_df.columns:
+                        existing_sectors = (
+                            old_df[["ticker", "sector"]]
+                            .drop_duplicates("ticker")
+                            .set_index("ticker")["sector"]
+                            .to_dict()
+                        )
+                    else:
+                        existing_sectors = {}
+
+                    # 새 데이터에 sector 할당: static_map → 기존 parquet → unknown
+                    if "sector" not in new_df.columns:
+                        new_df["sector"] = "unknown"
+                    for ticker in new_df["ticker"].unique():
+                        if ticker in static_map:
+                            new_df.loc[new_df["ticker"] == ticker, "sector"] = static_map[ticker]
+                        elif ticker in existing_sectors:
+                            new_df.loc[new_df["ticker"] == ticker, "sector"] = existing_sectors[ticker]
+
+                    # 중복 제거 후 합치기 (새 데이터 우선)
                     combined = pd.concat([old_df, new_df]).drop_duplicates(
-                        subset=["date", "ticker"]
+                        subset=["date", "ticker"], keep="last"
                     ).sort_values(["date", "ticker"])
                     combined.to_parquet(processed_path, index=False)
                     logger.info(
@@ -128,6 +154,12 @@ class DailyRunner:
                         f"(+{len(combined)-len(old_df):,}행)"
                     )
                 else:
+                    # 새 파일: static_map에서 sector 할당
+                    if "sector" not in new_df.columns:
+                        new_df["sector"] = "unknown"
+                    for ticker in new_df["ticker"].unique():
+                        if ticker in static_map:
+                            new_df.loc[new_df["ticker"] == ticker, "sector"] = static_map[ticker]
                     new_df.to_parquet(processed_path, index=False)
                     logger.info(f"데이터 새로 저장: {len(new_df):,}행")
 
@@ -198,21 +230,20 @@ class DailyRunner:
         for i, sector in enumerate(sector_order):
             raw_weights[i] = sector_alloc.get(sector, 0.0)
 
-        # top-K 정규화 (상위 5개 섹터, 양수만)
-        top_k = 5
-        top_indices = np.argsort(raw_weights)[-top_k:]
-        model_weights = np.zeros(n_sectors)
-        for idx in top_indices:
-            if raw_weights[idx] > 0:
-                model_weights[idx] = raw_weights[idx]
-        if model_weights.sum() > 1e-8:
-            model_weights /= model_weights.sum()
+        # Phase 21: Cross-sectional rank (dollar-neutral)
+        # signal.py가 이미 rank normalize된 신호 반환 (long +, short -)
+        # 여기서는 long 부분만 추출하여 비중 배분 (short = 포지션 축소/매도)
+        # Long weight → 포트폴리오 투자 비중, Short → 0% (매도 대상)
+        final_weights = np.zeros(n_sectors)
+        long_mask = raw_weights > 0
+        if long_mask.any():
+            final_weights[long_mask] = raw_weights[long_mask]
+            final_weights /= final_weights.sum() + 1e-8
         else:
-            model_weights = np.ones(n_sectors) / n_sectors
-
-        # Alpha 블렌딩 (40% model + 60% equal-weight)
-        ew = np.ones(n_sectors) / n_sectors
-        final_weights = self.alpha_blend * model_weights + (1 - self.alpha_blend) * ew
+            # 모든 섹터가 음수(극단적 방어) → 최소 균등 배분
+            final_weights = np.ones(n_sectors) / n_sectors
+        # cash_buffer 반영 (5%)
+        final_weights *= (1 - 0.05)
 
         # 섹터별 top 종목 추출
         sector_top_tickers = signals.get("sector_top_tickers", {})
@@ -375,7 +406,21 @@ class DailyRunner:
                 return []
             logger.warning(f"오늘은 {today.strftime('%A')} → --force 플래그로 강제 실행")
 
-        from live.signal_to_order import OrderGenerator
+        from live.signal_to_order import OrderGenerator, alpha_decay_scale
+
+        # Phase 21: Signal Decay — Wave별 신호 감쇠
+        # 신호 생성 시각(06:10/06:30) 대비 경과 시간에 따라 weight 축소
+        wave_signal_age = {1: 3.0, 2: 5.0, 3: 7.5}  # KR 09:10/11:00/13:30 기준 (hours from 06:10)
+        age_hours = wave_signal_age.get(twap_wave, 0.0)
+        if age_hours > 0:
+            decay = alpha_decay_scale(age_hours, signal_type="daily")
+            sector_weights = sector_weights * decay
+            # Re-normalize (long 비중 합 유지)
+            wsum = sector_weights[sector_weights > 0].sum()
+            if wsum > 1e-8:
+                sector_weights[sector_weights > 0] *= (0.95 / wsum)
+            logger.debug(f"Signal decay: age={age_hours:.1f}h → scale={decay:.3f}")
+
         generator = OrderGenerator(
             config_path="config/live_config.yaml",
             twap_wave=twap_wave,
@@ -437,15 +482,21 @@ class DailyRunner:
             if math.isnan(daily_return) or math.isinf(daily_return):
                 daily_return = 0.0
 
+            # Phase 21: 정확한 턴오버 계산 (매수+매도 양방향)
+            n_trades = len(trade_logger.get_trades_df(days=1))
+            daily_turnover = trade_logger.compute_turnover()
+
             trade_logger.log_daily_performance(
                 portfolio_value=portfolio_value,
                 daily_return=daily_return,
-                n_trades=len(trade_logger.get_trades_df(days=1)),
+                n_trades=n_trades,
+                turnover=daily_turnover,
             )
 
             logger.info(
                 f"포트폴리오: {portfolio_value:,.0f}원, "
-                f"일수익률: {daily_return:.2%}"
+                f"일수익률: {daily_return:.2%}, "
+                f"턴오버: {daily_turnover:.2%}, 거래: {n_trades}건"
             )
 
         except Exception as e:

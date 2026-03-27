@@ -108,19 +108,28 @@ class BacktestEngine:
                 else:
                     continue
 
-                # Portfolio optimization
-                # Use risk_parity when sufficient history, signal_weighted otherwise
+                # Phase 21: signal.py가 이미 cross-sectional rank를 반환
+                # Long(양수) 섹터만 투자, Short(음수) 섹터는 0% (매도 대상)
                 lookback = sector_returns.iloc[max(0, day - 60) : day]
-                if len(lookback) >= 20 and lookback.std().mean() > 1e-8:
-                    target_weights = self.portfolio_opt.optimize(
+
+                # Long weights 추출 + risk-parity 블렌딩
+                long_mask = target_signal > 0
+                if long_mask.any() and len(lookback) >= 20 and lookback.std().mean() > 1e-8:
+                    # Risk-parity base (long 섹터만)
+                    rp_weights = self.portfolio_opt.optimize(
                         target_signal, lookback, method="risk_parity"
                     )
-                    # Tilt risk-parity base toward model signal
-                    signal_tilt = self.portfolio_opt.optimize(
+                    # Signal-weighted tilt
+                    sw_weights = self.portfolio_opt.optimize(
                         target_signal, lookback, method="signal_weighted"
                     )
-                    # Blend: 60% risk-parity base + 40% signal tilt
-                    target_weights = 0.6 * target_weights + 0.4 * signal_tilt
+                    # Blend: 60% risk-parity + 40% signal tilt
+                    target_weights = 0.6 * rp_weights + 0.4 * sw_weights
+                    # Short 섹터 강제 0% (포지션 청산)
+                    target_weights[~long_mask] = 0.0
+                    # Normalize long weights + 5% cash buffer
+                    if target_weights.sum() > 1e-8:
+                        target_weights = target_weights / target_weights.sum() * 0.95
                 else:
                     target_weights = self.portfolio_opt.optimize(
                         target_signal, lookback, method="signal_weighted"
@@ -131,10 +140,16 @@ class BacktestEngine:
                     target_weights, portfolio_value, lookback
                 )
 
-                # Drift-based rebalancing: only trade if drift exceeds threshold
-                # This reduces unnecessary turnover and trading costs
-                drift = np.abs(target_weights - positions).max()
-                if drift < self.rebalance_threshold:
+                # Drift-based rebalancing
+                # 매도 방향 drift는 낮은 threshold (2%), 매수는 기본 threshold
+                sell_drift = np.max(np.where(
+                    target_weights < positions, positions - target_weights, 0
+                ))
+                buy_drift = np.max(np.where(
+                    target_weights > positions, target_weights - positions, 0
+                ))
+                sell_threshold = min(self.rebalance_threshold, 0.02)
+                if sell_drift < sell_threshold and buy_drift < self.rebalance_threshold:
                     continue  # Skip rebalance — positions close enough
 
                 # Trading costs
