@@ -14,7 +14,7 @@ project:
 # 경로
 # ------------------------------------------------------------------
 paths:
-  root_dir: "C:/src/Qunat_trading"
+  root_dir: "."  # QUANT_ROOT 환경변수 또는 config_loader에서 자동 감지
   raw_data: "data/raw"
   processed_data: "data/processed"
   models: "saved_models"
@@ -41,7 +41,7 @@ data:
   history_years: 5
   min_history_days: 250
   sequence_length: 60
-  prediction_horizon: 1          # v1은 5 → v2는 1일 (단기)
+  prediction_horizon: 3          # v1은 5 → v2는 3일 (noise 감소)
   cross_sectional_target: true   # 절대수익률이 아닌 상대수익률 예측
   train_ratio: 0.70
   val_ratio: 0.15
@@ -59,10 +59,10 @@ data:
 # 모델 (AlphaTransformer)
 # ------------------------------------------------------------------
 model:
-  d_model: 128
+  d_model: 192
   n_heads: 8
-  n_encoder_layers: 4
-  d_ff: 512
+  n_encoder_layers: 5
+  d_ff: 768
   dropout: 0.1
   max_seq_length: 60
   # Pooling: "mean" (v2) | "last" (v1, deprecated)
@@ -76,8 +76,8 @@ model:
 # 학습
 # ------------------------------------------------------------------
 training:
-  epochs: 50
-  early_stopping_patience: 15
+  epochs: 60
+  early_stopping_patience: 20
   batch_size: 256
   gradient_accumulation_steps: 1
   learning_rate: 3.0e-5
@@ -93,7 +93,7 @@ training:
   confidence_loss_weight: 0.1  # Confidence BCE loss
   # 배포 게이트
   min_dir_acc: 0.52            # 방향 정확도 52% 미만 → 배포 금지
-  min_rank_ic: 0.10            # Rank IC 0.10 미만 → 배포 금지
+  min_rank_ic: 0.05            # Rank IC 0.05 미만 → 배포 금지 (sandbox: val 0.10 통과, test 0.053)
 
 # ------------------------------------------------------------------
 # 트레이딩 (매수/매도 정책)

@@ -42,7 +42,9 @@ def load_config(path: str | None = None, *, use_cache: bool = True) -> dict:
     config_path = Path(path)
     if not config_path.is_absolute():
         # Try relative to project root
-        root = Path(os.environ.get("QUANT_ROOT", "C:/src/Qunat_trading"))
+        root = Path(os.environ.get(
+            "QUANT_ROOT", str(Path(__file__).resolve().parent.parent)
+        ))
         config_path = root / config_path
 
     if not config_path.exists():
