@@ -1,0 +1,227 @@
+# ============================================================
+# Quant Trading System v2 — Unified Configuration
+# "확신 있을 때만, 크게, 빠르게"
+# ============================================================
+# 이 파일이 유일한 설정 파일입니다.
+# 코드에 하드코딩된 상수는 없습니다.
+# ============================================================
+
+project:
+  name: "Conviction Alpha Trader"
+  version: "2.0.0"
+
+# ------------------------------------------------------------------
+# 경로
+# ------------------------------------------------------------------
+paths:
+  root_dir: "C:/src/Qunat_trading"
+  raw_data: "data/raw"
+  processed_data: "data/processed"
+  models: "saved_models"
+  logs: "logs"
+  results: "results"
+  trade_log_db: "tracking/trades.db"
+  normalizer_stats: "saved_models/normalizer_stats.json"
+
+# ------------------------------------------------------------------
+# GPU / 하드웨어
+# ------------------------------------------------------------------
+gpu:
+  device: "cuda"
+  mixed_precision: true
+  gradient_checkpointing: true
+  memory_fraction: 0.85
+  compile_model: false
+
+# ------------------------------------------------------------------
+# 데이터
+# ------------------------------------------------------------------
+data:
+  markets: ["KOSPI", "KOSDAQ", "NASDAQ"]
+  history_years: 5
+  min_history_days: 250
+  sequence_length: 60
+  prediction_horizon: 1          # v1은 5 → v2는 1일 (단기)
+  cross_sectional_target: true   # 절대수익률이 아닌 상대수익률 예측
+  train_ratio: 0.70
+  val_ratio: 0.15
+  test_ratio: 0.15
+  filter_unknown_sectors: true
+  kospi200_only: true
+  include_kosdaq: true
+  kosdaq150_only: true
+  max_tickers: 350
+  # 피처 정규화
+  normalize_features: true       # z-score per column (학습셋 기준)
+  normalize_clip: 5.0            # 정규화 후 클리핑 범위 [-5, 5]
+
+# ------------------------------------------------------------------
+# 모델 (AlphaTransformer)
+# ------------------------------------------------------------------
+model:
+  d_model: 128
+  n_heads: 8
+  n_encoder_layers: 4
+  d_ff: 512
+  dropout: 0.1
+  max_seq_length: 60
+  # Pooling: "mean" (v2) | "last" (v1, deprecated)
+  pooling: "mean"
+  # Confidence head: 예측 정확도 확률 출력
+  use_confidence_head: true
+  # Sector attention 제거 (전 종목 대상 예측)
+  use_sector_attention: false
+
+# ------------------------------------------------------------------
+# 학습
+# ------------------------------------------------------------------
+training:
+  epochs: 50
+  early_stopping_patience: 15
+  batch_size: 256
+  gradient_accumulation_steps: 1
+  learning_rate: 3.0e-5
+  weight_decay: 1.0e-5
+  scheduler: "cosine_warmup"
+  warmup_steps: 1000
+  max_grad_norm: 1.0
+  seed: 42
+  num_workers: 0               # Windows 호환
+  pin_memory: true
+  # Pairwise ranking loss 비중
+  ranking_loss_weight: 0.5     # Huber 0.5 + Ranking 0.5
+  confidence_loss_weight: 0.1  # Confidence BCE loss
+  # 배포 게이트
+  min_dir_acc: 0.52            # 방향 정확도 52% 미만 → 배포 금지
+  min_rank_ic: 0.10            # Rank IC 0.10 미만 → 배포 금지
+
+# ------------------------------------------------------------------
+# 트레이딩 (매수/매도 정책)
+# ------------------------------------------------------------------
+trading:
+  # 매수 조건
+  conviction_threshold: 0.90    # score가 상위 10% (90th pctl) 이상만 매수
+  max_positions: 3              # 최대 동시 포지션 수
+  max_single_weight: 0.40       # 단일 종목 최대 비중 40%
+  min_order_amount: 5_000_000   # 최소 주문금액 500만원 (v1은 10만원)
+  icr_min: 3.0                  # ICR ≥ 3.0 (신호 > 3× 거래비용)
+
+  # 매도 조건
+  profit_take_pct: 0.025        # +2.5% 도달 시 50% 이익 실현
+  profit_take_full_pct: 0.05    # +5% 도달 시 전량 청산
+  stop_loss_pct: 0.02           # -2% 도달 시 전량 손절
+  time_exit_hours: 2            # 2시간 내 +1% 미달 시 청산
+  time_exit_min_profit: 0.01    # 시간 청산 면제 기준 (+1%)
+  max_hold_days: 3              # 최대 보유 기간 3일
+  day_trade_default: true       # 기본 당일 청산
+
+  # 비용
+  transaction_cost_rate: 0.006  # 왕복 0.6%
+  commission_rate: 0.0002       # 편도 0.02%
+  slippage_by_market:
+    KOSPI: 0.003
+    KOSDAQ: 0.005
+    NASDAQ: 0.001
+
+  # 턴오버
+  max_daily_turnover: 0.15      # 일일 최대 15%
+  volume_participation_max: 0.05  # 거래량 5% 이내
+
+  # 주문 실행
+  retry_wait_secs: 300           # 5분 후 미체결 확인
+  urgency_thresholds:
+    aggressive: 0.008
+    normal: 0.004
+
+# ------------------------------------------------------------------
+# 리스크 관리
+# ------------------------------------------------------------------
+risk:
+  daily_loss_limit: 0.015       # 일간 -1.5% 시 거래 중단 (v1은 -3%)
+  total_loss_limit: 0.15        # 누적 -15% 시 거래 중단
+  # 서킷 브레이커 (MDD 기반)
+  circuit_breaker:
+    caution: 0.05               # MDD > 5% → 사이즈 75%
+    warning: 0.10               # MDD > 10% → 사이즈 50%
+    high: 0.20                  # MDD > 20% → 사이즈 25%
+    crisis: 0.30                # MDD > 30% → 전량 청산
+  # Kelly sizing
+  use_kelly_sizing: true
+  kelly_fraction: 0.5           # Half-Kelly
+  kelly_lookback_days: 20
+  target_annual_vol: 0.15       # 연 15% 목표 변동성
+
+# ------------------------------------------------------------------
+# 시장 레짐
+# ------------------------------------------------------------------
+regime:
+  momentum_window: 20           # 20일 수익률
+  vol_lookback: 60              # 60일 변동성
+  vol_percentile_threshold: 0.80
+  bull_threshold: 0.03          # +3% → bull
+  bear_threshold: -0.03         # -3% → bear
+  # bear 레짐 행동: CASH (v1은 0.6x 축소)
+  bear_action: "cash"           # "cash" | "reduce"
+  bear_reduce_scale: 0.6        # reduce 시 스케일
+
+# ------------------------------------------------------------------
+# 백테스트
+# ------------------------------------------------------------------
+backtest:
+  initial_capital: 100_000_000
+  # 비용은 trading 섹션과 동일 (자동 참조)
+  walk_forward:
+    train_days: 252             # 학습 기간 1년
+    test_days: 63               # 테스트 기간 3개월
+    step_days: 63               # 롤링 스텝
+  min_sharpe: 1.0               # Sharpe < 1.0 → 배포 금지
+  # 장중 시뮬레이션: stop loss를 profit taking보다 먼저 체크 (보수적)
+  intraday_stop_first: true
+
+# ------------------------------------------------------------------
+# 스케줄 (KST)
+# ------------------------------------------------------------------
+schedule:
+  kr:
+    data_collect: "06:00"
+    signal_generate: "06:10"
+    execute_entry: "09:10"
+    # 모니터: 09:40, 10:10, ..., 14:50 (30분 간격, 코드에서 생성)
+    monitor_interval_min: 30
+    execute_exit: "15:20"       # 장 마감 10분 전 전량 청산
+    eod_record: "16:00"
+  us:
+    signal_generate: "22:00"    # US 신호 재생성 (06:10 재사용 금지!)
+    execute_entry: "23:40"
+    monitor_interval_min: 30
+    execute_exit: "04:30"
+  # 폐지된 세션 (v1에서 사용, v2에서 제거)
+  # kr_premarket (07:30), kr_afterclose (15:35), kr_aftersingle (16:30)
+  # us_premarket (18:30), us_afterhours (05:10)
+
+# ------------------------------------------------------------------
+# 브로커 (KIS API)
+# ------------------------------------------------------------------
+broker:
+  name: "한국투자증권"
+  mode: "sandbox"
+  paper_trading: true
+  token_expire_hours: 24
+
+# ------------------------------------------------------------------
+# 재학습
+# ------------------------------------------------------------------
+retrain:
+  weekly: true
+  weekly_day: "saturday"
+  monthly_full: true
+  monthly_day: 1
+  model_backup_count: 5
+
+# ------------------------------------------------------------------
+# 로깅
+# ------------------------------------------------------------------
+logging:
+  level: "INFO"
+  console: true
+  file: true

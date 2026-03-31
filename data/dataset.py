@@ -1,4 +1,10 @@
-"""PyTorch Dataset and DataLoader for sector-based time series."""
+"""PyTorch Dataset and DataLoader for sector-based time series.
+
+v2: Added FeatureNormalizer integration in create_dataloaders().
+    Training-set statistics are used for all splits (no look-ahead).
+"""
+
+from __future__ import annotations
 
 from typing import Optional
 
@@ -7,6 +13,8 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
 from loguru import logger
+
+from data.normalizer import FeatureNormalizer
 
 
 class MarketSequenceDataset(Dataset):
@@ -168,18 +176,30 @@ def create_dataloaders(
     feature_cols: list[str],
     sector_map: dict[str, int],
     seq_length: int = 60,
-    prediction_horizon: int = 5,
+    prediction_horizon: int = 1,
     batch_size: int = 32,
     train_ratio: float = 0.7,
     val_ratio: float = 0.15,
     num_workers: int = 4,
     pin_memory: bool = True,
     cross_sectional_target: bool = True,
-) -> tuple[DataLoader, DataLoader, DataLoader]:
+    normalize: bool = True,
+    normalizer_save_path: str | None = None,
+) -> tuple[DataLoader, DataLoader, DataLoader, FeatureNormalizer | None]:
     """Create train/val/test DataLoaders with time-based splitting.
 
     Split is done temporally: oldest data for train, middle for val,
     newest for test to prevent look-ahead bias.
+
+    v2: Feature normalization using training-set statistics.
+
+    Args:
+        normalize: If True, z-score normalize features using train stats.
+        normalizer_save_path: If set, save normalizer stats to this path.
+
+    Returns:
+        (train_loader, val_loader, test_loader, normalizer)
+        normalizer is None if normalize=False.
     """
     df = df.sort_values("date")
     dates = df["date"].unique()
@@ -188,13 +208,25 @@ def create_dataloaders(
     train_end = dates[int(n_dates * train_ratio)]
     val_end = dates[int(n_dates * (train_ratio + val_ratio))]
 
-    train_df = df[df["date"] < train_end]
-    val_df = df[(df["date"] >= train_end) & (df["date"] < val_end)]
-    test_df = df[df["date"] >= val_end]
+    train_df = df[df["date"] < train_end].copy()
+    val_df = df[(df["date"] >= train_end) & (df["date"] < val_end)].copy()
+    test_df = df[df["date"] >= val_end].copy()
 
     logger.info(
         f"Split: train={len(train_df)}, val={len(val_df)}, test={len(test_df)}"
     )
+
+    # v2: Feature normalization (train stats only)
+    normalizer = None
+    if normalize:
+        normalizer = FeatureNormalizer()
+        normalizer.fit(train_df, feature_cols)
+        train_df = normalizer.transform(train_df, feature_cols)
+        val_df = normalizer.transform(val_df, feature_cols)
+        test_df = normalizer.transform(test_df, feature_cols)
+        if normalizer_save_path:
+            normalizer.save(normalizer_save_path)
+        logger.info("Feature normalization applied (train-set statistics)")
 
     train_ds = MarketSequenceDataset(
         train_df, feature_cols, seq_length, prediction_horizon, sector_map,
@@ -232,4 +264,4 @@ def create_dataloaders(
         pin_memory=pin_memory,
     )
 
-    return train_loader, val_loader, test_loader
+    return train_loader, val_loader, test_loader, normalizer

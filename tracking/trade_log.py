@@ -268,13 +268,16 @@ class TradeLogger:
             "수익일비율":    f"{(perf_df['daily_return'] > 0).mean():.1%}",
         }
 
-    def compute_turnover(self, date_str: str = None) -> float:
+    def compute_turnover(
+        self, date_str: str = None, portfolio_value: float = None,
+    ) -> float:
         """일별 턴오버 계산: sum(매수+매도 금액) / 포트폴리오 가치.
 
         Phase 21: 매도 포함한 양방향 턴오버 (기존: 매수만)
 
         Args:
             date_str: 계산할 날짜 (ISO 형식, None이면 오늘).
+            portfolio_value: 직접 전달 시 DB 조회 생략 (step_eod 호출 시).
 
         Returns:
             Turnover ratio (0.0 if data is unavailable).
@@ -292,12 +295,13 @@ class TradeLogger:
             ).fetchone()
             trade_total = row[0] if row else 0.0
 
-            # 해당 날짜 포트폴리오 가치
-            pv_row = conn.execute(
-                "SELECT portfolio_value FROM daily_performance WHERE date = ?",
-                (date_str,),
-            ).fetchone()
-            portfolio_value = pv_row[0] if pv_row else 0.0
+            # portfolio_value가 직접 전달되지 않은 경우 DB 조회
+            if portfolio_value is None:
+                pv_row = conn.execute(
+                    "SELECT portfolio_value FROM daily_performance WHERE date = ?",
+                    (date_str,),
+                ).fetchone()
+                portfolio_value = pv_row[0] if pv_row else 0.0
 
         if portfolio_value <= 0:
             return 0.0

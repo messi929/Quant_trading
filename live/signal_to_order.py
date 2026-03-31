@@ -143,6 +143,9 @@ class OrderGenerator:
         # 세션 내 동적 블랙리스트 (반복 실패 종목 자동 스킵)
         self._session_blocklist: set[str] = set()
 
+        # 스탑로스 당일 재매수 방지 (whipsaw 방지)
+        self._stoploss_cooldown: set[str] = set()  # 당일 스탑로스 발동 종목
+
         # Phase 21: 일일 턴오버 제한
         self.max_daily_turnover = exec_cfg.get("max_daily_turnover", 0.15)  # 15%
         self._daily_traded_amount: float = 0.0  # 당일 누적 거래 금액
@@ -150,6 +153,13 @@ class OrderGenerator:
 
         self.logger  = TradeLogger(self.cfg["logging"]["trade_log_db"])
         self.sectors = get_sector_order()
+
+    def add_stoploss_cooldown(self, ticker: str):
+        """스탑로스 발동 종목을 당일 재매수 차단 목록에 추가."""
+        from utils.ticker_utils import kis_code
+        code = kis_code(ticker)
+        self._stoploss_cooldown.add(code)
+        logger.info(f"[쿨다운 등록] {ticker} ({code}): 당일 재매수 차단")
 
     def _get_api(self, market: str) -> KISApi:
         """market 문자열에 따라 적합한 API 인스턴스 반환."""
@@ -809,6 +819,11 @@ class OrderGenerator:
                 _norm_code = kis_code(ticker)
                 if self.is_sandbox and _norm_code in (SANDBOX_BLOCKLIST | self._session_blocklist):
                     logger.debug(f"스킵 [{ticker}]: 블랙리스트 (매매불가)")
+                    continue
+
+                # 스탑로스 당일 재매수 방지 (whipsaw 방지)
+                if _norm_code in self._stoploss_cooldown:
+                    logger.info(f"스킵 [{ticker}]: 스탑로스 쿨다운 (당일 재매수 차단)")
                     continue
 
                 # Phase D: split 모드에서만 score 임계값 필터 적용 (ETF는 항상 거래)

@@ -297,8 +297,7 @@ class DailyRunner:
         market_label = f"[{market_filter}] " if market_filter else ""
         logger.info(f"=== Step 2-B: {market_label}하락 신호 매도 체크 ===")
 
-        from live.signal_to_order import OrderGenerator
-        generator = OrderGenerator(config_path="config/live_config.yaml")
+        generator = self._make_generator()
 
         try:
             executed = generator.execute_sell_check(sector_top_tickers, market_filter=market_filter)
@@ -373,6 +372,14 @@ class DailyRunner:
         top_tickers  = self._filter_by_market(top_tickers, market_key)
         return weights, top_tickers
 
+    def _make_generator(self, **kwargs):
+        """OrderGenerator 생성 + 스탑로스 쿨다운 전파."""
+        from live.signal_to_order import OrderGenerator
+        gen = OrderGenerator(config_path="config/live_config.yaml", **kwargs)
+        for tkr in getattr(self, "_stoploss_cooldown_tickers", set()):
+            gen.add_stoploss_cooldown(tkr)
+        return gen
+
     # ------------------------------------------------------------------
     # Step 3: 리밸런싱 주문
     # ------------------------------------------------------------------
@@ -421,10 +428,7 @@ class DailyRunner:
                 sector_weights[sector_weights > 0] *= (0.95 / wsum)
             logger.debug(f"Signal decay: age={age_hours:.1f}h → scale={decay:.3f}")
 
-        generator = OrderGenerator(
-            config_path="config/live_config.yaml",
-            twap_wave=twap_wave,
-        )
+        generator = self._make_generator(twap_wave=twap_wave)
 
         try:
             executed = generator.execute_rebalance(
@@ -483,8 +487,11 @@ class DailyRunner:
                 daily_return = 0.0
 
             # Phase 21: 정확한 턴오버 계산 (매수+매도 양방향)
+            # portfolio_value 직접 전달: DB 삽입 전이라 조회 시 0 반환 방지
             n_trades = len(trade_logger.get_trades_df(days=1))
-            daily_turnover = trade_logger.compute_turnover()
+            daily_turnover = trade_logger.compute_turnover(
+                portfolio_value=portfolio_value,
+            )
 
             trade_logger.log_daily_performance(
                 portfolio_value=portfolio_value,
@@ -958,8 +965,17 @@ class DailyRunner:
                 result = gen._execute_with_retry(order, "aggressive")
                 gen.logger.log_trade(result, note="stoploss")
                 executed.append(result)
+                # 당일 재매수 차단 (whipsaw 방지)
+                gen.add_stoploss_cooldown(order["ticker"])
             except Exception as e:
                 logger.error(f"스탑로스 실패 [{order['ticker']}]: {e}")
+
+        # 이후 Wave에서 사용할 OrderGenerator에도 쿨다운 전파
+        self._stoploss_cooldown_tickers = getattr(
+            self, "_stoploss_cooldown_tickers", set()
+        )
+        for result in executed:
+            self._stoploss_cooldown_tickers.add(result.get("ticker", ""))
 
         return executed
 
@@ -974,8 +990,7 @@ class DailyRunner:
         if not top_tickers:
             logger.info("[KR] 장전: 신호 없음 → 스킵")
             return
-        from live.signal_to_order import OrderGenerator
-        generator   = OrderGenerator(config_path="config/live_config.yaml")
+        generator   = self._make_generator()
         signal_age  = self._get_signal_age_hours("06:10")
         try:
             executed = generator.execute_extended_hours(
@@ -995,8 +1010,7 @@ class DailyRunner:
         weights, top_tickers = self._load_market_cache("kr")
         if not top_tickers:
             return
-        from live.signal_to_order import OrderGenerator
-        generator  = OrderGenerator(config_path="config/live_config.yaml")
+        generator  = self._make_generator()
         signal_age = self._get_signal_age_hours("06:10")
         layer2     = self._kr_layer2_scales
         try:
@@ -1018,8 +1032,7 @@ class DailyRunner:
         weights, top_tickers = self._load_market_cache("kr")
         if not top_tickers:
             return
-        from live.signal_to_order import OrderGenerator
-        generator  = OrderGenerator(config_path="config/live_config.yaml")
+        generator  = self._make_generator()
         signal_age = self._get_signal_age_hours("06:10")
         layer2     = self._kr_layer2_scales
         try:
@@ -1045,8 +1058,7 @@ class DailyRunner:
         weights, top_tickers = self._load_market_cache("us")
         if not top_tickers:
             return
-        from live.signal_to_order import OrderGenerator
-        generator  = OrderGenerator(config_path="config/live_config.yaml")
+        generator  = self._make_generator()
         signal_age = self._get_signal_age_hours("06:10")
         try:
             executed = generator.execute_extended_hours(
@@ -1066,8 +1078,7 @@ class DailyRunner:
         weights, top_tickers = self._load_market_cache("us")
         if not top_tickers:
             return
-        from live.signal_to_order import OrderGenerator
-        generator  = OrderGenerator(config_path="config/live_config.yaml")
+        generator  = self._make_generator()
         # After-hours는 전날 06:10 신호 기준 → 약 23시간 경과
         signal_age = self._get_signal_age_hours("06:10")
         layer2     = self._us_layer2_scales
