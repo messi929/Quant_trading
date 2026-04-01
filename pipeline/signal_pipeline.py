@@ -86,10 +86,19 @@ class SignalPipeline:
             logger.warning("No market data available")
             return {"action": "CASH", "positions": [], "regime": {}, "cash_weight": 1.0, "reason": "No data"}
 
-        # Step 2: Feature engineering
-        market_data = self.feature_eng.compute_all(market_data)
+        # Step 2: Feature engineering (skip if features already exist in data)
+        has_features = all(c in market_data.columns for c in self.feature_cols[:5])
+        if has_features:
+            logger.debug("Features already present in data — skipping feature engineering")
+        else:
+            market_data = self.feature_eng.compute_all(market_data)
 
-        # Step 3: Normalize
+        # Step 3: Normalize (using saved training-set statistics)
+        missing_cols = [c for c in self.feature_cols if c not in market_data.columns]
+        if missing_cols:
+            logger.warning(f"Missing {len(missing_cols)} feature cols, filling with 0")
+            for c in missing_cols:
+                market_data[c] = 0.0
         market_data = self.normalizer.transform(market_data, self.feature_cols)
 
         # Step 4: Per-ticker inference
@@ -160,10 +169,11 @@ class SignalPipeline:
     def _get_market_returns(self, df: pd.DataFrame) -> pd.Series:
         """Compute equal-weight market daily returns."""
         try:
-            daily_returns = df.groupby("date")["close"].apply(
-                lambda x: x.pct_change().mean()
-            )
-            # Flatten and clean
+            # Use pre-computed market_return if available
+            if "market_return" in df.columns:
+                market_ret = df.groupby("date")["market_return"].first()
+                return market_ret.dropna()
+
             market_ret = df.groupby("date").apply(
                 lambda g: g["close"].pct_change().dropna().mean()
             )

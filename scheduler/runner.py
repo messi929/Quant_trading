@@ -8,9 +8,11 @@ Replaces v1 DailyRunner (15+ daemon methods, 7 sessions).
 
 from __future__ import annotations
 
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
+from pathlib import Path
 from typing import Optional
 
+import pandas as pd
 import schedule
 import time as _time
 
@@ -40,6 +42,76 @@ class TradingRunner:
         # Schedule config
         self._kr = self.cfg["schedule"]["kr"]
         self._us = self.cfg["schedule"]["us"]
+
+    # ── Data Collection ────────────────────────────────────────
+
+    def collect_data(self):
+        """06:00 — Collect latest market data and update parquet."""
+        logger.info("=" * 50)
+        logger.info("[DATA] Collecting latest market data")
+        try:
+            from data.collector import DataCollector
+            from data.processor import DataProcessor
+            from data.sector_classifier import load_kr_sector_map
+
+            collector = DataCollector(self.cfg)
+            end_date = date.today()
+            start_date = end_date - timedelta(days=10)
+
+            raw_df = collector.collect_all(
+                start_date=start_date.strftime("%Y-%m-%d"),
+                end_date=end_date.strftime("%Y-%m-%d"),
+            )
+
+            if raw_df is None or len(raw_df) == 0:
+                logger.warning("[DATA] No new data collected — using existing parquet")
+                return
+
+            processor = DataProcessor(min_history_days=1)
+            new_df = processor.process(raw_df)
+
+            # Sector assignment
+            static_map = load_kr_sector_map()
+            if "sector" not in new_df.columns:
+                new_df["sector"] = "unknown"
+            for ticker in new_df["ticker"].unique():
+                if ticker in static_map:
+                    new_df.loc[new_df["ticker"] == ticker, "sector"] = static_map[ticker]
+
+            # Merge with existing parquet
+            processed_path = (
+                Path(self.cfg["paths"]["processed_data"]) / "processed_data.parquet"
+            )
+            if processed_path.exists():
+                old_df = pd.read_parquet(processed_path)
+                # Preserve sector from existing data for tickers not in static_map
+                if "sector" in old_df.columns:
+                    existing_sectors = (
+                        old_df[["ticker", "sector"]]
+                        .drop_duplicates("ticker")
+                        .set_index("ticker")["sector"]
+                        .to_dict()
+                    )
+                    for ticker in new_df["ticker"].unique():
+                        if ticker not in static_map and ticker in existing_sectors:
+                            new_df.loc[new_df["ticker"] == ticker, "sector"] = existing_sectors[ticker]
+
+                combined = pd.concat([old_df, new_df]).drop_duplicates(
+                    subset=["date", "ticker"], keep="last"
+                ).sort_values(["date", "ticker"])
+                combined.to_parquet(processed_path, index=False)
+                logger.info(
+                    f"[DATA] Updated: {len(old_df):,} → {len(combined):,} rows "
+                    f"(+{len(combined) - len(old_df):,})"
+                )
+            else:
+                processed_path.parent.mkdir(parents=True, exist_ok=True)
+                new_df.to_parquet(processed_path, index=False)
+                logger.info(f"[DATA] Created: {len(new_df):,} rows")
+
+        except Exception as e:
+            logger.error(f"[DATA] Collection failed: {e}")
+            logger.info("[DATA] Will use existing parquet for signal generation")
 
     # ── KR Session ─────────────────────────────────────────────
 
@@ -169,6 +241,9 @@ class TradingRunner:
         """Configure the schedule based on config."""
         kr = self._kr
         us = self._us
+
+        # Data collection (before signal generation)
+        schedule.every().day.at(kr.get("data_collect", "06:00")).do(self.collect_data)
 
         # KR session
         schedule.every().day.at(kr["signal_generate"]).do(self.kr_generate_signal)
