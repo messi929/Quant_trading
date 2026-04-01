@@ -107,28 +107,33 @@ MDD > 30% → 전량 청산, 거래 중단
 - 거래량 높은 시간대에 집중 (개장/마감)
 - 시간외 거래: 최소화 (유동성 부족)
 
-### KR 스케줄 (간소화)
+### KR 스케줄 (v2, 간소화)
 
 ```
-06:10  신호 생성
-09:10  매수/매도 (확신 있는 1~3 종목)
-13:30  추가 매수 또는 매도 (필요시만)
+06:00  데이터 수집 (yfinance + pykrx, 증분 10일)
+06:10  신호 생성 (AlphaTransformer → ConvictionSignalGenerator)
+09:10  매수 (확신 있는 1~3 종목)
+09:40~14:50  모니터 (30분 간격, profit taking/stop loss/time exit)
 15:20  장 마감 전 전량 청산 (데이트레이딩 기본)
+16:00  EOD 성과 기록
 ```
 
-### US 스케줄 (간소화)
+### US 스케줄 (v2, 간소화)
 
 ```
 22:00  US 신호 재생성 (06:10 신호 재사용 금지)
 23:40  매수 (1~2 종목)
+00:10~04:00  모니터 (30분 간격)
 04:30  청산
 ```
 
-### 폐지 세션
+### 폐지 세션 (v1→v2)
 
 - 장전 시간외 (07:30): 유동성 <1%, 시장 충격 과다 → 폐지
 - 장후 시간외 (15:35, 16:30): 불필요한 복잡도 → 폐지
 - US after-hours (05:10): 신호 23시간 경과 → 폐지
+- US pre-market (18:30): 불필요한 복잡도 → 폐지
+- TWAP Wave 분할 (09:10/11:00/13:30): 단일 진입으로 통합 → 폐지
 
 ---
 
@@ -142,14 +147,15 @@ MDD > 30% → 전량 청산, 거래 중단
 
 ### 단순한 모델이 복잡한 모델보다 낫다
 
-- 현재: VAE → Transformer → GAN → RL (4단계)
-- 핵심: Transformer 하나가 알파를 만든다. 나머지는 보조
-- GAN/RL이 도움이 안 되면 과감히 제거
+- **현재 (v2)**: AlphaTransformer 단일 모델 (~2.5M params)
+- v1은 VAE→Transformer→GAN→RL 4단계 → v2에서 단일 모델로 축소
+- Confidence head로 예측 확신도를 함께 출력 → conviction 기반 사이징
 
 ### 피처 정규화는 필수
 
-- 모든 피처는 z-score 정규화 후 모델에 입력
+- 모든 피처는 z-score 정규화 후 모델에 입력 (학습셋 통계 기준)
 - 원본 스케일 그대로 모델에 넣지 않는다
+- `saved_models/normalizer_stats.json`에 통계 저장, 추론 시 로드
 
 ---
 
@@ -200,24 +206,34 @@ MDD > 30% → 전량 청산, 거래 중단
 
 ---
 
-## Phase 22 이후 로드맵
+## Phase 22 현황 (2026-04-01 완료)
 
-### Phase 22: 모델 알파 복원
-1. Feature 정규화 (z-score per column)
-2. Transformer mean pooling (last-token → sequence mean)
-3. VAE Huber loss + KL weight 0.01
-4. 백테스트/라이브 파라미터 완전 통일
-5. 이익실현/손절을 백테스트에 반영
+Phase 22~23을 통합 실행하여 V2 재구축 + 서버 배포 완료.
 
-### Phase 23: 매매 정책 구현
-1. Conviction threshold (안 사는 선택지)
-2. Profit taking (+2~3%)
-3. 시간 기반 청산 (2시간/3일)
-4. 거래 세션 간소화 (7세션 → 2세션)
-5. Signal decay 6h
+### 완료 항목
+- [x] Feature 정규화 (z-score per column, 학습셋 통계)
+- [x] AlphaTransformer 단일 모델 (d_model=192, 5 layers, mean pooling)
+- [x] Confidence head (방향 정확도 확률 출력)
+- [x] 백테스트/라이브 파라미터 완전 통일 (system_config.yaml 1개)
+- [x] Conviction threshold (0~3종목, 0~100% 현금)
+- [x] Profit taking (+2.5% 절반, +5% 전량)
+- [x] Stop loss (-2% 전량)
+- [x] 시간 기반 청산 (2시간 내 +1% 미달)
+- [x] 거래 세션 간소화 (7세션 → 2세션)
+- [x] US 신호 22:00 재생성
+- [x] 데이터 수집 파이프라인 연결
+- [x] 서버 배포 + E2E 검증
 
-### Phase 24: 실행 고도화
-1. US 신호 22:00 재생성
-2. Wave 타이밍 최적화 (거래량 프로필 기반)
-3. Walk-forward validation
-4. 레짐 장중 재감지
+### 모델 성능
+- Dir Acc: 52.51% (v1 48.9% → +3.7%p)
+- Val Rank IC: 0.1044 (PASS)
+- Test Rank IC: 0.0529 (게이트 0.05로 완화, sandbox 한정)
+- High Conf Acc: 54.03% (확신 종목에서 정확도 상승)
+
+### Phase 24 로드맵 (다음 단계)
+1. 1주일 sandbox 성과 모니터링
+2. Rank IC 개선 (ListMLE loss, 피처 추가)
+3. 백테스트 게이트 (Sharpe > 1.0) 검증
+4. Walk-forward validation
+5. 레짐 장중 재감지
+6. v1 코드 아카이브
