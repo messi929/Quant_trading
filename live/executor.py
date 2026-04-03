@@ -1,28 +1,33 @@
-"""Trading executor — entry, monitor, exit (v2).
+"""Trading executor — 3-day hold strategy (v2.2).
 
-Simple execution loop:
-  1. execute_entry(): Buy positions from signal
-  2. monitor_positions(): Check profit/stop/time exits every 30min
-  3. execute_exit(): Close all remaining positions at session end
+Core principles:
+  - 모델이 3일 후를 예측 → 3일간 보유하여 예측 실현 기회 확보
+  - 개별 종목 스탑로스 제거 → 포트폴리오 레벨 리스크 관리
+  - 청산 기준: (1) +5% 이상치 (2) 3일 만료 (3) 신호 반전 (4) 포트폴리오 손실 한도
 
-Replaces v1 signal_to_order.py (1700+ lines → ~300 lines).
+v2.2 changes:
+  - 개별 stop_loss 제거 (노이즈 청산 방지)
+  - time_exit 제거 (alpha decay 기간까지 보유)
+  - 부분 이익실현 제거 (+5% 전량만)
+  - session_close: 만료 포지션만 청산, 나머지 오버나이트 보유
+  - 포트폴리오 daily_loss_limit: 미실현 P&L 포함
 """
 
 from __future__ import annotations
 
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 
 from loguru import logger
 
 from broker.kis_api import KISApi
 from tracking.trade_log import TradeLogger
-from utils.ticker_utils import kis_code, is_domestic, kospi_tick_size
+from utils.ticker_utils import kis_code
 
 
 class TradingExecutor:
-    """Executes trades based on ConvictionSignalGenerator output."""
+    """Executes trades with 3-day hold strategy."""
 
     def __init__(
         self,
@@ -30,97 +35,98 @@ class TradingExecutor:
         api: Optional[KISApi] = None,
         trade_logger: Optional[TradeLogger] = None,
     ):
-        cfg_trading = config["trading"]
-        cfg_broker = config["broker"]
-        cfg_risk = config["risk"]
+        trading = config["trading"]
+        broker = config["broker"]
+        risk = config["risk"]
 
-        self.profit_take_pct = cfg_trading["profit_take_pct"]
-        self.profit_take_full_pct = cfg_trading["profit_take_full_pct"]
-        self.stop_loss_pct = cfg_trading["stop_loss_pct"]
-        self.time_exit_hours = cfg_trading["time_exit_hours"]
-        self.time_exit_min_profit = cfg_trading["time_exit_min_profit"]
-        self.max_hold_days = cfg_trading["max_hold_days"]
-        self.retry_wait_secs = cfg_trading["retry_wait_secs"]
-        self.daily_loss_limit = cfg_risk["daily_loss_limit"]
-        self.cost_rate = cfg_trading["transaction_cost_rate"]
-        self.volume_max_pct = cfg_trading["volume_participation_max"]
+        # Exit: +5% 이상치에서만 조기 청산
+        self.profit_take_full_pct = trading["profit_take_full_pct"]
+        # 3일 보유 후 만료 청산
+        self.max_hold_days = trading["max_hold_days"]
+        self.cost_rate = trading["transaction_cost_rate"]
 
-        self.paper_trading = cfg_broker.get("paper_trading", True)
-        self.mode = cfg_broker.get("mode", "sandbox")
+        # 포트폴리오 레벨 리스크
+        self.daily_loss_limit = risk["daily_loss_limit"]
+        self.circuit_breaker_cfg = risk["circuit_breaker"]
 
-        if api is None:
-            self.api = KISApi(mode=self.mode, market_type="domestic")
-        else:
-            self.api = api
+        # Broker
+        self.paper_trading = broker.get("paper_trading", True)
+        self.mode = broker.get("mode", "sandbox")
 
-        if trade_logger is None:
-            self.logger = TradeLogger(config["paths"]["trade_log_db"])
-        else:
-            self.logger = trade_logger
+        self.api = api or KISApi(mode=self.mode, market_type="domestic")
+        self.trade_logger = trade_logger or TradeLogger(config["paths"]["trade_log_db"])
 
-        # Active positions: {ticker: {qty, entry_price, entry_time, weight, ...}}
+        # State
         self.open_positions: dict[str, dict] = {}
-
-        # Stoploss cooldown (no rebuy same day)
         self._stoploss_tickers: set[str] = set()
-
-        # Daily P&L tracking
         self._daily_pnl = 0.0
+        self._daily_traded_amount = 0.0
 
-    # ── Entry ──────────────────────────────────────────────────
+    # ── Entry (reconciliation + circuit breaker) ──────────────
 
     def execute_entry(
         self,
         positions: list[dict],
         portfolio_value: Optional[float] = None,
     ) -> list[dict]:
-        """Execute buy orders for signal positions.
+        """Reconcile holdings with signal, trade only the diff.
 
-        Args:
-            positions: From ConvictionSignalGenerator.generate()["positions"]
-            portfolio_value: Total portfolio value for sizing. If None, queries API.
-
-        Returns:
-            List of executed order results.
+        1. Circuit breaker scaling (MDD-based)
+        2. Close positions NOT in new signal (rebalance)
+        3. Keep positions still in signal (save costs)
+        4. Buy new positions
         """
-        if not positions:
-            return []
-
         if portfolio_value is None:
-            try:
-                balance = self.api.get_domestic_balance()
-                portfolio_value = balance.get("total_eval", 100_000_000)
-            except Exception as e:
-                logger.error(f"Balance query failed: {e}")
+            portfolio_value = self._get_portfolio_value()
+            if portfolio_value is None:
                 return []
 
+        # Circuit breaker
+        cb_scale = self._circuit_breaker_scale()
+        if cb_scale <= 0:
+            logger.warning("CIRCUIT BREAKER [crisis]: all trading halted")
+            return self.force_close_all()
+        if cb_scale < 1.0:
+            logger.warning(f"CIRCUIT BREAKER: scaling positions to {cb_scale:.0%}")
+
+        # Reconcile: close positions not in new signal
+        target_tickers = {p["ticker"] for p in positions}
+        for ticker in list(self.open_positions):
+            if ticker not in target_tickers:
+                pos = self.open_positions[ticker]
+                price = self._get_price(ticker, pos["market"])
+                if price > 0:
+                    self._close_position(ticker, pos, price, "rebalance")
+
+        # Buy new positions
         executed = []
         for pos in positions:
             ticker = pos["ticker"]
-            weight = pos["weight"]
             market = pos.get("market", "domestic")
 
-            # Cooldown check
-            if kis_code(ticker) in self._stoploss_tickers:
-                logger.info(f"Skip [{ticker}]: stoploss cooldown")
+            if ticker in self.open_positions:
+                logger.info(f"KEEP [{ticker}]: already held, skip re-entry")
                 continue
 
-            # Daily loss check
+            if kis_code(ticker) in self._stoploss_tickers:
+                logger.info(f"SKIP [{ticker}]: cooldown")
+                continue
+
+            # Portfolio loss check (realized only, for entry gating)
             if self._daily_pnl <= -self.daily_loss_limit:
-                logger.warning(f"Daily loss limit reached ({self._daily_pnl:.2%})")
+                logger.warning(f"STOP: daily loss limit ({self._daily_pnl:.2%})")
                 break
 
             try:
-                amount = portfolio_value * weight
+                weight = pos["weight"] * cb_scale
                 price = self._get_price(ticker, market)
                 if price <= 0:
                     continue
 
-                qty = int(amount / price)
+                qty = int(portfolio_value * weight / price)
                 if qty < 1:
                     continue
 
-                # Execute
                 result = self._place_order(ticker, "buy", qty, price, market)
                 if result:
                     self.open_positions[ticker] = {
@@ -131,127 +137,204 @@ class TradingExecutor:
                         "market": market,
                         "score": pos.get("score", 0),
                     }
-                    self.logger.log_trade(result, note="entry")
+                    self.trade_logger.log_trade(result, note="entry")
+                    self._daily_traded_amount += qty * price
                     executed.append(result)
                     logger.info(
                         f"ENTRY: {ticker} {qty}주 @ {price:,.0f} "
                         f"(weight={weight:.0%}, score={pos.get('score', 0):.4f})"
                     )
-
             except Exception as e:
                 logger.error(f"Entry failed [{ticker}]: {e}")
 
         return executed
 
-    # ── Monitor ────────────────────────────────────────────────
+    # ── Monitor (portfolio-level risk) ────────────────────────
 
     def monitor_positions(self) -> list[dict]:
-        """Check all open positions for exit conditions.
+        """Check exit conditions every 5 minutes.
 
-        Called every 30 minutes during trading session.
-
-        Returns:
-            List of exit order results.
+        Exit conditions (no individual stop loss):
+          1. Portfolio daily loss limit (realized + unrealized)
+          2. Profit take full (+5%) → close
+          3. Hold expired (3 days) → close
         """
-        exits = []
+        if not self.open_positions:
+            return []
 
-        for ticker, pos in list(self.open_positions.items()):
-            try:
-                current_price = self._get_price(ticker, pos["market"])
-                if current_price <= 0:
-                    continue
+        # Fetch all prices and calculate unrealized P&L
+        unrealized_pnl = 0.0
+        position_data: dict[str, tuple[float, float]] = {}
 
-                entry_price = pos["entry_price"]
-                pnl_pct = (current_price - entry_price) / entry_price
-                elapsed = datetime.now() - pos["entry_time"]
-                elapsed_hours = elapsed.total_seconds() / 3600
+        for ticker, pos in self.open_positions.items():
+            price = self._get_price(ticker, pos["market"])
+            if price <= 0:
+                continue
+            pnl_pct = (price - pos["entry_price"]) / pos["entry_price"]
+            position_data[ticker] = (price, pnl_pct)
+            unrealized_pnl += pnl_pct * pos["weight"]
 
-                exit_reason = None
+        # Portfolio-level risk: realized + unrealized
+        total_pnl = self._daily_pnl + unrealized_pnl
+        if total_pnl <= -self.daily_loss_limit:
+            logger.warning(
+                f"PORTFOLIO RISK: daily P&L {total_pnl:.2%} "
+                f"(realized={self._daily_pnl:.2%}, unrealized={unrealized_pnl:.2%}) "
+                f"→ closing all positions"
+            )
+            return self.force_close_all()
 
-                # Stop loss: -2%
-                if pnl_pct <= -self.stop_loss_pct:
-                    exit_reason = "stop_loss"
-
-                # Profit take (full): +5%
-                elif pnl_pct >= self.profit_take_full_pct:
-                    exit_reason = "profit_take_full"
-
-                # Profit take (partial): +2.5%
-                elif pnl_pct >= self.profit_take_pct:
-                    exit_reason = "profit_take"
-
-                # Time exit: 2h and < +1%
-                elif (elapsed_hours >= self.time_exit_hours
-                      and pnl_pct < self.time_exit_min_profit):
-                    exit_reason = "time_exit"
-
-                if exit_reason:
-                    result = self._close_position(ticker, pos, current_price, exit_reason)
-                    if result:
-                        exits.append(result)
-
-            except Exception as e:
-                logger.error(f"Monitor error [{ticker}]: {e}")
-
-        return exits
-
-    # ── Session Close ──────────────────────────────────────────
-
-    def execute_exit(self) -> list[dict]:
-        """Close ALL remaining positions (session end).
-
-        Returns:
-            List of exit order results.
-        """
+        # Individual position checks
         exits = []
         for ticker, pos in list(self.open_positions.items()):
-            try:
-                current_price = self._get_price(ticker, pos["market"])
-                if current_price <= 0:
-                    current_price = pos["entry_price"]  # Fallback
+            if ticker not in position_data:
+                continue
 
-                result = self._close_position(ticker, pos, current_price, "session_close")
+            price, pnl_pct = position_data[ticker]
+            hold_days = (datetime.now() - pos["entry_time"]).days
+
+            reason = None
+
+            # +5% 이상치 → 조기 청산
+            if pnl_pct >= self.profit_take_full_pct:
+                reason = "profit_take_full"
+
+            # 3일 보유 만료 → 예측 기간 종료
+            elif hold_days >= self.max_hold_days:
+                reason = "hold_expired"
+
+            if reason:
+                result = self._close_position(ticker, pos, price, reason)
                 if result:
                     exits.append(result)
-            except Exception as e:
-                logger.error(f"Exit failed [{ticker}]: {e}")
 
-        logger.info(f"Session close: {len(exits)} positions exited")
         return exits
 
-    # ── Internal ───────────────────────────────────────────────
+    # ── Session Close (non-destructive) ───────────────────────
+
+    def execute_exit(self) -> list[dict]:
+        """Session close: only close expired positions. Keep others overnight.
+
+        3일 미만 보유 포지션은 오버나이트 유지 (턴오버 감소).
+        """
+        exits = []
+        for ticker, pos in list(self.open_positions.items()):
+            hold_days = (datetime.now() - pos["entry_time"]).days
+            if hold_days >= self.max_hold_days:
+                price = self._get_price(ticker, pos["market"])
+                if price <= 0:
+                    price = pos["entry_price"]
+                result = self._close_position(ticker, pos, price, "hold_expired")
+                if result:
+                    exits.append(result)
+
+        kept = len(self.open_positions)
+        logger.info(
+            f"Session close: {len(exits)} expired, {kept} carried overnight"
+        )
+        return exits
+
+    def force_close_all(self) -> list[dict]:
+        """Emergency: close ALL positions (crisis, CASH signal)."""
+        exits = []
+        for ticker, pos in list(self.open_positions.items()):
+            price = self._get_price(ticker, pos["market"])
+            if price <= 0:
+                price = pos["entry_price"]
+            result = self._close_position(ticker, pos, price, "force_close")
+            if result:
+                exits.append(result)
+        logger.info(f"Force close: {len(exits)} positions closed")
+        return exits
+
+    # ── Position close ────────────────────────────────────────
 
     def _close_position(
         self,
         ticker: str,
         pos: dict,
-        current_price: float,
+        price: float,
         reason: str,
     ) -> dict | None:
-        """Close a single position."""
+        """Close a position fully."""
         qty = pos["qty"]
-        result = self._place_order(ticker, "sell", qty, current_price, pos["market"])
+        result = self._place_order(ticker, "sell", qty, price, pos["market"])
 
         if result:
-            pnl_pct = (current_price - pos["entry_price"]) / pos["entry_price"]
+            pnl_pct = (price - pos["entry_price"]) / pos["entry_price"]
             self._daily_pnl += pnl_pct * pos["weight"]
+            self._daily_traded_amount += qty * price
 
-            self.logger.log_trade(result, note=reason)
+            self.trade_logger.log_trade(result, note=reason)
             del self.open_positions[ticker]
 
-            if reason == "stop_loss":
+            if reason in ("force_close", "rebalance"):
                 self._stoploss_tickers.add(kis_code(ticker))
 
-            symbol = "+" if pnl_pct > 0 else ""
+            sign = "+" if pnl_pct > 0 else ""
+            hold = (datetime.now() - pos["entry_time"]).days
             logger.info(
-                f"EXIT [{reason}]: {ticker} {qty}주 @ {current_price:,.0f} "
-                f"({symbol}{pnl_pct:.2%})"
+                f"EXIT [{reason}]: {ticker} {qty}주 @ {price:,.0f} "
+                f"({sign}{pnl_pct:.2%}, {hold}d held)"
             )
+        else:
+            if pos["market"] == "domestic":
+                self._verify_and_sync(ticker)
 
         return result
 
+    # ── Sell failure recovery ─────────────────────────────────
+
+    def _verify_and_sync(self, ticker: str):
+        """On sell failure, check actual KIS balance and sync."""
+        try:
+            balance = self.api.get_domestic_balance()
+            held_codes = {
+                p.get("ticker", "") for p in balance.get("positions", [])
+            }
+            code = kis_code(ticker)
+
+            if code not in held_codes:
+                logger.warning(
+                    f"SYNC: {ticker} ({code}) not in KIS balance — "
+                    f"removing from open_positions"
+                )
+                self.open_positions.pop(ticker, None)
+            else:
+                logger.info(
+                    f"SYNC: {ticker} confirmed in balance — retry next cycle"
+                )
+        except Exception as e:
+            logger.error(f"Balance verification failed: {e}")
+
+    # ── Circuit breaker ───────────────────────────────────────
+
+    def _circuit_breaker_scale(self) -> float:
+        """MDD-based position scaling."""
+        mdd = abs(self.trade_logger._compute_cumulative_mdd())
+        cb = self.circuit_breaker_cfg
+
+        if mdd >= cb["crisis"]:
+            return 0.0
+        if mdd >= cb["high"]:
+            return 0.25
+        if mdd >= cb["warning"]:
+            return 0.50
+        if mdd >= cb["caution"]:
+            return 0.75
+        return 1.0
+
+    # ── Helpers ────────────────────────────────────────────────
+
+    def _get_portfolio_value(self) -> float | None:
+        try:
+            balance = self.api.get_domestic_balance()
+            return balance.get("total_eval", 100_000_000)
+        except Exception as e:
+            logger.error(f"Balance query failed: {e}")
+            return None
+
     def _get_price(self, ticker: str, market: str) -> float:
-        """Get current price from API or yfinance fallback."""
         try:
             if market == "domestic":
                 data = self.api.get_domestic_price(kis_code(ticker))
@@ -275,10 +358,8 @@ class TradingExecutor:
         price: float,
         market: str,
     ) -> dict | None:
-        """Place order via KIS API or paper trade."""
         try:
             if self.paper_trading and market == "overseas":
-                # Paper trade for overseas
                 return {
                     "ticker": ticker,
                     "side": side,
@@ -290,15 +371,9 @@ class TradingExecutor:
                 }
 
             code = kis_code(ticker)
-            if side == "buy":
-                result = self.api.order_domestic(
-                    ticker=code, qty=qty, price=int(price), side="buy",
-                )
-            else:
-                result = self.api.order_domestic(
-                    ticker=code, qty=qty, price=int(price), side="sell",
-                )
-
+            result = self.api.order_domestic(
+                ticker=code, qty=qty, price=int(price), side=side,
+            )
             return {
                 "ticker": ticker,
                 "side": side,
@@ -308,13 +383,12 @@ class TradingExecutor:
                 "order_no": result.get("order_no", ""),
                 "market": market,
             }
-
         except Exception as e:
             logger.error(f"Order failed [{side} {ticker} x{qty}]: {e}")
             return None
 
     def reset_daily(self):
-        """Reset daily state (call at start of each trading day)."""
+        """Reset daily counters. Preserves open_positions for carry-over."""
         self._stoploss_tickers.clear()
         self._daily_pnl = 0.0
-        self.open_positions.clear()
+        self._daily_traded_amount = 0.0

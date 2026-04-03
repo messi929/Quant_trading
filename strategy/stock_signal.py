@@ -1,14 +1,17 @@
-"""Conviction-based stock signal generator (v2).
+"""Conviction-based stock signal generator (v2.1).
 
 Philosophy: "확신 있을 때만, 크게, 빠르게"
 - Bear regime → CASH (no position)
 - Low conviction → CASH (no position)
 - High conviction → 1~3 stocks, concentrated
 
-Replaces v1 sector-rotation SignalGenerator.
+v2.1: score_history persisted to disk (survives service restart).
 """
 
 from __future__ import annotations
+
+import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -39,20 +42,8 @@ class ConvictionSignalGenerator:
         bear_action: str = "cash",
         kelly_fraction: float = 0.5,
         target_daily_vol: float = 0.0094,  # 15% annual / sqrt(252)
+        score_history_path: str = "saved_models/score_history.json",
     ):
-        """
-        Args:
-            conviction_threshold_pctl: Percentile threshold for conviction.
-                Only trade when best score exceeds this percentile of
-                historical score distribution.
-            max_positions: Maximum concurrent positions (1~3).
-            max_single_weight: Maximum weight for any single ticker.
-            icr_min: Minimum information-to-cost ratio.
-            transaction_cost_rate: Round-trip transaction cost (default 0.6%).
-            bear_action: "cash" = 100% cash in bear, "reduce" = scale down.
-            kelly_fraction: Fraction of full Kelly (0.5 = half-Kelly).
-            target_daily_vol: Target daily volatility for sizing.
-        """
         self.conviction_pctl = conviction_threshold_pctl
         self.max_positions = max_positions
         self.max_single_weight = max_single_weight
@@ -64,8 +55,9 @@ class ConvictionSignalGenerator:
 
         self.regime_detector = MarketRegimeDetector()
 
-        # Historical score distribution for adaptive threshold
-        self._score_history: list[float] = []
+        # Historical score distribution for adaptive threshold (persisted)
+        self._score_history_path = Path(score_history_path)
+        self._score_history: list[float] = self._load_score_history()
 
     def generate(
         self,
@@ -112,10 +104,11 @@ class ConvictionSignalGenerator:
         score_values = list(scores.values())
         max_score = max(score_values)
 
-        # Update history for adaptive threshold
+        # Update history for adaptive threshold (persisted to disk)
         self._score_history.extend(score_values)
         if len(self._score_history) > 10000:
             self._score_history = self._score_history[-10000:]
+        self._save_score_history()
 
         # Threshold: score must be in top N percentile of history
         if len(self._score_history) >= 100:
@@ -238,3 +231,30 @@ class ConvictionSignalGenerator:
             "cash_weight": 1.0,
             "reason": reason,
         }
+
+    # ── Score history persistence ─────────────────────────────
+
+    def _load_score_history(self) -> list[float]:
+        """Load score history from disk. Returns empty list if not found."""
+        try:
+            if self._score_history_path.exists():
+                data = json.loads(self._score_history_path.read_text())
+                if isinstance(data, list):
+                    logger.info(
+                        f"Score history loaded: {len(data)} entries "
+                        f"from {self._score_history_path}"
+                    )
+                    return data[-10000:]
+        except Exception as e:
+            logger.warning(f"Score history load failed: {e}")
+        return []
+
+    def _save_score_history(self):
+        """Persist score history to disk."""
+        try:
+            self._score_history_path.parent.mkdir(parents=True, exist_ok=True)
+            self._score_history_path.write_text(
+                json.dumps(self._score_history[-10000:])
+            )
+        except Exception as e:
+            logger.warning(f"Score history save failed: {e}")

@@ -1,16 +1,18 @@
-"""Trading runner — 2-session scheduler (v2).
+"""Trading runner — 2-session scheduler (v2.2).
 
-KR Session: signal(06:10) → execute(09:10) → monitor(30min) → close(15:20)
-US Session: signal(22:00) → execute(23:40) → monitor(30min) → close(04:30)
+KR Session: data(06:00) → signal(06:10) → entry(09:30) → monitor(5min) → close(15:20) → eod(16:00)
+US Session: signal(22:00) → entry(23:40) → monitor(5min) → close(04:30)
 
-Replaces v1 DailyRunner (15+ daemon methods, 7 sessions).
+v2.2 changes:
+  - KR entry 09:10 → 09:30 (스프레드 안정화 후 진입)
+  - Session close: 만료(3일) 포지션만 청산, 나머지 오버나이트 보유
+  - CASH 신호 시 force_close_all
 """
 
 from __future__ import annotations
 
-from datetime import datetime, date, timedelta
+from datetime import date, timedelta
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 import schedule
@@ -24,22 +26,16 @@ from live.executor import TradingExecutor
 
 
 class TradingRunner:
-    """Simplified 2-session trading scheduler.
-
-    Removes: premarket, afterclose, aftersingle, afterhours, Layer 2, TWAP waves.
-    Keeps: signal → entry → monitor → exit per session.
-    """
+    """2-session trading scheduler with 3-day hold strategy."""
 
     def __init__(self, config: dict | None = None):
         self.cfg = config or load_config()
         self.pipeline = SignalPipeline(self.cfg)
         self.executor = TradingExecutor(self.cfg)
 
-        # Current signal cache
         self._kr_signal: dict | None = None
         self._us_signal: dict | None = None
 
-        # Schedule config
         self._kr = self.cfg["schedule"]["kr"]
         self._us = self.cfg["schedule"]["us"]
 
@@ -70,7 +66,6 @@ class TradingRunner:
             processor = DataProcessor(min_history_days=1)
             new_df = processor.process(raw_df)
 
-            # Sector assignment
             static_map = load_kr_sector_map()
             if "sector" not in new_df.columns:
                 new_df["sector"] = "unknown"
@@ -78,13 +73,11 @@ class TradingRunner:
                 if ticker in static_map:
                     new_df.loc[new_df["ticker"] == ticker, "sector"] = static_map[ticker]
 
-            # Merge with existing parquet
             processed_path = (
                 Path(self.cfg["paths"]["processed_data"]) / "processed_data.parquet"
             )
             if processed_path.exists():
                 old_df = pd.read_parquet(processed_path)
-                # Preserve sector from existing data for tickers not in static_map
                 if "sector" in old_df.columns:
                     existing_sectors = (
                         old_df[["ticker", "sector"]]
@@ -94,7 +87,9 @@ class TradingRunner:
                     )
                     for ticker in new_df["ticker"].unique():
                         if ticker not in static_map and ticker in existing_sectors:
-                            new_df.loc[new_df["ticker"] == ticker, "sector"] = existing_sectors[ticker]
+                            new_df.loc[
+                                new_df["ticker"] == ticker, "sector"
+                            ] = existing_sectors[ticker]
 
                 combined = pd.concat([old_df, new_df]).drop_duplicates(
                     subset=["date", "ticker"], keep="last"
@@ -130,20 +125,29 @@ class TradingRunner:
             self._kr_signal = None
 
     def kr_execute_entry(self):
-        """09:10 — Execute KR buy orders."""
+        """09:30 — Execute KR entry with reconciliation.
+
+        - CASH signal → force close all positions
+        - TRADE signal → reconcile (close non-signal, keep matching, buy new)
+        """
         logger.info("[KR] Execute entry")
         self.executor.reset_daily()
 
-        if self._kr_signal is None or self._kr_signal["action"] == "CASH":
-            logger.info("[KR] CASH — no positions to enter")
+        if self._kr_signal is None:
+            logger.info("[KR] No signal — skipping entry")
+            return
+
+        if self._kr_signal["action"] == "CASH":
+            logger.info("[KR] CASH — closing all positions")
+            self.executor.force_close_all()
             return
 
         positions = self._kr_signal["positions"]
         results = self.executor.execute_entry(positions)
-        logger.info(f"[KR] Entered {len(results)} positions")
+        logger.info(f"[KR] Entered {len(results)} new positions")
 
     def kr_monitor(self):
-        """Every 30min — Check profit/stop/time exits."""
+        """Every 5min — Check portfolio risk, profit take, hold expiry."""
         if not self.executor.open_positions:
             return
 
@@ -152,16 +156,15 @@ class TradingRunner:
             logger.info(f"[KR] Monitor: {len(exits)} exits triggered")
 
     def kr_close_session(self):
-        """15:20 — Close all remaining KR positions."""
+        """15:20 — Close only expired positions. Keep others overnight."""
         logger.info("[KR] Session close")
         exits = self.executor.execute_exit()
-        logger.info(f"[KR] Closed {len(exits)} positions")
         self._log_daily_performance()
 
     # ── US Session ─────────────────────────────────────────────
 
     def us_generate_signal(self):
-        """22:00 — Generate FRESH US signal (not reuse morning signal!)."""
+        """22:00 — Generate FRESH US signal."""
         logger.info("=" * 50)
         logger.info("[US] Signal generation start (fresh)")
         try:
@@ -174,12 +177,17 @@ class TradingRunner:
             self._us_signal = None
 
     def us_execute_entry(self):
-        """23:40 — Execute US buy orders."""
+        """23:40 — Execute US entry with reconciliation."""
         logger.info("[US] Execute entry")
         self.executor.reset_daily()
 
-        if self._us_signal is None or self._us_signal["action"] == "CASH":
-            logger.info("[US] CASH — no positions to enter")
+        if self._us_signal is None:
+            logger.info("[US] No signal — skipping entry")
+            return
+
+        if self._us_signal["action"] == "CASH":
+            logger.info("[US] CASH — closing any positions")
+            self.executor.force_close_all()
             return
 
         positions = self._us_signal["positions"]
@@ -187,7 +195,7 @@ class TradingRunner:
         logger.info(f"[US] Entered {len(results)} positions")
 
     def us_monitor(self):
-        """Every 30min — Check profit/stop/time exits."""
+        """Every 5min — Check exits for US positions."""
         if not self.executor.open_positions:
             return
 
@@ -196,15 +204,15 @@ class TradingRunner:
             logger.info(f"[US] Monitor: {len(exits)} exits triggered")
 
     def us_close_session(self):
-        """04:30 — Close all remaining US positions."""
+        """04:30 — Close US positions (paper trading, full close)."""
         logger.info("[US] Session close")
-        exits = self.executor.execute_exit()
+        exits = self.executor.force_close_all()
         logger.info(f"[US] Closed {len(exits)} positions")
 
     # ── EOD ────────────────────────────────────────────────────
 
     def _log_daily_performance(self):
-        """Log daily performance to database."""
+        """Log daily performance (includes unrealized P&L from held positions)."""
         try:
             from tracking.trade_log import TradeLogger
             tl = TradeLogger(self.cfg["paths"]["trade_log_db"])
@@ -228,9 +236,12 @@ class TradingRunner:
                 n_trades=n_trades,
                 turnover=turnover,
             )
+
+            held = len(self.executor.open_positions)
             logger.info(
                 f"EOD: portfolio={portfolio_value:,.0f}, "
-                f"return={daily_return:.2%}, trades={n_trades}"
+                f"return={daily_return:.2%}, trades={n_trades}, "
+                f"positions_held={held}"
             )
         except Exception as e:
             logger.error(f"EOD logging failed: {e}")
@@ -238,11 +249,11 @@ class TradingRunner:
     # ── Scheduler ──────────────────────────────────────────────
 
     def setup_schedule(self):
-        """Configure the schedule based on config."""
+        """Configure schedule from config."""
         kr = self._kr
         us = self._us
 
-        # Data collection (before signal generation)
+        # Data collection
         schedule.every().day.at(kr.get("data_collect", "06:00")).do(self.collect_data)
 
         # KR session
@@ -250,15 +261,17 @@ class TradingRunner:
         schedule.every().day.at(kr["execute_entry"]).do(self.kr_execute_entry)
         schedule.every().day.at(kr["execute_exit"]).do(self.kr_close_session)
 
-        # KR monitor: every 30min from 09:40 to 14:50
-        monitor_interval = kr.get("monitor_interval_min", 30)
-        for h in range(9, 15):
-            for m in [10, 40] if h == 9 else [10, 40]:
-                if h == 9 and m == 10:
-                    continue  # Skip 09:10 (entry time)
-                t = f"{h:02d}:{m:02d}"
-                if t <= kr["execute_exit"]:
-                    schedule.every().day.at(t).do(self.kr_monitor)
+        # KR monitor: every N min from entry+interval to exit
+        kr_interval = kr.get("monitor_interval_min", 5)
+        kr_entry_h, kr_entry_m = map(int, kr["execute_entry"].split(":"))
+        kr_exit = kr["execute_exit"]
+        cur = kr_entry_h * 60 + kr_entry_m + kr_interval
+        while True:
+            t = f"{cur // 60:02d}:{cur % 60:02d}"
+            if t > kr_exit:
+                break
+            schedule.every().day.at(t).do(self.kr_monitor)
+            cur += kr_interval
 
         # EOD
         schedule.every().day.at(kr.get("eod_record", "16:00")).do(
@@ -270,18 +283,34 @@ class TradingRunner:
         schedule.every().day.at(us["execute_entry"]).do(self.us_execute_entry)
         schedule.every().day.at(us["execute_exit"]).do(self.us_close_session)
 
-        # US monitor: every 30min from 00:10 to 04:00
-        for h in [0, 1, 2, 3, 4]:
-            for m in [10, 40]:
-                t = f"{h:02d}:{m:02d}"
-                if t <= us["execute_exit"]:
-                    schedule.every().day.at(t).do(self.us_monitor)
+        # US monitor
+        us_interval = us.get("monitor_interval_min", 5)
+        us_entry_h, us_entry_m = map(int, us["execute_entry"].split(":"))
+        us_exit_h, us_exit_m = map(int, us["execute_exit"].split(":"))
+        us_exit_abs = us_exit_h * 60 + us_exit_m
+        cur = (us_entry_h * 60 + us_entry_m + us_interval) % (24 * 60)
+        while True:
+            t = f"{cur // 60:02d}:{cur % 60:02d}"
+            if cur <= us_exit_abs:
+                schedule.every().day.at(t).do(self.us_monitor)
+                if cur == us_exit_abs:
+                    break
+                cur += us_interval
+                if cur > us_exit_abs:
+                    break
+            else:
+                schedule.every().day.at(t).do(self.us_monitor)
+                cur = (cur + us_interval) % (24 * 60)
 
         logger.info("Schedule configured:")
-        logger.info(f"  KR: signal={kr['signal_generate']}, "
-                     f"entry={kr['execute_entry']}, exit={kr['execute_exit']}")
-        logger.info(f"  US: signal={us['signal_generate']}, "
-                     f"entry={us['execute_entry']}, exit={us['execute_exit']}")
+        logger.info(
+            f"  KR: signal={kr['signal_generate']}, "
+            f"entry={kr['execute_entry']}, exit={kr['execute_exit']}"
+        )
+        logger.info(
+            f"  US: signal={us['signal_generate']}, "
+            f"entry={us['execute_entry']}, exit={us['execute_exit']}"
+        )
 
     def run_daemon(self):
         """Run the scheduler loop."""
@@ -305,7 +334,6 @@ class TradingRunner:
         """Manually run a full KR session (for testing)."""
         self.kr_generate_signal()
         self.kr_execute_entry()
-        # In real usage, monitor would run on schedule
         self.kr_monitor()
         self.kr_close_session()
 

@@ -30,18 +30,19 @@ scp -i "$SSH_KEY" strategy/stock_signal.py "$SERVER:$SERVER_DIR/strategy/" 2>&1 
 scp -i "$SSH_KEY" scheduler/runner.py "$SERVER:$SERVER_DIR/scheduler/" 2>&1 | tee -a "$LOG"
 scp -i "$SSH_KEY" live/executor.py "$SERVER:$SERVER_DIR/live/" 2>&1 | tee -a "$LOG"
 scp -i "$SSH_KEY" data/normalizer.py data/dataset.py "$SERVER:$SERVER_DIR/data/" 2>&1 | tee -a "$LOG"
+scp -i "$SSH_KEY" tracking/trade_log.py "$SERVER:$SERVER_DIR/tracking/" 2>&1 | tee -a "$LOG"
 scp -i "$SSH_KEY" backtest/conviction_engine.py backtest/intraday_sim.py "$SERVER:$SERVER_DIR/backtest/" 2>&1 | tee -a "$LOG"
 scp -i "$SSH_KEY" run_v2.py "$SERVER:$SERVER_DIR/" 2>&1 | tee -a "$LOG"
 
 # 4. 서버 패키지 확인
 echo "[$(date '+%H:%M:%S')] 서버 패키지 확인..." | tee -a "$LOG"
-ssh -i "$SSH_KEY" "$SERVER" "pip3 install -q schedule loguru 2>&1" | tee -a "$LOG"
+ssh -i "$SSH_KEY" "$SERVER" "$SERVER_DIR/venv/bin/pip install -q schedule loguru 2>&1" | tee -a "$LOG"
 
 # 5. systemd 서비스 업데이트 + 재시작
 echo "[$(date '+%H:%M:%S')] 서비스 재시작..." | tee -a "$LOG"
 ssh -i "$SSH_KEY" "$SERVER" "
-    # ExecStart를 run_v2.py로 변경
-    sed -i 's|ExecStart=.*|ExecStart=/usr/bin/python3 /opt/quant/run_v2.py|' /etc/systemd/system/quant-trading.service
+    # ExecStart를 run_v2.py로 변경 (venv python 사용)
+    sed -i 's|ExecStart=.*|ExecStart=/opt/quant/venv/bin/python /opt/quant/run_v2.py|' /etc/systemd/system/quant-trading.service
     # QUANT_ROOT 환경변수 추가 (없으면)
     grep -q 'QUANT_ROOT' /etc/systemd/system/quant-trading.service || \
         sed -i '/\[Service\]/a Environment=QUANT_ROOT=/opt/quant' /etc/systemd/system/quant-trading.service

@@ -58,6 +58,9 @@ class SignalPipeline:
             bear_action=cfg_regime["bear_action"],
             kelly_fraction=self.cfg["risk"]["kelly_fraction"],
             target_daily_vol=self.cfg["_derived"]["target_daily_vol"],
+            score_history_path=str(
+                Path(self.cfg["paths"]["models"]) / "score_history.json"
+            ),
         )
 
         # Feature columns

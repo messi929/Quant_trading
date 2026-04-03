@@ -8,7 +8,7 @@
 
 project:
   name: "Conviction Alpha Trader"
-  version: "2.0.0"
+  version: "2.2.0"
 
 # ------------------------------------------------------------------
 # 경로
@@ -106,14 +106,11 @@ trading:
   min_order_amount: 5_000_000   # 최소 주문금액 500만원 (v1은 10만원)
   icr_min: 3.0                  # ICR ≥ 3.0 (신호 > 3× 거래비용)
 
-  # 매도 조건
-  profit_take_pct: 0.025        # +2.5% 도달 시 50% 이익 실현
-  profit_take_full_pct: 0.05    # +5% 도달 시 전량 청산
-  stop_loss_pct: 0.02           # -2% 도달 시 전량 손절
-  time_exit_hours: 2            # 2시간 내 +1% 미달 시 청산
-  time_exit_min_profit: 0.01    # 시간 청산 면제 기준 (+1%)
-  max_hold_days: 3              # 최대 보유 기간 3일
-  day_trade_default: true       # 기본 당일 청산
+  # 매도 조건 (v2.2: 3일 보유 전략)
+  # 개별 스탑로스 제거 → 포트폴리오 daily_loss_limit으로 관리
+  # time_exit 제거 → prediction_horizon(3일) 동안 보유
+  profit_take_full_pct: 0.05    # +5% 이상치에서만 조기 전량 청산
+  max_hold_days: 3              # 예측 기간 만료 → 청산 (오버나이트 보유)
 
   # 비용
   transaction_cost_rate: 0.006  # 왕복 0.6%
@@ -123,8 +120,7 @@ trading:
     KOSDAQ: 0.005
     NASDAQ: 0.001
 
-  # 턴오버
-  max_daily_turnover: 0.15      # 일일 최대 15%
+  # 턴오버 (3일 보유 + reconciliation → ~30~60% 목표)
   volume_participation_max: 0.05  # 거래량 5% 이내
 
   # 주문 실행
@@ -185,15 +181,15 @@ schedule:
   kr:
     data_collect: "06:00"
     signal_generate: "06:10"
-    execute_entry: "09:10"
-    # 모니터: 09:40, 10:10, ..., 14:50 (30분 간격, 코드에서 생성)
-    monitor_interval_min: 30
+    execute_entry: "09:30"          # v2.2: 스프레드 안정화 후 진입 (09:10→09:30)
+    # 모니터: 09:35, 09:40, ..., 15:15 (5분 간격, 코드에서 생성)
+    monitor_interval_min: 5
     execute_exit: "15:20"       # 장 마감 10분 전 전량 청산
     eod_record: "16:00"
   us:
     signal_generate: "22:00"    # US 신호 재생성 (06:10 재사용 금지!)
     execute_entry: "23:40"
-    monitor_interval_min: 30
+    monitor_interval_min: 5
     execute_exit: "04:30"
   # 폐지된 세션 (v1에서 사용, v2에서 제거)
   # kr_premarket (07:30), kr_afterclose (15:35), kr_aftersingle (16:30)
