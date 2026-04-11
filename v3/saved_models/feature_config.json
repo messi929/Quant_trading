@@ -1,0 +1,31 @@
+{
+  "feature_cols": [
+    "vol_ratio_5_20",
+    "volume_ratio_20d",
+    "vol_cc_5d",
+    "vol_ratio_10_60",
+    "intraday_range",
+    "vol_parkinson_5d",
+    "volume_ratio_5d",
+    "vol_of_vol_10d",
+    "vol_cc_20d",
+    "vol_rank_20d",
+    "price_position_20d",
+    "vol_of_vol_20d",
+    "return_10d",
+    "volume_change_1d",
+    "log_return_5d",
+    "return_20d",
+    "vol_cc_60d",
+    "market_vol_20d",
+    "price_position_60d",
+    "drawdown_20d",
+    "body_ratio",
+    "market_return_1d",
+    "log_return_1d",
+    "drawdown_60d",
+    "return_rank_5d",
+    "relative_return_1d"
+  ],
+  "has_flow": false
+}

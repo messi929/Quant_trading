@@ -1,0 +1,175 @@
+# ============================================================
+# Vol Expansion Trader V3 — Unified Configuration
+# "변동성 팽창 예측 → 방향은 규칙 → 조건부 진입"
+# ============================================================
+
+project_name: "Vol Expansion Trader V3"
+version: "3.0.0"
+
+# ------------------------------------------------------------------
+# 경로
+# ------------------------------------------------------------------
+paths:
+  raw_data: "v3/data/raw"
+  processed_data: "v3/data/processed"
+  models: "v3/saved_models"
+  logs: "v3/logs"
+  results: "v3/results"
+  normalizer_stats: "v3/saved_models/normalizer_stats.json"
+
+# ------------------------------------------------------------------
+# GPU
+# ------------------------------------------------------------------
+gpu:
+  device: "cuda"
+  mixed_precision: true
+  memory_fraction: 0.85
+  compile_model: false
+
+# ------------------------------------------------------------------
+# 데이터
+# ------------------------------------------------------------------
+data:
+  markets: ["NASDAQ"]                  # v3.1: KOSPI 제외 (왕복 1% 비용 → vol전략 부적합)
+  history_years: 5
+  min_history_days: 250
+  sequence_length: 60
+  vol_prediction_horizon: 5        # 5일 forward vol 예측
+  vol_baseline_window: 20          # 20일 기준 vol
+  cross_sectional_target: true
+  kospi200_only: true
+  include_kosdaq: false
+  max_tickers: 350
+  normalize_clip: 5.0
+  train_ratio: 0.70
+  val_ratio: 0.15
+  test_ratio: 0.15
+
+# ------------------------------------------------------------------
+# 모델 (VolTransformer)
+# ------------------------------------------------------------------
+model:
+  d_model: 192
+  n_heads: 8
+  n_layers: 5
+  d_ff: 768
+  dropout: 0.1
+  max_seq_length: 60
+  pooling: "mean"
+  use_confidence_head: true
+
+# ------------------------------------------------------------------
+# 학습
+# ------------------------------------------------------------------
+training:
+  epochs: 60
+  early_stopping_patience: 20
+  batch_size: 256
+  learning_rate: 3.0e-5
+  weight_decay: 1.0e-5
+  scheduler: "cosine_warmup"
+  warmup_steps: 1000
+  max_grad_norm: 1.0
+  seed: 42
+  num_workers: 0
+  pin_memory: true
+  ranking_loss_weight: 0.6        # Huber 0.4 + ListMLE 0.6
+  confidence_loss_weight: 0.1
+
+# ------------------------------------------------------------------
+# 배포 게이트
+# ------------------------------------------------------------------
+gates:
+  min_vol_ic: 0.30                 # Vol IC < 0.30 → 배포 금지
+  min_vol_rank_ic: 0.20            # Vol Rank IC < 0.20 → 배포 금지
+  min_dir_acc: 0.55                # 방향 정확도 55% 미만 → 배포 금지
+  min_backtest_sharpe: 1.0         # Sharpe < 1.0 → 배포 금지
+
+# ------------------------------------------------------------------
+# 트레이딩
+# ------------------------------------------------------------------
+trading:
+  max_positions: 3
+  max_single_weight: 0.40
+  min_order_amount_krw: 5_000_000
+  max_trades_per_month: 5          # 월 5회 이하 (V2: 매일 → V3: 조건부)
+  max_hold_days: 5                 # 5일 보유 (V2: 3일)
+  profit_take_pct: 0.05
+  vol_contraction_exit_ratio: 0.70 # vol이 진입 시 70% 이하로 감소 → 청산
+  target_annual_vol: 0.15
+  volume_participation_max: 0.05
+  # v3.1 최적 파라미터 (Sharpe 1.65 스윕 결과)
+  min_vol_expansion: 0.05          # v3.0: 0.10 → v3.1: 0.05 (더 많은 기회)
+  min_confidence: 0.30             # v3.0: 0.40 → v3.1: 0.30 (진입 완화)
+  use_mae_stop: false              # v3.1: MAE 개별 스탑 제거 (V2.2 교훈 일치)
+
+  costs:
+    krx_roundtrip: 0.010           # KRX 왕복 1.0%
+    us_roundtrip: 0.001            # US 왕복 0.1%
+    krx_slippage: 0.003
+    us_slippage: 0.001
+    krx_commission: 0.0005
+    us_commission: 0.0001
+
+  direction_rules:
+    momentum_window: 20
+    momentum_weight: 0.5
+    flow_weight: 0.3
+    event_weight: 0.2
+    min_direction_clarity: 0.2       # v3.1: 0.3 → 0.2 (Sharpe 1.65 최적화)
+
+# ------------------------------------------------------------------
+# 리스크
+# ------------------------------------------------------------------
+risk:
+  daily_loss_limit: 0.015
+  total_loss_limit: 0.15
+  circuit_breaker:
+    caution: 0.05
+    warning: 0.10
+    high: 0.20
+    crisis: 0.30
+
+# ------------------------------------------------------------------
+# 시장 레짐
+# ------------------------------------------------------------------
+regime:
+  momentum_window: 20
+  vol_lookback: 60
+  vol_percentile_threshold: 0.80
+  bull_threshold: 0.05
+  bear_threshold: -0.08
+  bear_action: "cash"
+
+# ------------------------------------------------------------------
+# 스케줄
+# ------------------------------------------------------------------
+schedule:
+  kr:
+    data_collect: "06:00"
+    inference: "06:15"
+    execute: "09:30"
+    monitor_interval_min: 15
+    session_close: "15:20"
+  us:
+    inference: "22:00"
+    execute: "23:40"
+    monitor_interval_min: 15
+    session_close: "04:30"
+
+# ------------------------------------------------------------------
+# 브로커
+# ------------------------------------------------------------------
+broker:
+  mode: "sandbox"
+  paper_trading: true
+  token_expire_hours: 24
+
+# ------------------------------------------------------------------
+# 백테스트
+# ------------------------------------------------------------------
+backtest:
+  initial_capital: 100_000_000
+  walk_forward_train_days: 252
+  walk_forward_test_days: 63
+  walk_forward_step_days: 63

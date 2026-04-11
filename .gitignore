@@ -33,3 +33,11 @@ venv/
 .vscode/
 .idea/
 *.swp
+v3/data/raw/*.parquet
+v3/data/processed/*.parquet
+v3/saved_models/*.pt
+v3/saved_models/paper_account.json
+v3/saved_models/open_positions.json
+v3/saved_models/ticker_cooldown.json
+v3/logs/
+v3/results/
