@@ -595,3 +595,385 @@ ssh root@77.42.78.9 "systemctl stop quant-trading-v3 && rm -rf /opt/quant && mv 
    - 99종목 중 2~3종목만 진입, 나머지 87% 현금
    - 이것이 MDD 4%의 비결
 ```
+
+---
+
+## V3.2 — Phase 2 Regime/Alpha 재설계 (Phase 26, 2026-04-18)
+
+> **"Regime은 임계값 조작자가 아니라 알파 가중치 선택자"**
+>
+> Phase 1의 `threshold_multiplier`, `engine toggle`, 상속 변이 등 원칙
+> 위배 요소를 전면 제거하고, Two Sigma/AQR 컨벤션에 맞춰 재설계.
+
+### 재설계 동기
+
+V3.1 운영 7일(4/11~4/18) 관찰 결과, 연속 `volatile` 레짐 + CASH 지속으로
+QQQ +6% 급등장을 완전히 놓침. 원인 진단에서 발견된 **7가지 원칙 위배**:
+
+| # | 위치 | 문제 |
+|---|------|------|
+| P1 | `signal.py` `_apply_threshold_multiplier` | entry filter 필드 런타임 뮤테이션 |
+| P2 | `CrossAssetRegimeState(RegimeState)` | Liskov 위반, 필드 추가 상속 |
+| P3 | `RegimeConfig.engine` 토글 | 한 시스템 두 철학 공존 |
+| P4 | `live_pipeline._detect_regime` if/else | engine별 분기 |
+| P5 | `backtest/engine.py` 단독 regime | live-backtest 코드 불일치 |
+| P6 | vol 단일 알파 | "vol 팽창 없는 bull 랠리" 원천 차단 |
+| P7 | Phase 1 가중치 임의 지정 (0.20, 0.15) | 데이터 증거 없음 |
+
+### Phase 2 설계 7대 원칙
+
+1. **Single source of truth** — 진입은 `opportunity > cost × k` 단일 수식
+2. **직교·가산적 알파** — 여러 독립 알파 소스, 회귀에서 가중합만 다름
+3. **Regime = 알파 가중치 선택자** — threshold 조작 금지, 가중치 분포만 변경
+4. **Immutable data flow** — frozen dataclass, pure functions, 뮤테이션 제거
+5. **단순한 Regime 출력** — name, score, alpha_weights, position_scale만
+6. **Legacy 제거** — engine 토글 없음, 단일 경로
+7. **백테스트가 설계를 증명** — 모든 가중치/threshold는 과거 IC 학습 결과
+
+### 알파 분류 체계 (새로 도입)
+
+Two Sigma/AQR 컨벤션에 맞춰 **두 축으로 분리**:
+
+| 축 | 역할 | 출력 범위 | 현재 구성 |
+|----|------|----------|----------|
+| **DirectionalAlpha** | 수익률 예측 (signed) | [-0.1, 0.1] (5일 기대 초과수익률) | `trend`, `reversion` |
+| **ConvictionSource** | 확신도 예측 (unsigned) | [0, 1] | `vol` (VolTransformer 재분류) |
+
+**핵심 인식**: VolTransformer는 **Risk model**이지 Alpha model이 아니다.
+변동성 팽창은 "크기 예측"이지 "방향 예측"이 아니므로 signed return과 IC ≈ 0.
+직접 수익률 예측에 합치 않고, 대신 **다른 알파의 확신도를 modulate**.
+
+#### 수식
+
+```
+direction(ticker)   = Σ_a  w_a(regime) · α_a(ticker)       ∈ [-0.1, 0.1]
+conviction(ticker)  = Π_c  c_s(ticker)                      ∈ [0, 1]
+opportunity(ticker) = direction · conviction                ∈ [-0.1, 0.1]
+
+enter_if:  opportunity > cost × k    (k = 1.75)
+```
+
+### 매수 정책 — v3.2 개정
+
+#### 이전 (V3.1, Phase 1) — 10개 조건 게이트
+
+```
+C1: vol_score ≥ min_vol_expansion (0.05)
+C2: confidence ≥ min_confidence (0.30)
+C3: direction_clarity ≥ min_direction_clarity (0.20)
+C4: direction == "long"
+C5: monthly_trades < dynamic_max
+C6: current_positions < max_positions
+C7: circuit_breaker OFF
+C8: expected_move > cost × 1.75 (vol-adjusted)
+C9: ticker_volume ≥ min_volume
+C10: sector_concentration ≤ max_sector_conc
+```
+
+#### 이후 (V3.2, Phase 2) — 단일 알파 게이트 + 운영 제약
+
+```
+[알파 게이트] — OpportunityScorer (단일)
+  opportunity(ticker) > cost × 1.75
+
+[운영 제약] — EntryFilter (C5~C10을 재분류)
+  ✓ 포지션 한도 (max_positions)
+  ✓ 월 거래 한도 (dynamic, win_rate/mdd 반영)
+  ✓ Circuit breaker halt
+  ✓ 유동성 (daily_volume ≥ 5억)
+  ✓ 섹터 집중 (≤ 2 per sector)
+```
+
+**변경 본질**: 알파 관련 게이트(C1/C2/C3/C4/C8)를 **opportunity 단일 수식**에
+통합. 임계값 여러 개에 흩뿌려진 로직을 `edge > cost × k` 하나로.
+
+#### Regime별 진입 방식 차이
+
+**이전**: regime이 `threshold_multiplier`로 entry filter의 `min_vol_expansion`
+등을 동적 수정 (뮤테이션) → 원칙 위배.
+
+**이후**: regime은 **알파 가중치**만 결정. 게이트 자체는 고정:
+- strong_bull: alpha_weights 학습 결과 (예: reversion 1.0) → reversion 알파가
+  주도하는 opportunity → 그 기준 진입
+- bull/neutral/caution/bear: 각 regime이 자기 가중치로 opportunity 계산
+- bear: `position_scale=0 → CASH` 단락
+
+### 매도 정책 — V3 유지 (변경 없음)
+
+1. 시간감쇠 이익실현 (Day1 +5% ~ Day5 +1.5%)
+2. Vol 수축 (진입 vol의 70% 이하 3일 지속)
+3. 보유 만기 (5일)
+4. 포트폴리오 일간 -1.0~2.0% (배포 비례)
+
+### 포지션 사이징 — v3.2 개정
+
+#### position_scale 연속화
+
+Phase 1: discrete scale (bull 1.2, neutral 1.0, volatile 0.6, bear 0.0)
+Phase 2: **연속 score → smooth scale** (Bridgewater discrete + Medallion continuous 하이브리드)
+
+```
+POSITION_SCALE_CURVE (piecewise linear):
+  score 0.00 → 0.00  (bear = CASH)
+  score 0.25 → 0.30
+  score 0.40 → 0.60
+  score 0.55 → 0.90
+  score 0.75 → 1.10
+  score 1.00 → 1.20
+```
+
+**효과**: regime 전환 경계(0.54 ↔ 0.56)에서 포지션 쇼크 없음. 매끄러운 조절.
+
+#### Alpha weights (regime별)
+
+`v3/config/alpha_weights.json`에 저장 (S2 학습 결과). 최신 (2026-04-18, 3년 학습):
+
+```
+strong_bull: {trend: 0.0, reversion: 1.0}   # reversion IC=0.113 유일 양수
+bull:        {trend: 0.5, reversion: 0.5}   # IC 모두 게이트 미달 → uniform
+neutral:     {trend: 1.0, reversion: 0.0}   # trend IC=0.028 유일 유의미
+caution:     {trend: 0.5, reversion: 0.5}   # uniform
+bear:        {trend: 0.5, reversion: 0.5}   # uniform (CASH로 우회)
+```
+
+### Regime 시스템 — v3.2 재정의
+
+#### 역할 변경
+- **이전**: bull/bear 판정 → threshold 조작 (잘못된 설계)
+- **이후**: 5 state 분류 → **알파 가중치 선택 + position_scale 결정**
+
+#### Regime 5 state + continuous score
+
+| State | Score 범위 | 의미 | position_scale |
+|-------|----------|------|---------------|
+| strong_bull | ≥ 0.75 | 강한 위험선호 | ~1.10 |
+| bull | 0.55~0.75 | 위험선호 | ~0.90 |
+| neutral | 0.40~0.55 | 중립 | ~0.60 |
+| caution | 0.25~0.40 | 경계 | ~0.30 |
+| bear | < 0.25 | 위험회피 | 0 (CASH) |
+
+#### Composite score 계산
+
+7개 macro feature의 5년 rolling percentile을 **학습된 weights + signs**로 가중합.
+
+```
+score = Σ  w_f × (pctl_f  if sign_f == +1  else  1 - pctl_f)
+```
+
+#### 학습된 feature_signs (3년 NASDAQ 2023~2026, contrarian 패턴)
+
+```
++1 (percentile 그대로 기여):    vix_ratio, hy_level, gold_spy_mom_60d
+-1 (1 - percentile 반전):       yc_slope, hy_change_60d, dxy_mom_60d,
+                                hyg_tlt_mom_60d, breadth
+```
+
+**해석**: 최근 3년은 NASDAQ 상승장 → "vix 높고 HY 넓으면 반등"(contrarian),
+"breadth 높으면 과열"(mean-revert) 패턴이 학습됨. 데이터 기반 결과이므로 존중
+하되, 시장 국면 변화 시 월 재학습에서 자동 수정됨.
+
+### 알파 가중치 학습 정책
+
+#### 월 재학습 + 3년 rolling
+
+- **주기**: 매월 1일 재학습 (분기는 regime shift 반영 느림)
+- **Lookback**: 3년 (더 길면 구체제 편향, 짧으면 noise)
+- **파일**: `v3/config/alpha_weights.json` (latest) +
+  `v3/config/alpha_weights_history/alpha_weights_YYYY-MM.json` (versioned)
+- **수동 실행**: `python v3/backtest/alpha_weight_trainer.py --lookback-years 3`
+
+#### 3-step bootstrap (원칙 7 구현)
+
+```
+A. Vanilla IC — 각 directional alpha의 전체 기간 IC 측정 (baseline edge)
+   · MIN_VANILLA_IC = 0.02  (노이즈 vs 신호 구분)
+   · vanilla_ic_pass = false 여도 저장 (정직 기록)
+
+B. Regime 분류 — 7개 macro feature의 stand-alone IC로 composite weights 산출
+   · feature vs 시장 forward return Spearman 측정
+   · max(|IC|, 0) / total 정규화 → feature_weights
+   · sign(IC) 저장 → feature_signs
+
+C. Conditional IC — 각 regime 내에서 alpha × return IC 재측정
+   · 최소 40 샘플 미달 regime → uniform fallback
+   · weight = max(IC - 0.02, 0) / total  (shrinkage로 노이즈 차단)
+   · 전부 게이트 미달 → uniform weights
+```
+
+#### Conviction accuracy (별도 측정, 가중치 학습 아님)
+
+```
+expansion_ic = Spearman(vol_conviction, realized_5d_vol / past_20d_vol - 1)
+             = 0.1899  (VolTransformer 훈련 타겟과 일치 측정)
+
+level_ic     = Spearman(vol_conviction, realized_5d_vol)
+             = 0.0358  (참고값, 사용 안 함)
+```
+
+### 백테스트-라이브 정합성 강화
+
+#### 이전 (V3.1) — 다른 코드 경로
+- `live_pipeline` → `RegimeDetector` + `DirectionEngine` + `EntryFilter`
+- `backtest/engine.py` → **동일하지만 재구현** (불일치 리스크)
+
+#### 이후 (V3.2) — 단일 코드 경로
+- 양쪽 모두 동일한 `SignalGenerator`(v3/strategy/signal.py) 호출
+- 동일한 `OpportunityScorer`, 동일한 `EntryFilter`, 동일한 `RegimeDetectorV2`
+- 차이점은 오직 "데이터 공급 방식"(live=실시간, backtest=과거 replay)
+
+### 게이트 수정 사항
+
+| 게이트 | 이전 (V3.1) | 이후 (V3.2) |
+|--------|------------|-------------|
+| 알파 진입 임계값 | `min_vol_expansion=0.05, min_confidence=0.30, min_direction_clarity=0.20` | **제거**. `opportunity > cost × 1.75` 하나 |
+| Vanilla IC | 없음 | `MIN_VANILLA_IC = 0.02` (게이트 통과 실패도 기록) |
+| Conditional IC shrinkage | 없음 | `max(IC - 0.02, 0)` (노이즈 레벨 기각) |
+| Regime 샘플 최소 | 없음 | 40개 미달 regime → uniform fallback |
+| Feature signs | 하드코딩 (Phase 1 patch) | **학습 기반** (artifact에 저장) |
+
+### 코드 구조 변경 일람
+
+#### 신규 파일 (4개)
+
+```
+v3/strategy/alpha_sources.py       — AlphaSource, ConvictionSource ABC + 구현
+v3/strategy/opportunity.py         — OpportunityScorer (stateless pure function)
+v3/strategy/regime_v2.py           — @dataclass(frozen=True) Regime + detector
+v3/backtest/alpha_weight_trainer.py — 월 재학습 트레이너
+```
+
+#### 신규 설정/데이터 (2개)
+
+```
+v3/config/alpha_weights.json                           (latest)
+v3/config/alpha_weights_history/alpha_weights_YYYY-MM.json (monthly version)
+```
+
+#### 재작성 파일 (4개)
+
+```
+v3/strategy/signal.py        — SignalGenerator 재작성, _apply_threshold_multiplier 제거
+v3/rules/entry.py            — EntryFilter 재작성 (운영 제약 5개만)
+v3/pipeline/live_pipeline.py — engine toggle 제거, 단일 경로
+v3/backtest/engine.py        — SignalGenerator 재사용 (live parity)
+```
+
+#### 아카이브 (_legacy/)
+
+```
+v3/strategy/_legacy/regime_single_asset.py   (이전: regime.py)
+v3/strategy/_legacy/regime_cross_asset.py    (Phase 1 patch)
+v3/pipeline/_legacy/inference_pipeline.py    (미사용, 정리)
+v3/backtest/_legacy/engine_phase1.py         (이전 engine.py)
+```
+
+#### Config 정리
+
+```
+v3/config/schema.py     — RegimeConfig.engine 토글 필드 제거
+                          legacy single_asset 필드 (bull_threshold 등) 제거
+                          hysteresis_days + macro_history_years만 유지
+v3/config/v3_config.yaml — 위와 동일, yaml에서도 정리
+```
+
+### 검증 결과 (2026-04-18)
+
+#### S2 학습 결과
+- Panel: 14,817 rows (150 dates × 99 tickers, weekly × 3y)
+- Regime counts: neutral 7411, caution 4736, bull 2175, bear 297, strong_bull 198
+- Vanilla IC: trend 0.014, reversion -0.010 (둘 다 게이트 미달, 정직 기록)
+- Conditional IC: strong_bull reversion **+0.113** (유일 유의미), neutral trend +0.028
+- Conviction accuracy: vol expansion_ic **0.19**
+
+#### 실데이터 검증 (로컬·서버 동일)
+- Regime: `caution`, score=0.33, scale=0.47, weights uniform
+- 99 tickers → opportunity gate **10개 통과** (gate=0.00175)
+- FANG 선정: direction=0.035, conviction=0.657, **opportunity=0.023** (gate의 13배)
+
+### 제거된 요소 (Phase 1)
+
+```
+[제거] signal.py::_apply_threshold_multiplier (뮤테이션)
+[제거] signal.py::_base_thresholds 캐시 (몽키패치)
+[제거] CrossAssetRegimeState(RegimeState) 상속 (Liskov 위반)
+[제거] RegimeConfig.engine 토글 필드 (두 철학 공존)
+[제거] live_pipeline._detect_regime() if/else 분기 (단일 경로로)
+[제거] schema.py::apply_threshold_multiplier 플래그
+[제거] v3_config.yaml legacy regime 필드 (bull/bear_threshold 등)
+[아카이브] v3/strategy/regime.py → _legacy/
+[아카이브] v3/strategy/regime_cross_asset.py → _legacy/
+[아카이브] v3/pipeline/inference_pipeline.py → _legacy/
+[아카이브] v3/backtest/engine.py (phase1) → _legacy/
+```
+
+### 운영 명령 (V3.2)
+
+```bash
+PYTHON=/c/Users/wogus/miniconda3/envs/quant/python.exe
+FRED_API_KEY=... # .env에서 로드
+
+# 월 재학습 (매월 1일 실행 권장)
+PYTHONPATH=. $PYTHON v3/backtest/alpha_weight_trainer.py --lookback-years 3
+
+# 로컬 smoke test
+PYTHONPATH=. $PYTHON -c "
+from v3.pipeline.live_pipeline import LivePipeline
+p = LivePipeline()
+df = p.collect_data()
+print(p.generate_signal(df))"
+
+# 서버 배포 (파일별 scp, rsync 없음)
+scp v3/strategy/alpha_sources.py v3/strategy/regime_v2.py \
+    v3/strategy/opportunity.py v3/strategy/signal.py \
+    root@77.42.78.9:/opt/quant/v3/strategy/
+scp v3/rules/entry.py root@77.42.78.9:/opt/quant/v3/rules/
+scp v3/pipeline/live_pipeline.py root@77.42.78.9:/opt/quant/v3/pipeline/
+scp v3/backtest/engine.py v3/backtest/alpha_weight_trainer.py \
+    root@77.42.78.9:/opt/quant/v3/backtest/
+scp v3/config/schema.py v3/config/v3_config.yaml v3/config/alpha_weights.json \
+    root@77.42.78.9:/opt/quant/v3/config/
+
+# 서비스 재시작
+ssh root@77.42.78.9 "systemctl restart quant-trading-v3"
+
+# Paper trading 관찰 (일일)
+ssh root@77.42.78.9 "tail -100 /opt/quant/v3/logs/v3_$(date +%Y-%m-%d).log | \
+    grep -E 'Regime|Signal|Opportunity'"
+```
+
+### Phase 2 커밋 체인
+
+```
+9ebff71  feat: S1 — alpha_sources.py (3 independent alphas, Phase 2)
+d4f5276  feat: S1+S2 revised — alpha/conviction separation, regime-conditional IC
+5ddbd75  feat: S3 — regime_v2.py frozen Regime detector + artifact export
+843cbc4  feat: S4 — opportunity scorer + signal/entry rewrite + live_pipeline
+bfea53e  feat: S5 — backtest/engine.py Phase 2 rewrite + legacy archive
+```
+
+### V3.2 추가 교훈
+
+```
+6. 알파와 리스크를 혼동하지 말라
+   - VolTransformer는 vol 예측 (risk model), 수익률 예측 아님
+   - Alpha model ≠ Risk model (Two Sigma 컨벤션)
+   - conviction으로 modulate, 직접 가중합 금지
+
+7. 임계값은 수학적 안전계수만, 정책 레버 아님
+   - k=1.75 (cost multiplier)는 고정 수학값 (보수적 기대수익 요구)
+   - Regime은 threshold 조작 금지, 가중치만 조절
+   - "매개변수 튜닝"으로 기회를 만들지 말 것
+
+8. Shrinkage는 과적합 방어의 핵심
+   - Conditional IC 0.03 → 100% weight (과적합)
+   - max(IC - 0.02, 0) 적용 → uniform fallback (보수적)
+   - 노이즈 레벨 edge로 포지션 잡지 말기
+
+9. 백테스트와 라이브는 동일 함수를 호출해야 한다
+   - 두 세계 다른 코드 = 결과 불일치 = 라이브 손실
+   - `SignalGenerator` 하나를 양쪽에서 재사용
+
+10. 설계 원칙 위배는 나중에 비싸게 돌려받는다
+    - Phase 1 threshold_multiplier 패치 → 1주간 CASH, 급등장 놓침
+    - 패치 누적 금지, 원칙 훼손 발견 즉시 재설계
+```
