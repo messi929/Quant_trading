@@ -71,6 +71,10 @@ class SignalGenerator:
                 n_rejected=len(vol_scores), rejection_reasons={"bear_regime": len(vol_scores)},
             )
 
+        # Apply regime-based threshold_multiplier to entry filter (CrossAssetRegimeState only)
+        thresh_mult = getattr(regime_state, "threshold_multiplier", 1.0) if regime_state else 1.0
+        self._apply_threshold_multiplier(thresh_mult)
+
         # Step 1: Direction evaluation with regime
         direction_signals = self.direction.evaluate_batch(full_data, event_scores, regime=regime)
 
@@ -159,6 +163,32 @@ class SignalGenerator:
             n_rejected=len(vol_scores) - len(ranked),
             rejection_reasons=rejections,
         )
+
+    def _apply_threshold_multiplier(self, mult: float) -> None:
+        """Adjust entry filter thresholds by regime multiplier (in-place).
+
+        mult < 1.0 (strong_bull): relax thresholds → more entries
+        mult > 1.0 (caution):     tighten thresholds → fewer entries
+        """
+        if abs(mult - 1.0) < 1e-6:
+            return
+
+        # Cache base thresholds on first call
+        if not hasattr(self.entry, "_base_thresholds"):
+            self.entry._base_thresholds = {
+                "min_vol_expansion": self.entry.min_vol_expansion,
+                "min_confidence": self.entry.min_confidence,
+                "min_clarity": self.entry.min_clarity,
+            }
+
+        base = self.entry._base_thresholds
+        self.entry.min_vol_expansion = max(0.01, base["min_vol_expansion"] * mult)
+        self.entry.min_confidence = max(0.10, base["min_confidence"] * mult)
+        self.entry.min_clarity = max(0.05, base["min_clarity"] * mult)
+        logger.info(f"Entry thresholds × {mult:.2f}: "
+                     f"vol={self.entry.min_vol_expansion:.3f}, "
+                     f"conf={self.entry.min_confidence:.3f}, "
+                     f"clarity={self.entry.min_clarity:.3f}")
 
     def _size_with_vol_target(self, candidates: list[dict], regime_scale: float) -> list[dict]:
         """Size using VolTargetSizer with regime scaling."""

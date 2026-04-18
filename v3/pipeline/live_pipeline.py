@@ -9,6 +9,8 @@ from loguru import logger
 
 from v3.config.schema import V3Config, load_config
 from v3.data.collector import OHLCVCollector
+from v3.data.macro_collector import MacroCollector
+from v3.data.macro_features import MacroFeatureEngineer
 from v3.data.universe import Universe
 from v3.data.feature_engineer import VolFeatureEngineer
 from v3.data.normalizer import FeatureNormalizer
@@ -20,6 +22,7 @@ from v3.rules.entry import EntryFilter
 from v3.strategy.signal import SignalGenerator
 from v3.strategy.sizing import VolTargetSizer
 from v3.strategy.regime import RegimeDetector
+from v3.strategy.regime_cross_asset import CrossAssetRegimeDetector
 from v3.execution.executor import TradingExecutor
 from v3.utils.device import DeviceManager
 from v3.utils.storage import StorageManager
@@ -80,7 +83,23 @@ class LivePipeline:
         )
         sizer = VolTargetSizer(target_annual_vol=self.cfg.trading.target_annual_vol)
         self.signal_gen = SignalGenerator(direction_engine, entry_filter, sizer)
-        self.regime_detector = RegimeDetector()
+
+        # Regime engine: cross_asset(신규) or single_asset(legacy)
+        if self.cfg.regime.engine == "cross_asset":
+            self.macro_collector = MacroCollector(
+                save_dir=self.cfg.paths.raw_data,
+                history_years=self.cfg.regime.macro_history_years,
+            )
+            self.macro_features = MacroFeatureEngineer()
+            self.regime_detector = CrossAssetRegimeDetector(
+                hysteresis_days=self.cfg.regime.hysteresis_days,
+            )
+            logger.info("Regime engine: cross_asset (multi-signal composite)")
+        else:
+            self.macro_collector = None
+            self.macro_features = None
+            self.regime_detector = RegimeDetector()
+            logger.info("Regime engine: single_asset (legacy)")
 
         # Execution
         self.executor = TradingExecutor(self.cfg)
@@ -112,10 +131,15 @@ class LivePipeline:
         vol_scores = self.inference.predict(df)
 
         # Regime detection
-        market_data = df.groupby("date").agg(close=("close", "mean")).reset_index().sort_values("date")
-        regime_state = self.regime_detector.detect(market_data)
-        logger.info(f"Regime: {regime_state.regime} (momentum={regime_state.momentum:.2%}, "
-                     f"vol={regime_state.volatility:.2%})")
+        regime_state = self._detect_regime(df)
+        if self.cfg.regime.engine == "cross_asset":
+            logger.info(f"Regime: {regime_state.regime} score={regime_state.score:.2f} "
+                         f"scale={regime_state.scale_factor:.2f} "
+                         f"thresh_mult={regime_state.threshold_multiplier:.2f} "
+                         f"contribs={regime_state.contributions}")
+        else:
+            logger.info(f"Regime: {regime_state.regime} (momentum={regime_state.momentum:.2%}, "
+                         f"vol={regime_state.volatility:.2%})")
 
         # DART events
         event_scores = {}
@@ -146,6 +170,32 @@ class LivePipeline:
             "regime": signal.regime,
             "cash_weight": signal.cash_weight,
         }
+
+    def _detect_regime(self, ohlcv: pd.DataFrame):
+        """Dispatch to single_asset or cross_asset regime engine."""
+        if self.cfg.regime.engine == "cross_asset" and self.macro_collector is not None:
+            # Collect latest macro (incremental 90d)
+            existing = self.macro_collector.load()
+            if existing is None or len(existing) < 60:
+                macro = self.macro_collector.collect()
+            else:
+                macro = self.macro_collector.collect(incremental_days=90)
+
+            # Compute features + percentiles
+            feats = self.macro_features.compute(macro, ohlcv)
+            pctl = self.macro_features.compute_percentiles(feats)
+
+            # Warm up hysteresis by replaying last 5 days (first startup only)
+            if self.regime_detector._days_in_regime == 0 and len(pctl) >= 5:
+                for i in range(-5, 0):
+                    self.regime_detector.detect(pctl.iloc[: len(pctl) + i + 1 if i < -1 else None])
+            return self.regime_detector.detect(pctl)
+
+        # Legacy single-asset fallback
+        market_data = ohlcv.groupby("date").agg(
+            close=("close", "mean")
+        ).reset_index().sort_values("date")
+        return self.regime_detector.detect(market_data)
 
     def execute(self, signal: dict) -> list[dict]:
         """Execute trading signal."""

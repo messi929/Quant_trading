@@ -89,7 +89,7 @@ gates:
 # 트레이딩
 # ------------------------------------------------------------------
 trading:
-  max_positions: 3
+  max_positions: 1                 # v3.1-safe: 3→1 (실거래 미검증, paper 보수 운영)
   max_single_weight: 0.40
   min_order_amount_krw: 5_000_000
   max_trades_per_month: 5          # 월 5회 이하 (V2: 매일 → V3: 조건부)
@@ -122,7 +122,7 @@ trading:
 # 리스크
 # ------------------------------------------------------------------
 risk:
-  daily_loss_limit: 0.015
+  daily_loss_limit: 0.005          # v3.1-safe: 0.015→0.005 (paper 검증 중 타이트)
   total_loss_limit: 0.15
   circuit_breaker:
     caution: 0.05
@@ -134,12 +134,18 @@ risk:
 # 시장 레짐
 # ------------------------------------------------------------------
 regime:
+  engine: "cross_asset"             # "single_asset"(legacy) | "cross_asset"(신규)
+  # Legacy single-asset params (fallback용, engine=single_asset일 때만 사용)
   momentum_window: 20
   vol_lookback: 60
   vol_percentile_threshold: 0.80
   bull_threshold: 0.05
   bear_threshold: -0.08
   bear_action: "cash"
+  # Cross-asset regime params
+  hysteresis_days: 2                # 2일 확인 후 레짐 전환
+  macro_history_years: 5            # 5년 rolling percentile
+  apply_threshold_multiplier: true  # regime별 entry threshold 자동 조절
 
 # ------------------------------------------------------------------
 # 스케줄
