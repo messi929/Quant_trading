@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-04-18T15:02:43",
+  "generated_at": "2026-04-18T15:25:15",
   "anchor_date": "2026-04-18",
   "window_start": "2023-04-19",
   "lookback_years": 3.0,
@@ -77,6 +77,35 @@
       "expansion_ic": 0.1899,
       "sample_size": 14817,
       "level_ic": 0.0358
+    }
+  },
+  "regime_composite": {
+    "feature_weights": {
+      "vix_ratio": 0.2217724244247369,
+      "yc_slope": 0.036491480689025496,
+      "hy_level": 0.24850018917040526,
+      "hy_change_60d": 0.020275532877840775,
+      "dxy_mom_60d": 0.1547353715012127,
+      "gold_spy_mom_60d": 0.007934263150338247,
+      "hyg_tlt_mom_60d": 0.15085074324311532,
+      "breadth": 0.15943999494332536
+    },
+    "feature_signs": {
+      "vix_ratio": 1.0,
+      "yc_slope": -1.0,
+      "hy_level": 1.0,
+      "hy_change_60d": -1.0,
+      "dxy_mom_60d": -1.0,
+      "gold_spy_mom_60d": 1.0,
+      "hyg_tlt_mom_60d": -1.0,
+      "breadth": -1.0
+    },
+    "thresholds": {
+      "strong_bull": 0.75,
+      "bull": 0.55,
+      "neutral": 0.4,
+      "caution": 0.25,
+      "bear": 0.0
     }
   }
 }

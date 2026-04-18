@@ -174,6 +174,9 @@ class AlphaWeightTrainer:
         )
         if panel.empty:
             raise RuntimeError("Empty panel — insufficient data or window too tight")
+        # Capture regime composite config for artifact export
+        self._regime_feature_weights = getattr(self, "_regime_feat_weights_used", {})
+        self._regime_feature_signs = getattr(self, "_feature_ic_signs", {})
         logger.info(
             f"Panel: {len(panel)} rows, {panel['date'].nunique()} dates, "
             f"{panel['ticker'].nunique()} tickers"
@@ -256,6 +259,7 @@ class AlphaWeightTrainer:
             forward_horizon=forward_horizon,
         )
         logger.info(f"Feature weights (macro stand-alone IC): {regime_feat_weights}")
+        self._regime_feat_weights_used = dict(regime_feat_weights)
         regime_series = self._classify_regimes(macro_pctl, regime_feat_weights)
 
         # Wide-form close for return and realized-vol calculations
@@ -601,6 +605,12 @@ class AlphaWeightTrainer:
             "conditional_ic": conditional_ic,
             "directional_weights": directional_weights,
             "conviction_metrics": conviction_metrics,
+            # Regime composite config (used by S3 RegimeDetectorV2)
+            "regime_composite": {
+                "feature_weights": getattr(self, "_regime_feature_weights", {}),
+                "feature_signs": getattr(self, "_regime_feature_signs", {}),
+                "thresholds": {name: lb for lb, name in REGIME_THRESHOLDS},
+            },
         }
 
         latest_path = config_dir / "alpha_weights.json"
