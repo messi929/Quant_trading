@@ -1,22 +1,29 @@
-"""Alpha sources — independent edge generators (Phase 2 S1).
+"""Alpha & conviction sources — separated by role (Phase 2 S1 revised).
 
-Three initial alpha sources, each producing scores in **5-day expected excess
-return** units (approximately [-0.1, 0.1] range):
+This module distinguishes two kinds of signals (Two Sigma / AQR convention):
 
-  - AlphaVol:       Vol-expansion edge (from VolTransformer)
-  - AlphaTrend:     Multi-period momentum (5/20/60d blend)
-  - AlphaReversion: Mean-reversion from SMA20
+  1. Directional alphas — predict RETURN, signed, [-0.1, 0.1] expected 5-day
+     excess return. Linearly combined with regime-conditional weights.
+       * AlphaTrend        (momentum, multi-period)
+       * AlphaReversion    (mean-reversion from SMA)
+       * (future: AlphaFlow, AlphaSentiment, ... gated by IC)
 
-Design principles (Phase 2):
+  2. Conviction sources — predict MAGNITUDE/CONFIDENCE, unsigned, [0, 1].
+     Used as a multiplier on directional score, NOT linearly combined.
+       * VolConviction     (VolTransformer vol_score percentile rank)
+
+Opportunity formula (implemented in S4 opportunity.py):
+    direction = Σ  w_regime(a) · α_a(ticker)   ∈ [-0.1, 0.1]
+    conviction = Π  c_s(ticker)                 ∈ [0, 1]
+    opportunity = direction × conviction        ∈ [-0.1, 0.1]
+
+    enter if  opportunity > cost × k  (k ≈ 1.75)
+
+Design principles (unchanged from Phase 2 spec):
   1. Pure functions — no mutation, no side effects
-  2. Independent — each alpha is self-contained, unaware of others
-  3. Same output unit — 5-day expected excess return
-  4. Cross-sectionally normalized where appropriate
-  5. Protocol-based — extend via AlphaSource subclass, no modification needed
-
-Evidence policy (CLAUDE.md "Evidence > assumptions"):
-  Additional alphas (vol_of_vol, earnings_drift, breadth_divergence, …)
-  will be added in S2 ONLY after IC measurement confirms their edge.
+  2. Independent — each source is self-contained
+  3. Units explicit — directional in return units, conviction in [0, 1]
+  4. Protocol-based — extend via subclass, no modification needed
 """
 
 from __future__ import annotations
@@ -28,92 +35,47 @@ import pandas as pd
 from loguru import logger
 
 
-# Target scale: approximate symmetric range for a 5-day expected excess return.
-# Empirical: well-behaved alphas fall within ±0.05 (±5%), extreme values within ±0.10.
+# Target scale for directional alphas: approximate 5-day expected excess return.
 ALPHA_SCALE: float = 0.10
 
 
+# ──────────────────────────────────────────────────────────────
+# Base classes
+# ──────────────────────────────────────────────────────────────
 class AlphaSource(ABC):
-    """Abstract base class for a single alpha signal source.
-
-    Subclasses MUST:
-      - Override `name` (unique, lowercase, short)
-      - Override `compute` (return pd.Series indexed by ticker)
-      - NOT mutate inputs
-      - NOT depend on other alpha sources
-    """
+    """Signed directional alpha: predicts RETURN in [-0.1, 0.1] units."""
 
     @property
     @abstractmethod
     def name(self) -> str:
-        """Unique short identifier (e.g., 'vol', 'trend', 'reversion')."""
+        """Unique short identifier (e.g., 'trend', 'reversion')."""
 
     @abstractmethod
     def compute(self, ohlcv: pd.DataFrame, **kwargs) -> pd.Series:
-        """Compute alpha scores for all tickers available in ohlcv.
-
-        Args:
-            ohlcv: Long-format OHLCV with columns [date, ticker, close, ...].
-            **kwargs: Alpha-specific side data (e.g., vol_scores for AlphaVol).
-
-        Returns:
-            pd.Series indexed by ticker, values in ~[-0.1, 0.1].
-            Tickers without sufficient data are omitted (NOT filled with NaN
-            — downstream code must handle missing tickers via reindex).
-        """
+        """Return pd.Series indexed by ticker, values approximately in [-0.1, 0.1]."""
 
 
-# ──────────────────────────────────────────────────────────────
-# AlphaVol — vol expansion edge
-# ──────────────────────────────────────────────────────────────
-class AlphaVol(AlphaSource):
-    """Vol-expansion alpha from a VolTransformer-style predictor.
-
-    The input `vol_scores` DataFrame is produced by V3's VolInference and
-    contains columns [ticker, vol_score, confidence].
-
-    This alpha is DIRECTIONLESS by construction (vol expansion = larger
-    absolute moves, positive or negative). Direction is contributed by
-    AlphaTrend/AlphaReversion. Here we only convert cross-sectional rank
-    of vol_score into expected-return units.
-    """
+class ConvictionSource(ABC):
+    """Unsigned conviction signal: predicts MAGNITUDE/CONFIDENCE in [0, 1]."""
 
     @property
+    @abstractmethod
     def name(self) -> str:
-        return "vol"
+        """Unique short identifier (e.g., 'vol')."""
 
-    def compute(
-        self,
-        ohlcv: pd.DataFrame,  # noqa: ARG002 (kept for interface)
-        vol_scores: pd.DataFrame | None = None,
-        **_: object,
-    ) -> pd.Series:
-        if vol_scores is None or len(vol_scores) == 0:
-            return pd.Series(dtype=float)
-
-        if "ticker" not in vol_scores.columns or "vol_score" not in vol_scores.columns:
-            raise ValueError(
-                "AlphaVol.compute: vol_scores must have 'ticker' and 'vol_score' columns"
-            )
-
-        scores = vol_scores.set_index("ticker")["vol_score"].astype(float)
-        if scores.empty:
-            return pd.Series(dtype=float)
-
-        # Cross-sectional percentile rank → symmetric around 0
-        # rank(pct=True) yields (0, 1]; shift to (-0.5, 0.5]; scale to (-0.1, 0.1].
-        ranks = scores.rank(pct=True, method="average")
-        return ((ranks - 0.5) * 2.0 * ALPHA_SCALE).rename(self.name)
+    @abstractmethod
+    def compute(self, ohlcv: pd.DataFrame, **kwargs) -> pd.Series:
+        """Return pd.Series indexed by ticker, values in [0, 1]."""
 
 
 # ──────────────────────────────────────────────────────────────
-# AlphaTrend — multi-period momentum
+# Directional alphas
 # ──────────────────────────────────────────────────────────────
 class AlphaTrend(AlphaSource):
     """Multi-period momentum alpha.
 
-    Blends returns over several lookback windows (5/20/60d default), then
-    applies cross-sectional z-score + tanh to produce bounded signed output.
+    Blends returns over several lookback windows (5/20/60d), then applies
+    cross-sectional z-score and tanh to produce bounded signed output.
     """
 
     def __init__(self, periods: tuple[int, ...] = (5, 20, 60)):
@@ -128,53 +90,40 @@ class AlphaTrend(AlphaSource):
 
     def compute(self, ohlcv: pd.DataFrame, **_: object) -> pd.Series:
         if ohlcv.empty:
-            return pd.Series(dtype=float)
+            return pd.Series(dtype=float, name=self.name)
 
-        # Avoid mutation: take a sorted view
         df = ohlcv[["date", "ticker", "close"]].sort_values(["ticker", "date"])
-
         raw: dict[str, float] = {}
         for ticker, group in df.groupby("ticker", sort=False):
             close = group["close"].to_numpy(dtype=float)
             if len(close) < self._max_period + 1:
                 continue
-
             returns: list[float] = []
             for p in self.periods:
                 base = close[-p - 1]
                 if base <= 0 or not np.isfinite(base):
                     continue
                 returns.append(float(close[-1] / base - 1.0))
-
-            if not returns:
-                continue
-            raw[ticker] = float(np.mean(returns))
+            if returns:
+                raw[ticker] = float(np.mean(returns))
 
         if not raw:
             return pd.Series(dtype=float, name=self.name)
 
         s = pd.Series(raw, dtype=float)
-        # Cross-sectional z-score (robust to constant input)
         std = s.std(ddof=0)
         if std < 1e-12:
             return pd.Series(0.0, index=s.index, name=self.name)
 
         z = (s - s.mean()) / std
-        # Tanh compresses extremes; divide-by-2 softens so ±1σ ≈ ±0.46
         return (np.tanh(z / 2.0) * ALPHA_SCALE).rename(self.name)
 
 
-# ──────────────────────────────────────────────────────────────
-# AlphaReversion — mean-reversion from moving average
-# ──────────────────────────────────────────────────────────────
 class AlphaReversion(AlphaSource):
     """Mean-reversion alpha based on z-score of close vs SMA(window).
 
-    Overbought (z > 0) implies expected NEGATIVE 5-day return → negative alpha.
-    Oversold (z < 0) implies expected POSITIVE 5-day return → positive alpha.
-
-    The raw z-score is divided by `extreme_z` (default 2.0) before tanh, so
-    a 2σ deviation maps to |alpha| ≈ 0.076.
+    Overbought (z > 0) → expected NEGATIVE 5-day return → negative alpha.
+    Oversold (z < 0) → expected POSITIVE 5-day return → positive alpha.
     """
 
     def __init__(self, window: int = 20, extreme_z: float = 2.0):
@@ -191,76 +140,91 @@ class AlphaReversion(AlphaSource):
 
     def compute(self, ohlcv: pd.DataFrame, **_: object) -> pd.Series:
         if ohlcv.empty:
-            return pd.Series(dtype=float)
+            return pd.Series(dtype=float, name=self.name)
 
         df = ohlcv[["date", "ticker", "close"]].sort_values(["ticker", "date"])
-
         alphas: dict[str, float] = {}
         for ticker, group in df.groupby("ticker", sort=False):
             close = group["close"].to_numpy(dtype=float)
             if len(close) < self.window + 1:
                 continue
-
             window_slice = close[-self.window:]
             sma = float(window_slice.mean())
             if sma <= 0 or not np.isfinite(sma):
                 continue
-
             std_pct = float(window_slice.std(ddof=0) / sma)
             if std_pct < 1e-8:
                 alphas[ticker] = 0.0
                 continue
-
             current = float(close[-1])
-            pct_deviation = (current - sma) / sma
-            z = pct_deviation / std_pct
-
-            # Mean-reversion: negate z; overbought → negative expected return
+            z = ((current - sma) / sma) / std_pct
             alphas[ticker] = float(-np.tanh(z / self.extreme_z) * ALPHA_SCALE)
 
         return pd.Series(alphas, dtype=float, name=self.name)
 
 
 # ──────────────────────────────────────────────────────────────
-# Orchestrator
+# Conviction sources
 # ──────────────────────────────────────────────────────────────
-DEFAULT_SOURCES: tuple[AlphaSource, ...] = (
-    AlphaVol(),
+class VolConviction(ConvictionSource):
+    """Conviction from VolTransformer vol_score.
+
+    Cross-sectional percentile rank of predicted vol expansion, producing
+    values in [0, 1]. Higher = larger expected move (direction-agnostic).
+
+    This is NOT a return predictor; it modulates conviction in directional
+    alphas. The VolTransformer output is a risk model, not an alpha model.
+    """
+
+    @property
+    def name(self) -> str:
+        return "vol"
+
+    def compute(
+        self,
+        ohlcv: pd.DataFrame,  # noqa: ARG002
+        vol_scores: pd.DataFrame | None = None,
+        **_: object,
+    ) -> pd.Series:
+        if vol_scores is None or len(vol_scores) == 0:
+            return pd.Series(dtype=float, name=self.name)
+        if "ticker" not in vol_scores.columns or "vol_score" not in vol_scores.columns:
+            raise ValueError(
+                "VolConviction.compute: vol_scores needs 'ticker' and 'vol_score' columns"
+            )
+
+        scores = vol_scores.set_index("ticker")["vol_score"].astype(float)
+        if scores.empty:
+            return pd.Series(dtype=float, name=self.name)
+
+        # Cross-sectional percentile rank in [0, 1]
+        return scores.rank(pct=True, method="average").rename(self.name).astype(float)
+
+
+# ──────────────────────────────────────────────────────────────
+# Defaults & orchestration
+# ──────────────────────────────────────────────────────────────
+DEFAULT_DIRECTIONAL: tuple[AlphaSource, ...] = (
     AlphaTrend(),
     AlphaReversion(),
 )
 
+DEFAULT_CONVICTION: tuple[ConvictionSource, ...] = (
+    VolConviction(),
+)
 
-def compute_all(
+
+def compute_directional(
     ohlcv: pd.DataFrame,
-    vol_scores: pd.DataFrame | None = None,
-    sources: tuple[AlphaSource, ...] = DEFAULT_SOURCES,
+    sources: tuple[AlphaSource, ...] = DEFAULT_DIRECTIONAL,
 ) -> pd.DataFrame:
-    """Compute every alpha source and return a (ticker × alpha) DataFrame.
-
-    Args:
-        ohlcv: Long-format OHLCV with [date, ticker, close, ...].
-        vol_scores: Output from VolInference (ticker, vol_score, confidence).
-        sources: Iterable of AlphaSource instances. Defaults to all three.
-
-    Returns:
-        DataFrame indexed by ticker, columns = [source.name for source in sources].
-        Tickers missing from any source are NaN for that column (outer join).
-    """
-    columns: dict[str, pd.Series] = {}
-    for src in sources:
-        kwargs: dict[str, object] = {}
-        if src.name == "vol":
-            kwargs["vol_scores"] = vol_scores
-
-        series = src.compute(ohlcv, **kwargs)
-        columns[src.name] = series
-
-    out = pd.DataFrame(columns)
+    """Compute all directional alphas. Returns DataFrame indexed by ticker."""
+    cols: dict[str, pd.Series] = {src.name: src.compute(ohlcv) for src in sources}
+    out = pd.DataFrame(cols)
     out.index.name = "ticker"
 
     if out.empty:
-        logger.warning("compute_all: produced empty DataFrame")
+        logger.warning("compute_directional: empty output")
         return out
 
     coverage = {c: round(float(out[c].notna().mean()), 3) for c in out.columns}
@@ -270,14 +234,47 @@ def compute_all(
         for c in out.columns
     }
     logger.info(
-        f"Alphas: {out.shape[0]} tickers × {out.shape[1]} sources | "
+        f"Directional: {out.shape[0]} tickers × {out.shape[1]} alphas | "
+        f"coverage={coverage} | ranges={ranges}"
+    )
+    return out
+
+
+def compute_conviction(
+    ohlcv: pd.DataFrame,
+    vol_scores: pd.DataFrame | None = None,
+    sources: tuple[ConvictionSource, ...] = DEFAULT_CONVICTION,
+) -> pd.DataFrame:
+    """Compute all conviction sources. Returns DataFrame indexed by ticker."""
+    cols: dict[str, pd.Series] = {}
+    for src in sources:
+        kwargs: dict[str, object] = {}
+        if src.name == "vol":
+            kwargs["vol_scores"] = vol_scores
+        cols[src.name] = src.compute(ohlcv, **kwargs)
+
+    out = pd.DataFrame(cols)
+    out.index.name = "ticker"
+
+    if out.empty:
+        logger.warning("compute_conviction: empty output")
+        return out
+
+    coverage = {c: round(float(out[c].notna().mean()), 3) for c in out.columns}
+    ranges = {
+        c: (round(float(out[c].min(skipna=True)), 4),
+            round(float(out[c].max(skipna=True)), 4))
+        for c in out.columns
+    }
+    logger.info(
+        f"Conviction: {out.shape[0]} tickers × {out.shape[1]} sources | "
         f"coverage={coverage} | ranges={ranges}"
     )
     return out
 
 
 # ──────────────────────────────────────────────────────────────
-# Smoke test  (run: python v3/strategy/alpha_sources.py)
+# Smoke test
 # ──────────────────────────────────────────────────────────────
 def _synthetic_data(n_tickers: int = 50, n_days: int = 90, seed: int = 42):
     rng = np.random.default_rng(seed)
@@ -287,7 +284,7 @@ def _synthetic_data(n_tickers: int = 50, n_days: int = 90, seed: int = 42):
     records = []
     for t in tickers:
         price = 100.0
-        drift = rng.normal(0.0005, 0.0005)  # Heterogeneous drift per ticker
+        drift = rng.normal(0.0005, 0.0005)
         vol = rng.uniform(0.01, 0.03)
         for d in dates:
             price *= float(1.0 + rng.normal(drift, vol))
@@ -306,35 +303,49 @@ def _synthetic_data(n_tickers: int = 50, n_days: int = 90, seed: int = 42):
     return ohlcv, vol_scores
 
 
-def _validate(alphas: pd.DataFrame) -> None:
-    assert not alphas.empty, "empty output"
-    for col in alphas.columns:
-        vals = alphas[col].dropna()
+def _validate(directional: pd.DataFrame, conviction: pd.DataFrame) -> None:
+    assert not directional.empty, "empty directional"
+    assert not conviction.empty, "empty conviction"
+
+    for col in directional.columns:
+        vals = directional[col].dropna()
         if len(vals) == 0:
             continue
-        assert vals.min() >= -0.15, f"{col}: min {vals.min():.4f} below -0.15"
-        assert vals.max() <= 0.15, f"{col}: max {vals.max():.4f} above 0.15"
-        assert np.isfinite(vals).all(), f"{col}: non-finite values present"
-    # Alphas should not be perfectly correlated/anti-correlated. Moderate
-    # anti-correlation between trend and reversion is expected by design
-    # (momentum vs mean-reversion on the same price series). True independence
-    # is validated via IC analysis in S2, not here.
-    corr = alphas.corr().abs()
-    np.fill_diagonal(corr.values, 0.0)
-    max_corr = float(corr.max().max())
-    assert max_corr < 0.95, f"alpha pair near-perfectly correlated: {max_corr:.2f}"
+        assert vals.min() >= -0.15, f"directional {col}: min {vals.min():.4f} too low"
+        assert vals.max() <= 0.15, f"directional {col}: max {vals.max():.4f} too high"
+        assert np.isfinite(vals).all(), f"directional {col}: non-finite values"
+
+    for col in conviction.columns:
+        vals = conviction[col].dropna()
+        if len(vals) == 0:
+            continue
+        assert vals.min() >= 0.0, f"conviction {col}: min {vals.min():.4f} below 0"
+        assert vals.max() <= 1.0, f"conviction {col}: max {vals.max():.4f} above 1"
+        assert np.isfinite(vals).all(), f"conviction {col}: non-finite values"
+
+    if directional.shape[1] >= 2:
+        corr = directional.corr().abs()
+        np.fill_diagonal(corr.values, 0.0)
+        max_corr = float(corr.max().max())
+        assert max_corr < 0.95, f"directional alphas near-perfectly correlated: {max_corr:.2f}"
 
 
 if __name__ == "__main__":
     ohlcv, vol_scores = _synthetic_data()
-    alphas = compute_all(ohlcv, vol_scores)
-    print("=== Alpha Sources Smoke Test ===")
-    print(f"Shape: {alphas.shape}")
-    print("\nHead:")
-    print(alphas.head().round(4))
+    directional = compute_directional(ohlcv)
+    conviction = compute_conviction(ohlcv, vol_scores)
+
+    print("=== Directional Alphas ===")
+    print(directional.head().round(4))
     print("\nDescribe:")
-    print(alphas.describe().round(4))
+    print(directional.describe().round(4))
     print("\nCorrelation:")
-    print(alphas.corr().round(3))
-    _validate(alphas)
+    print(directional.corr().round(3))
+
+    print("\n=== Conviction Sources ===")
+    print(conviction.head().round(4))
+    print("\nDescribe:")
+    print(conviction.describe().round(4))
+
+    _validate(directional, conviction)
     print("\nAll validations passed.")

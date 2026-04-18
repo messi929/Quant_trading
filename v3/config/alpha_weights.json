@@ -1,0 +1,82 @@
+{
+  "generated_at": "2026-04-18T15:02:43",
+  "anchor_date": "2026-04-18",
+  "window_start": "2023-04-19",
+  "lookback_years": 3.0,
+  "forward_horizon_days": 5,
+  "directional_alphas": [
+    "trend",
+    "reversion"
+  ],
+  "conviction_sources": [
+    "vol"
+  ],
+  "panel_size": 14817,
+  "regime_sample_counts": {
+    "neutral": 7411,
+    "caution": 4736,
+    "bull": 2175,
+    "bear": 297,
+    "strong_bull": 198
+  },
+  "vanilla_ic": {
+    "trend": 0.0138,
+    "reversion": -0.0102
+  },
+  "vanilla_ic_gate": 0.02,
+  "vanilla_ic_pass": {
+    "trend": false,
+    "reversion": false
+  },
+  "conditional_ic": {
+    "strong_bull": {
+      "trend": -0.0158,
+      "reversion": 0.1131
+    },
+    "bull": {
+      "trend": 0.0096,
+      "reversion": -0.0553
+    },
+    "neutral": {
+      "trend": 0.0284,
+      "reversion": -0.0108
+    },
+    "caution": {
+      "trend": -0.0035,
+      "reversion": 0.0121
+    },
+    "bear": {
+      "trend": -0.0141,
+      "reversion": -0.0099
+    }
+  },
+  "directional_weights": {
+    "strong_bull": {
+      "trend": 0.0,
+      "reversion": 1.0
+    },
+    "bull": {
+      "trend": 0.5,
+      "reversion": 0.5
+    },
+    "neutral": {
+      "trend": 1.0,
+      "reversion": 0.0
+    },
+    "caution": {
+      "trend": 0.5,
+      "reversion": 0.5
+    },
+    "bear": {
+      "trend": 0.5,
+      "reversion": 0.5
+    }
+  },
+  "conviction_metrics": {
+    "vol": {
+      "expansion_ic": 0.1899,
+      "sample_size": 14817,
+      "level_ic": 0.0358
+    }
+  }
+}
