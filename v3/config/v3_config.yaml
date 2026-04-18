@@ -134,18 +134,10 @@ risk:
 # 시장 레짐
 # ------------------------------------------------------------------
 regime:
-  engine: "cross_asset"             # "single_asset"(legacy) | "cross_asset"(신규)
-  # Legacy single-asset params (fallback용, engine=single_asset일 때만 사용)
-  momentum_window: 20
-  vol_lookback: 60
-  vol_percentile_threshold: 0.80
-  bull_threshold: 0.05
-  bear_threshold: -0.08
-  bear_action: "cash"
-  # Cross-asset regime params
-  hysteresis_days: 2                # 2일 확인 후 레짐 전환
-  macro_history_years: 5            # 5년 rolling percentile
-  apply_threshold_multiplier: true  # regime별 entry threshold 자동 조절
+  # Phase 2: cross-asset regime only. Weights/signs loaded from
+  # v3/config/alpha_weights.json (trained by alpha_weight_trainer.py).
+  hysteresis_days: 2                # 2일 연속 확인 후 regime 전환
+  macro_history_years: 5            # macro percentile rolling window
 
 # ------------------------------------------------------------------
 # 스케줄

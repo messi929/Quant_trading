@@ -110,21 +110,13 @@ class RiskConfig(BaseModel):
 
 
 class RegimeConfig(BaseModel):
-    # Engine selection
-    engine: Literal["single_asset", "cross_asset"] = "single_asset"
+    """Regime detector configuration (Phase 2: single cross-asset path).
 
-    # single_asset (legacy) params
-    momentum_window: int = 20
-    vol_lookback: int = 60
-    vol_percentile_threshold: float = 0.80
-    bull_threshold: float = 0.05
-    bear_threshold: float = -0.08
-    bear_action: Literal["cash", "reduce"] = "cash"
-
-    # cross_asset params
+    Legacy single_asset fields removed. All regime logic now in RegimeDetectorV2,
+    which loads learned weights from v3/config/alpha_weights.json.
+    """
     hysteresis_days: int = 2
     macro_history_years: int = 5
-    apply_threshold_multiplier: bool = True   # Let regime adjust entry thresholds
 
 
 class ScheduleSession(BaseModel):
