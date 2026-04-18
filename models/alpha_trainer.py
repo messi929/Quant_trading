@@ -1,7 +1,12 @@
-"""AlphaTransformer trainer with deployment gates (v2).
+"""AlphaTransformer trainer with deployment gates (v2.3).
 
-Loss: Huber (magnitude) + PairwiseRanking (order) + BCE (confidence)
-Gates: dir_acc > 52%, rank_ic > 0.10 — must pass before deployment.
+Loss: Huber (magnitude) + ListMLE (ranking) + BCE (confidence)
+Gates: dir_acc > 54.5%, rank_ic > 0.10 — must pass before deployment.
+
+v2.3 changes:
+  - PairwiseRankingLoss → ListMLE (learns full ranking, not random pairs)
+  - Huber delta 0.5 → 1.5 (robust to outlier returns)
+  - Deployment gates tightened (52% → 54.5% dir_acc)
 """
 
 from __future__ import annotations
@@ -23,33 +28,84 @@ from utils.storage import StorageManager
 
 # ── Loss Functions ────────────────────────────────────────────
 
-class PairwiseRankingLoss(nn.Module):
-    """Pairwise ranking loss for cross-sectional order learning."""
+class ListMLELoss(nn.Module):
+    """ListMLE: Listwise ranking loss.
 
-    def __init__(self, sigma: float = 1.0, n_pairs: int = 256):
+    Learns the full permutation probability of the correct ranking,
+    not just random pairwise comparisons. Provably better for Rank IC.
+
+    Reference: Xia et al. "Listwise Approach to Learning to Rank" (2008)
+    """
+
+    def __init__(self, temperature: float = 1.0):
         super().__init__()
-        self.sigma = sigma
-        self.n_pairs = n_pairs
+        self.temperature = temperature
 
     def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        batch_size = preds.shape[0]
-        if batch_size < 2:
+        """Compute ListMLE loss.
+
+        Args:
+            preds: (batch,) model predictions
+            targets: (batch,) ground truth values
+
+        Returns:
+            Scalar loss (lower = predictions rank targets better)
+        """
+        n = preds.shape[0]
+        if n < 2:
             return torch.tensor(0.0, device=preds.device)
 
-        n_pairs = min(self.n_pairs, batch_size * (batch_size - 1) // 2)
-        idx_i = torch.randint(0, batch_size, (n_pairs,), device=preds.device)
-        idx_j = torch.randint(0, batch_size, (n_pairs,), device=preds.device)
-        mask = idx_i != idx_j
-        idx_i, idx_j = idx_i[mask], idx_j[mask]
+        # Sort targets descending → get the "ideal" permutation
+        _, ideal_order = targets.sort(descending=True)
 
-        if len(idx_i) == 0:
+        # Reorder predictions by ideal ranking
+        preds_sorted = preds[ideal_order] / self.temperature
+
+        # ListMLE: sum of log-softmax along the ranked list
+        # For position i, probability = exp(s_i) / sum(exp(s_j) for j >= i)
+        loss = torch.tensor(0.0, device=preds.device)
+        for i in range(n - 1):
+            # log(exp(s_i) / sum(exp(s_j) for j >= i))
+            # = s_i - logsumexp(s_j for j >= i)
+            loss = loss - preds_sorted[i] + torch.logsumexp(preds_sorted[i:], dim=0)
+
+        return loss / n
+
+
+class ListMLELossBatched(nn.Module):
+    """Efficient ListMLE for large batches using chunked ranking.
+
+    Splits batch into groups (simulating cross-sectional days),
+    applies ListMLE within each group.
+    """
+
+    def __init__(self, temperature: float = 1.0, group_size: int = 64):
+        super().__init__()
+        self.temperature = temperature
+        self.group_size = group_size
+        self._listmle = ListMLELoss(temperature)
+
+    def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        n = preds.shape[0]
+        if n < 2:
             return torch.tensor(0.0, device=preds.device)
 
-        pred_diff = preds[idx_i] - preds[idx_j]
-        target_sign = torch.sign(targets[idx_i] - targets[idx_j])
+        # Shuffle to avoid ordering bias, then chunk
+        idx = torch.randperm(n, device=preds.device)
+        preds_s = preds[idx]
+        targets_s = targets[idx]
 
-        logits = self.sigma * pred_diff * target_sign
-        return -F.logsigmoid(logits).mean()
+        total_loss = torch.tensor(0.0, device=preds.device)
+        n_groups = 0
+        for i in range(0, n, self.group_size):
+            p = preds_s[i : i + self.group_size]
+            t = targets_s[i : i + self.group_size]
+            if len(p) < 2:
+                continue
+            total_loss = total_loss + self._listmle(p, t)
+            n_groups += 1
+
+        return total_loss / max(n_groups, 1)
 
 
 # ── Scheduler ─────────────────────────────────────────────────
@@ -101,9 +157,9 @@ class AlphaTrainer:
         self.warmup_steps = warmup_steps
         self.storage = StorageManager()
 
-        # Loss
-        self.criterion_huber = nn.HuberLoss(delta=0.5)
-        self.criterion_rank = PairwiseRankingLoss(sigma=1.0, n_pairs=256)
+        # Loss — v2.3: ListMLE + Huber(delta=1.5)
+        self.criterion_huber = nn.HuberLoss(delta=1.5)
+        self.criterion_rank = ListMLELossBatched(temperature=1.0, group_size=64)
         self.rank_weight = ranking_loss_weight
         self.conf_weight = confidence_loss_weight
 

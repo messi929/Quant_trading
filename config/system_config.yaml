@@ -8,7 +8,7 @@
 
 project:
   name: "Conviction Alpha Trader"
-  version: "2.2.0"
+  version: "2.3.0"
 
 # ------------------------------------------------------------------
 # 경로
@@ -88,12 +88,12 @@ training:
   seed: 42
   num_workers: 0               # Windows 호환
   pin_memory: true
-  # Pairwise ranking loss 비중
-  ranking_loss_weight: 0.5     # Huber 0.5 + Ranking 0.5
+  # ListMLE ranking loss 비중 (v2.3: Pairwise → ListMLE)
+  ranking_loss_weight: 0.6     # Huber 0.4 + ListMLE 0.6 (ranking이 핵심)
   confidence_loss_weight: 0.1  # Confidence BCE loss
-  # 배포 게이트
-  min_dir_acc: 0.52            # 방향 정확도 52% 미만 → 배포 금지
-  min_rank_ic: 0.05            # Rank IC 0.05 미만 → 배포 금지 (sandbox: val 0.10 통과, test 0.053)
+  # 배포 게이트 (v2.3: 강화)
+  min_dir_acc: 0.545           # 방향 정확도 54.5% 미만 → 배포 금지 (p<0.05 유의 수준)
+  min_rank_ic: 0.10            # Rank IC 0.10 미만 → 배포 금지 (val+test 모두 통과 필요)
 
 # ------------------------------------------------------------------
 # 트레이딩 (매수/매도 정책)
@@ -106,15 +106,16 @@ trading:
   min_order_amount: 5_000_000   # 최소 주문금액 500만원 (v1은 10만원)
   icr_min: 3.0                  # ICR ≥ 3.0 (신호 > 3× 거래비용)
 
-  # 매도 조건 (v2.2: 3일 보유 전략)
+  # 매도 조건 (v2.3: 3일 보유 + Medallion alignment)
   # 개별 스탑로스 제거 → 포트폴리오 daily_loss_limit으로 관리
   # time_exit 제거 → prediction_horizon(3일) 동안 보유
+  # v2.3: 고스트 제거(3회 실패), 멀티데이 냉각기(5일2패), 연속진입 차단(3일)
   profit_take_full_pct: 0.05    # +5% 이상치에서만 조기 전량 청산
   max_hold_days: 3              # 예측 기간 만료 → 청산 (오버나이트 보유)
 
-  # 비용
-  transaction_cost_rate: 0.006  # 왕복 0.6%
-  commission_rate: 0.0002       # 편도 0.02%
+  # 비용 (v2.3: 현실화 — 증권거래세+수수료+슬리피지 반영)
+  transaction_cost_rate: 0.010  # 왕복 1.0% (수수료0.05%×2 + 세금0.18% + 슬리피지0.3%×2 + 스프레드0.12%)
+  commission_rate: 0.0005       # 편도 0.05% (한투 수수료 0.015% + 증권거래세 매도 분할)
   slippage_by_market:
     KOSPI: 0.003
     KOSDAQ: 0.005
@@ -154,8 +155,8 @@ regime:
   momentum_window: 20           # 20일 수익률
   vol_lookback: 60              # 60일 변동성
   vol_percentile_threshold: 0.80
-  bull_threshold: 0.03          # +3% → bull
-  bear_threshold: -0.03         # -3% → bear
+  bull_threshold: 0.05          # +5% → bull (v2.3: 완화)
+  bear_threshold: -0.08         # -8% → bear (v2.3: -3%는 정상 조정, -8%부터 진짜 bear)
   # bear 레짐 행동: CASH (v1은 0.6x 축소)
   bear_action: "cash"           # "cash" | "reduce"
   bear_reduce_scale: 0.6        # reduce 시 스케일

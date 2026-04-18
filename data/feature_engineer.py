@@ -124,13 +124,13 @@ class FeatureEngineer:
         opn = df["open"]
         volume = df["volume"]
 
-        # --- Returns ---
-        df["return_1d"] = close.pct_change().clip(-1, 10)
-        df["log_return_1d"] = np.log((close / close.shift(1)).clip(lower=1e-8))
+        # --- Returns (clipped to ±30%, KRX daily limit) ---
+        df["return_1d"] = close.pct_change().clip(-0.3, 0.3)
+        df["log_return_1d"] = np.log((close / close.shift(1)).clip(lower=0.7, upper=1.3))
 
         for w in self.WINDOWS:
-            df[f"return_{w}d"] = close.pct_change(w).clip(-1, 10)
-            df[f"log_return_{w}d"] = np.log((close / close.shift(w)).clip(lower=1e-8))
+            df[f"return_{w}d"] = close.pct_change(w).clip(-0.5, 0.5)
+            df[f"log_return_{w}d"] = np.log((close / close.shift(w)).clip(lower=0.5, upper=2.0))
 
         # --- Volatility (realized) ---
         for w in self.WINDOWS:
@@ -313,6 +313,89 @@ class FeatureEngineer:
         df["relative_return_5d"] = df["return_5d"] - df.groupby("ticker")[
             "market_return_1d"
         ].transform(lambda x: x.rolling(5).mean())
+
+        # --- Sector relative strength ---
+        if "sector" in df.columns:
+            df = self._add_sector_features(df)
+
+        # --- Beta / residual return (market exposure separation) ---
+        df = self._add_beta_features(df)
+
+        return df
+
+    def _add_sector_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add sector-relative features.
+
+        Separates stock performance from sector trend so the model
+        can identify stock-specific alpha vs sector rotation.
+        """
+        # Sector average return per date
+        sector_ret = (
+            df.groupby(["date", "sector"])["return_1d"]
+            .mean()
+            .rename("sector_return_1d")
+            .reset_index()
+        )
+        df = df.merge(sector_ret, on=["date", "sector"], how="left")
+
+        # Stock return relative to its sector (intra-sector alpha)
+        df["sector_relative_return"] = df["return_1d"] - df["sector_return_1d"]
+
+        # Rolling sector momentum (5d, 20d)
+        for w in [5, 20]:
+            df[f"sector_momentum_{w}d"] = df.groupby("ticker")[
+                "sector_return_1d"
+            ].transform(lambda x: x.rolling(w, min_periods=1).mean())
+
+        # Sector relative strength rank (per date: which sector is hottest?)
+        sector_rank = (
+            df.groupby("date")["sector_return_1d"]
+            .rank(pct=True)
+        )
+        df["sector_strength_rank"] = sector_rank
+
+        # Cumulative sector-relative return (5d)
+        df["sector_relative_cumul_5d"] = df.groupby("ticker")[
+            "sector_relative_return"
+        ].transform(lambda x: x.rolling(5, min_periods=1).sum())
+
+        return df
+
+    def _add_beta_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add rolling beta and residual return features.
+
+        Decomposes stock return into market-driven (beta × market)
+        and idiosyncratic (residual) components.
+        """
+        if "market_return_1d" not in df.columns:
+            return df
+
+        g = df.groupby("ticker", group_keys=False)
+
+        # Rolling 20-day beta: cov(stock, market) / var(market)
+        def rolling_beta(group):
+            stock_ret = group["return_1d"]
+            market_ret = group["market_return_1d"]
+            cov = stock_ret.rolling(20, min_periods=10).cov(market_ret)
+            var = market_ret.rolling(20, min_periods=10).var()
+            return (cov / (var + 1e-10)).clip(-5, 5)
+
+        df["beta_20d"] = g.apply(rolling_beta).reset_index(level=0, drop=True)
+
+        # Residual return: actual - beta × market (idiosyncratic component)
+        df["residual_return_1d"] = (
+            df["return_1d"] - df["beta_20d"] * df["market_return_1d"]
+        )
+
+        # Cumulative residual (5d) — pure stock-specific momentum
+        df["residual_cumul_5d"] = g["residual_return_1d"].transform(
+            lambda x: x.rolling(5, min_periods=1).sum()
+        )
+
+        # Residual volatility (idiosyncratic risk)
+        df["residual_vol_20d"] = g["residual_return_1d"].transform(
+            lambda x: x.rolling(20, min_periods=10).std()
+        )
 
         return df
 

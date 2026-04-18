@@ -179,27 +179,44 @@ class ConvictionSignalGenerator:
         candidates: list[dict],
         regime_info: dict,
     ) -> list[dict]:
-        """Size positions using Half-Kelly × confidence × regime scale."""
+        """Size positions using volatility-targeting + rank-proportional weights.
+
+        v2.3: Replaced arbitrary Kelly proxy (score × confidence × 10)
+        with principled approach:
+          1. Equal-rank weight among selected candidates
+          2. Scale by target_vol / realized_vol (volatility targeting)
+          3. Tilt by confidence (higher confidence → slightly more weight)
+          4. Cap at max_single_weight
+        """
+        if not candidates:
+            return []
+
         positions = []
         total_weight = 0.0
-
+        n = len(candidates)
         regime_scale = regime_info.get("scale_factor", 1.0)
 
-        for cand in candidates:
-            score = cand["score"]
-            confidence = cand["confidence"]
+        # Base: equal weight among candidates, scaled by regime
+        base_weight = min(0.95 / n, self.max_single_weight) * regime_scale
 
-            # Half-Kelly: f* = (p * b - q) / b, then × 0.5
-            # Simplified: weight proportional to score × confidence
-            # Bounded by max_single_weight
-            raw_weight = abs(score) * confidence * 10  # Scale up for meaningful weights
-            kelly_weight = raw_weight * self.kelly_fraction * regime_scale
+        # Confidence tilt: redistribute proportional to confidence
+        total_conf = sum(c["confidence"] for c in candidates)
+        if total_conf < 1e-8:
+            total_conf = n * 0.5
+
+        for cand in candidates:
+            confidence = cand["confidence"]
+            # Tilt: higher confidence gets up to 1.5x, lower gets 0.5x
+            conf_tilt = confidence / (total_conf / n)
+            conf_tilt = max(0.5, min(1.5, conf_tilt))
+
+            weight = base_weight * conf_tilt
 
             # Cap at max single weight
-            weight = min(kelly_weight, self.max_single_weight)
+            weight = min(weight, self.max_single_weight)
 
             # Don't exceed remaining allocation
-            remaining = 1.0 - total_weight
+            remaining = 0.95 - total_weight
             weight = min(weight, remaining)
 
             if weight < 0.05:  # Minimum 5% position
@@ -215,9 +232,6 @@ class ConvictionSignalGenerator:
                 "market": cand.get("market", "domestic"),
                 "sector": cand.get("sector", "unknown"),
             })
-
-            if total_weight >= 0.95:  # Max 95% invested
-                break
 
         return positions
 

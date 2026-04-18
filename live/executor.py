@@ -1,22 +1,23 @@
-"""Trading executor — 3-day hold strategy (v2.2).
+"""Trading executor — 3-day hold strategy (v2.3).
 
 Core principles:
   - 모델이 3일 후를 예측 → 3일간 보유하여 예측 실현 기회 확보
   - 개별 종목 스탑로스 제거 → 포트폴리오 레벨 리스크 관리
   - 청산 기준: (1) +5% 이상치 (2) 3일 만료 (3) 신호 반전 (4) 포트폴리오 손실 한도
 
-v2.2 changes:
-  - 개별 stop_loss 제거 (노이즈 청산 방지)
-  - time_exit 제거 (alpha decay 기간까지 보유)
-  - 부분 이익실현 제거 (+5% 전량만)
-  - session_close: 만료 포지션만 청산, 나머지 오버나이트 보유
-  - 포트폴리오 daily_loss_limit: 미실현 P&L 포함
+v2.3 changes (Medallion alignment):
+  - 고스트 포지션 강제 제거: 매도 3회 실패 시 open_positions에서 제거
+  - 포지션 디스크 영속화: JSON 저장으로 서비스 재시작 시 복구
+  - 멀티데이 냉각기: 최근 5일 내 2회 이상 손실 종목 진입 차단
+  - 연속 진입 제한: 동일 종목 3일 연속 진입 불가 (신호 정체 방지)
 """
 
 from __future__ import annotations
 
+import json
 import time
-from datetime import datetime
+from datetime import datetime, date
+from pathlib import Path
 from typing import Optional
 
 from loguru import logger
@@ -24,6 +25,14 @@ from loguru import logger
 from broker.kis_api import KISApi
 from tracking.trade_log import TradeLogger
 from utils.ticker_utils import kis_code
+
+
+# Medallion: edge × 반복 × sizing — 반복이 부족하면 edge가 발현되지 않음
+# → 동일 종목 반복 진입은 "반복"이 아니라 "집착"
+MAX_SELL_RETRIES = 3         # 매도 실패 N회 → 고스트 포지션 강제 제거
+COOLDOWN_DAYS = 5            # 냉각기 기간 (일)
+COOLDOWN_LOSS_COUNT = 2      # 이 기간 내 N회 손실 → 진입 차단
+MAX_CONSECUTIVE_ENTRY = 3    # 동일 종목 연속 N일 진입 → 차단
 
 
 class TradingExecutor:
@@ -56,13 +65,24 @@ class TradingExecutor:
         self.api = api or KISApi(mode=self.mode, market_type="domestic")
         self.trade_logger = trade_logger or TradeLogger(config["paths"]["trade_log_db"])
 
-        # State
-        self.open_positions: dict[str, dict] = {}
-        self._stoploss_tickers: set[str] = set()
+        # Persistence paths
+        self._state_dir = Path(config["paths"].get("models", "saved_models"))
+        self._positions_path = self._state_dir / "open_positions.json"
+        self._cooldown_path = self._state_dir / "ticker_cooldown.json"
+
+        # State (loaded from disk)
+        self.open_positions: dict[str, dict] = self._load_positions()
+        self._sell_fail_count: dict[str, int] = {}  # ticker → consecutive sell failures
         self._daily_pnl = 0.0
         self._daily_traded_amount = 0.0
 
-    # ── Entry (reconciliation + circuit breaker) ──────────────
+        # Multi-day cooldown state (persisted)
+        # {ticker_code: [{"date": "2026-04-06", "pnl": -0.03}, ...]}
+        self._ticker_history: dict[str, list[dict]] = self._load_cooldown()
+        # {ticker_code: ["2026-04-06", "2026-04-07", ...]} — consecutive entry dates
+        self._entry_dates: dict[str, list[str]] = {}
+
+    # ── Entry (reconciliation + circuit breaker + cooldown) ────
 
     def execute_entry(
         self,
@@ -74,7 +94,8 @@ class TradingExecutor:
         1. Circuit breaker scaling (MDD-based)
         2. Close positions NOT in new signal (rebalance)
         3. Keep positions still in signal (save costs)
-        4. Buy new positions
+        4. Cooldown check (multi-day loss history + consecutive entry)
+        5. Buy new positions
         """
         if portfolio_value is None:
             portfolio_value = self._get_portfolio_value()
@@ -99,17 +120,28 @@ class TradingExecutor:
                     self._close_position(ticker, pos, price, "rebalance")
 
         # Buy new positions
+        today_str = date.today().isoformat()
         executed = []
         for pos in positions:
             ticker = pos["ticker"]
+            code = kis_code(ticker)
             market = pos.get("market", "domestic")
 
             if ticker in self.open_positions:
                 logger.info(f"KEEP [{ticker}]: already held, skip re-entry")
                 continue
 
-            if kis_code(ticker) in self._stoploss_tickers:
-                logger.info(f"SKIP [{ticker}]: cooldown")
+            # Multi-day cooldown: 최근 N일 내 M회 손실 → 차단
+            if self._is_cooled_down(code):
+                logger.info(f"COOLDOWN [{ticker}]: recent losses, skipping")
+                continue
+
+            # Consecutive entry limit: 동일 종목 N일 연속 진입 → 차단
+            if self._is_consecutive_entry(code, today_str):
+                logger.info(
+                    f"STALE [{ticker}]: entered {MAX_CONSECUTIVE_ENTRY}+ "
+                    f"consecutive days, skipping"
+                )
                 continue
 
             # Portfolio loss check (realized only, for entry gating)
@@ -132,11 +164,13 @@ class TradingExecutor:
                     self.open_positions[ticker] = {
                         "qty": qty,
                         "entry_price": price,
-                        "entry_time": datetime.now(),
+                        "entry_time": datetime.now().isoformat(),
                         "weight": weight,
                         "market": market,
                         "score": pos.get("score", 0),
                     }
+                    self._record_entry(code, today_str)
+                    self._save_positions()
                     self.trade_logger.log_trade(result, note="entry")
                     self._daily_traded_amount += qty * price
                     executed.append(result)
@@ -191,7 +225,6 @@ class TradingExecutor:
                 continue
 
             price, pnl_pct = position_data[ticker]
-            hold_days = (datetime.now() - pos["entry_time"]).days
 
             reason = None
 
@@ -200,7 +233,7 @@ class TradingExecutor:
                 reason = "profit_take_full"
 
             # 3일 보유 만료 → 예측 기간 종료
-            elif hold_days >= self.max_hold_days:
+            elif self._hold_days(pos) >= self.max_hold_days:
                 reason = "hold_expired"
 
             if reason:
@@ -219,8 +252,7 @@ class TradingExecutor:
         """
         exits = []
         for ticker, pos in list(self.open_positions.items()):
-            hold_days = (datetime.now() - pos["entry_time"]).days
-            if hold_days >= self.max_hold_days:
+            if self._hold_days(pos) >= self.max_hold_days:
                 price = self._get_price(ticker, pos["market"])
                 if price <= 0:
                     price = pos["entry_price"]
@@ -267,23 +299,57 @@ class TradingExecutor:
 
             self.trade_logger.log_trade(result, note=reason)
             del self.open_positions[ticker]
+            self._sell_fail_count.pop(ticker, None)
+            self._save_positions()
 
-            if reason in ("force_close", "rebalance"):
-                self._stoploss_tickers.add(kis_code(ticker))
+            # Record loss for cooldown
+            code = kis_code(ticker)
+            self._record_trade_result(code, pnl_pct)
+
+            entry_time = pos.get("entry_time", "")
+            if isinstance(entry_time, str):
+                try:
+                    hold = (datetime.now() - datetime.fromisoformat(entry_time)).days
+                except ValueError:
+                    hold = 0
+            else:
+                hold = (datetime.now() - entry_time).days
 
             sign = "+" if pnl_pct > 0 else ""
-            hold = (datetime.now() - pos["entry_time"]).days
             logger.info(
                 f"EXIT [{reason}]: {ticker} {qty}주 @ {price:,.0f} "
                 f"({sign}{pnl_pct:.2%}, {hold}d held)"
             )
         else:
-            if pos["market"] == "domestic":
-                self._verify_and_sync(ticker)
+            # Sell failed — track retries and force-remove ghosts
+            self._handle_sell_failure(ticker, pos)
 
         return result
 
-    # ── Sell failure recovery ─────────────────────────────────
+    # ── Sell failure recovery (ghost position elimination) ────
+
+    def _handle_sell_failure(self, ticker: str, pos: dict):
+        """Track sell failures. Force-remove after MAX_SELL_RETRIES.
+
+        Medallion principle: infrastructure failures must not block trading.
+        A position that can't be sold doesn't exist — remove it.
+        """
+        self._sell_fail_count[ticker] = self._sell_fail_count.get(ticker, 0) + 1
+        count = self._sell_fail_count[ticker]
+
+        if count >= MAX_SELL_RETRIES:
+            logger.warning(
+                f"GHOST REMOVAL: {ticker} sell failed {count} times "
+                f"— force-removing from open_positions"
+            )
+            self.open_positions.pop(ticker, None)
+            self._sell_fail_count.pop(ticker, None)
+            self._save_positions()
+            return
+
+        # Try balance verification (may also fail on sandbox)
+        if pos.get("market") == "domestic":
+            self._verify_and_sync(ticker)
 
     def _verify_and_sync(self, ticker: str):
         """On sell failure, check actual KIS balance and sync."""
@@ -300,9 +366,12 @@ class TradingExecutor:
                     f"removing from open_positions"
                 )
                 self.open_positions.pop(ticker, None)
+                self._sell_fail_count.pop(ticker, None)
+                self._save_positions()
             else:
                 logger.info(
-                    f"SYNC: {ticker} confirmed in balance — retry next cycle"
+                    f"SYNC: {ticker} confirmed in balance — "
+                    f"retry {self._sell_fail_count.get(ticker, 0)}/{MAX_SELL_RETRIES}"
                 )
         except Exception as e:
             logger.error(f"Balance verification failed: {e}")
@@ -325,6 +394,18 @@ class TradingExecutor:
         return 1.0
 
     # ── Helpers ────────────────────────────────────────────────
+
+    def _hold_days(self, pos: dict) -> int:
+        """Calculate hold days from entry_time (str or datetime)."""
+        entry = pos.get("entry_time")
+        if entry is None:
+            return 0
+        if isinstance(entry, str):
+            try:
+                entry = datetime.fromisoformat(entry)
+            except ValueError:
+                return 0
+        return (datetime.now() - entry).days
 
     def _get_portfolio_value(self) -> float | None:
         try:
@@ -389,6 +470,119 @@ class TradingExecutor:
 
     def reset_daily(self):
         """Reset daily counters. Preserves open_positions for carry-over."""
-        self._stoploss_tickers.clear()
         self._daily_pnl = 0.0
         self._daily_traded_amount = 0.0
+        # Note: cooldown is multi-day, NOT reset daily (unlike v2.2 _stoploss_tickers)
+
+    # ── Multi-day cooldown (Medallion: avoid repeated losses) ─
+
+    def _is_cooled_down(self, code: str) -> bool:
+        """Check if ticker is in cooldown (recent losses exceed threshold)."""
+        history = self._ticker_history.get(code, [])
+        if not history:
+            return False
+
+        cutoff = date.today().isoformat()
+        recent_losses = 0
+        for entry in history:
+            days_ago = (date.today() - date.fromisoformat(entry["date"])).days
+            if days_ago <= COOLDOWN_DAYS and entry["pnl"] < 0:
+                recent_losses += 1
+
+        return recent_losses >= COOLDOWN_LOSS_COUNT
+
+    def _is_consecutive_entry(self, code: str, today_str: str) -> bool:
+        """Check if ticker has been entered too many consecutive days.
+
+        Prevents "signal staleness" — same top pick for days means
+        the model is insensitive to recent price changes, not "convicted".
+        """
+        dates = self._entry_dates.get(code, [])
+        if len(dates) < MAX_CONSECUTIVE_ENTRY:
+            return False
+
+        # Check if last N entries are consecutive calendar days
+        recent = sorted(dates)[-MAX_CONSECUTIVE_ENTRY:]
+        for i in range(1, len(recent)):
+            d1 = date.fromisoformat(recent[i - 1])
+            d2 = date.fromisoformat(recent[i])
+            # Allow weekend gaps (max 3 days between consecutive trading days)
+            if (d2 - d1).days > 3:
+                return False
+        return True
+
+    def _record_entry(self, code: str, today_str: str):
+        """Record entry date for consecutive-entry tracking."""
+        if code not in self._entry_dates:
+            self._entry_dates[code] = []
+        if today_str not in self._entry_dates[code]:
+            self._entry_dates[code].append(today_str)
+        # Keep only recent entries
+        self._entry_dates[code] = self._entry_dates[code][-10:]
+
+    def _record_trade_result(self, code: str, pnl_pct: float):
+        """Record trade P&L for cooldown tracking (persisted)."""
+        if code not in self._ticker_history:
+            self._ticker_history[code] = []
+        self._ticker_history[code].append({
+            "date": date.today().isoformat(),
+            "pnl": round(pnl_pct, 4),
+        })
+        # Keep only recent history
+        self._ticker_history[code] = self._ticker_history[code][-20:]
+        self._save_cooldown()
+
+    # ── Position persistence (survive restarts) ───────────────
+
+    def _save_positions(self):
+        """Save open positions to disk."""
+        try:
+            self._state_dir.mkdir(parents=True, exist_ok=True)
+            # Convert datetime to string for JSON
+            data = {}
+            for ticker, pos in self.open_positions.items():
+                entry = dict(pos)
+                if isinstance(entry.get("entry_time"), datetime):
+                    entry["entry_time"] = entry["entry_time"].isoformat()
+                data[ticker] = entry
+            self._positions_path.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False)
+            )
+        except Exception as e:
+            logger.error(f"Position save failed: {e}")
+
+    def _load_positions(self) -> dict[str, dict]:
+        """Load open positions from disk."""
+        try:
+            if self._positions_path.exists():
+                data = json.loads(self._positions_path.read_text())
+                if isinstance(data, dict) and data:
+                    logger.info(
+                        f"Positions restored: {len(data)} from {self._positions_path}"
+                    )
+                    return data
+        except Exception as e:
+            logger.warning(f"Position load failed: {e}")
+        return {}
+
+    def _save_cooldown(self):
+        """Save cooldown history to disk."""
+        try:
+            self._state_dir.mkdir(parents=True, exist_ok=True)
+            self._cooldown_path.write_text(
+                json.dumps(self._ticker_history, indent=2, ensure_ascii=False)
+            )
+        except Exception as e:
+            logger.error(f"Cooldown save failed: {e}")
+
+    def _load_cooldown(self) -> dict[str, list[dict]]:
+        """Load cooldown history from disk."""
+        try:
+            if self._cooldown_path.exists():
+                data = json.loads(self._cooldown_path.read_text())
+                if isinstance(data, dict):
+                    logger.info(f"Cooldown history loaded: {len(data)} tickers")
+                    return data
+        except Exception as e:
+            logger.warning(f"Cooldown load failed: {e}")
+        return {}

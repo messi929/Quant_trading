@@ -81,7 +81,7 @@ class ConvictionBacktester:
         self.profit_take_full_pct = profit_take_full_pct
         self.stop_loss_pct = stop_loss_pct
         self.max_hold_days = max_hold_days
-        self.day_trade_default = day_trade_default
+        self.day_trade_default = False  # v2.3: 3일 보유 전략 — 당일 청산 금지
         self.min_sharpe = min_sharpe
 
     def run(
@@ -163,12 +163,13 @@ class ConvictionBacktester:
                     day_trade_default=self.day_trade_default,
                 )
 
-                # Apply commission
+                # Apply commission + exit slippage (v2.3)
                 gross_return = result.return_pct
-                cost = self.commission_rate * 2  # buy + sell
-                net_return = gross_return - cost
+                cost = self.commission_rate * 2  # buy + sell commission
+                exit_slip = self.slippage_rate    # exit slippage (entry already in price)
+                net_return = gross_return - cost - exit_slip
 
-                # Weighted contribution to portfolio return
+                # Weighted contribution to portfolio return (log-additive)
                 day_return += net_return * weight
                 n_positions += 1
 
