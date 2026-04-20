@@ -6,7 +6,7 @@ Uses V2 KISApi for order execution.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 from loguru import logger
 
@@ -153,7 +153,15 @@ class TradingExecutor:
                 continue
 
             current_price = price_info["price"]
-            hold_days = pos["hold_days"] + 1
+            # Calendar-day hold count (not monitor-tick count).
+            # entry_date is "YYYY-MM-DD" (possibly with time suffix from paper broker).
+            entry_date_str = str(pos.get("entry_date", current_date))[:10]
+            try:
+                entry_d = date.fromisoformat(entry_date_str)
+                today_d = date.fromisoformat(current_date)
+                hold_days = max(0, (today_d - entry_d).days)
+            except ValueError:
+                hold_days = int(pos.get("hold_days", 0) or 0)
             pos["hold_days"] = hold_days
 
             # Check exit

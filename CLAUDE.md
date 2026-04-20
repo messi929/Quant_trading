@@ -1114,3 +1114,23 @@ Entries: 1, Paper total: 100,679,152 KRW
     - 진입과 유지를 동일 수식(opportunity > cost × k)으로 통일
     - 승자 자르기 방지 = 손절만큼 중요한 edge 보존 메커니즘
 ```
+
+### V3.2.1 핫픽스 — hold_days 달력 일수 (2026-04-21)
+
+**증상**: FANG 22:16 진입 → 23:08 매도(+1.65%) → 23:40 재진입. 1시간 만에 churn.
+
+**원인**: `monitor_positions`에서 `hold_days = pos["hold_days"] + 1` — monitor
+호출마다 +1 증가. 15분 간격 monitor 4회면 hold_days=4 → `TIME_DECAY_TARGETS[4]
+= 0.015` (Day 5 TP 1.5%) → +1.65% ≥ 1.5% → profit_take 트리거.
+
+**수정** (`v3/execution/executor.py`)
+```python
+from datetime import date
+entry_date_str = str(pos.get("entry_date", current_date))[:10]
+entry_d = date.fromisoformat(entry_date_str)
+today_d = date.fromisoformat(current_date)
+hold_days = max(0, (today_d - entry_d).days)   # 달력 일수
+```
+
+**교훈 13**: 시간 관련 카운터는 **호출 빈도가 아니라 도메인 시간축**을 기준으로
+측정해야 한다. 15분 tick이 "1일"이 되면 Day5 TP가 1시간 만에 도달.
