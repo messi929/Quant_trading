@@ -55,7 +55,71 @@
       "Bash(/tmp/dry_run.py:*)",
       "Bash(git:*)",
       "Bash(GIT_TRACE=1 git push origin main 2>&1 | head -30)",
-      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" auth status 2>&1 || \"/c/Users/wogus/AppData/Local/GitHub CLI/gh.exe\" auth status 2>&1 || echo \"gh not found\")"
+      "Bash(\"/c/Program Files/GitHub CLI/gh.exe\" auth status 2>&1 || \"/c/Users/wogus/AppData/Local/GitHub CLI/gh.exe\" auth status 2>&1 || echo \"gh not found\")",
+      "Bash(PYTHONIOENCODING=utf-8 /c/Users/wogus/miniconda3/envs/quant/python.exe -c \"\nimport ast, sys\n\nfor f in ['live/signal_to_order.py']:\n    try:\n        with open\\(f, 'r', encoding='utf-8'\\) as fh:\n            ast.parse\\(fh.read\\(\\)\\)\n        print\\(f'OK: {f}'\\)\n    except SyntaxError as e:\n        print\\(f'FAIL: {f} at line {e.lineno}: {e.msg}'\\)\n        sys.exit\\(1\\)\n\nimport yaml\nfor f in ['config/settings_fast.yaml']:\n    try:\n        with open\\(f, 'r', encoding='utf-8'\\) as fh:\n            cfg = yaml.safe_load\\(fh\\)\n        mpp = cfg['backtest']['max_position_pct']\n        print\\(f'OK: {f} \\(max_position_pct={mpp}\\)'\\)\n    except Exception as e:\n        print\\(f'FAIL: {f}: {e}'\\)\n        sys.exit\\(1\\)\n\nprint\\('All checks passed'\\)\n\")",
+      "Bash(PYTHONIOENCODING=utf-8 /c/Users/wogus/miniconda3/envs/quant/python.exe main.py train --start-phase 1 --config config/settings_fast.yaml)",
+      "Bash(PYTHONIOENCODING=utf-8 /c/Users/wogus/miniconda3/envs/quant/python.exe main.py train --start-phase 2 --config config/settings_fast.yaml)",
+      "Bash(wmic process:*)",
+      "Bash(PYTHONIOENCODING=utf-8 /c/Users/wogus/miniconda3/envs/quant/python.exe main.py train --start-phase 5 --config config/settings_fast.yaml)",
+      "Bash(PYTHONIOENCODING=utf-8 /c/Users/wogus/miniconda3/envs/quant/python.exe -c \"\nimport yaml\nwith open\\('config/model_config_fast.yaml', 'r', encoding='utf-8'\\) as f:\n    mcfg = yaml.safe_load\\(f\\)\nprint\\('VAE keys:', list\\(mcfg.get\\('vae',{}\\).keys\\(\\)\\)\\)\nprint\\('Transformer keys:', list\\(mcfg.get\\('transformer',{}\\).keys\\(\\)\\)\\)\nprint\\('GAN keys:', list\\(mcfg.get\\('gan',{}\\).keys\\(\\)\\)\\)\nprint\\('RL keys:', list\\(mcfg.get\\('rl',{}\\).keys\\(\\)\\)\\)\n\")",
+      "Bash(PYTHONIOENCODING=utf-8 /c/Users/wogus/miniconda3/envs/quant/python.exe -c \"\nimport sys, torch, yaml, inspect\nsys.path.insert\\(0, '.'\\)\nfrom models.autoencoder.model import MarketVAE\nparams = inspect.signature\\(MarketVAE.__init__\\).parameters\nprint\\('MarketVAE params:', [p for p in params if p != 'self']\\)\n\")",
+      "Bash(PYTHONIOENCODING=utf-8 /c/Users/wogus/miniconda3/envs/quant/python.exe -c \"\nimport inspect; import sys; sys.path.insert\\(0,'.'\\)\nfrom models.transformer.model import TemporalTransformer\nprint\\([p for p in inspect.signature\\(TemporalTransformer.__init__\\).parameters if p != 'self']\\)\n\")",
+      "Bash(PYTHONIOENCODING=utf-8 /c/Users/wogus/miniconda3/envs/quant/python.exe main.py train --start-phase 6 --config config/settings_fast.yaml 2>&1)",
+      "Bash(# Move old 34-feature checkpoint out of way\nmv saved_models/transformer_epoch20.pt saved_models/transformer_epoch20_old34feat.pt\n# Now epoch16 \\(72 features, from today\\) will be the latest\nls -lt saved_models/transformer_epoch*.pt | head -5)",
+      "Bash(wc -l /c/src/Qunat_trading/logs/*.log)",
+      "Bash(sqlite3:*)",
+      "Bash(tee /c/src/Qunat_trading/logs/retrain_phase21.log)",
+      "Bash(find /c/src/Qunat_trading -type f \\\\\\(-name *.csv -o -name *.json \\\\\\) ! -path */.git/* ! -path */node_modules/*)",
+      "Bash(find /c/src/Qunat_trading -type f \\\\\\(-name *backtest* -o -name *report* \\\\\\) ! -path */.git/* ! -path */__pycache__/*)",
+      "Bash(find /c/src/Qunat_trading -type f \\\\\\(-name *.txt \\\\\\) ! -path */.git/* ! -path */.*)",
+      "Bash(wc -l /c/src/Qunat_trading/data/*.py /c/src/Qunat_trading/broker/*.py /c/src/Qunat_trading/tracking/*.py /c/src/Qunat_trading/utils/*.py)",
+      "Bash(tee logs/alpha_v2_full_train.log)",
+      "Bash(PYTHONIOENCODING=utf-8 /c/Users/wogus/miniconda3/envs/quant/python.exe -c \":*)",
+      "Bash(tee logs/alpha_v2_retrain.log)",
+      "Bash(SSH_KEY=~/.ssh/id_ed25519)",
+      "Bash(SERVER=root@77.42.78.9)",
+      "Bash(__NEW_LINE_136447405efc0f01__ ssh:*)",
+      "Bash(PYTHONIOENCODING=utf-8 /c/Users/wogus/miniconda3/envs/quant/python.exe -c \"\nimport ast\nfor f in ['scheduler/runner.py', 'pipeline/signal_pipeline.py']:\n    with open\\(f, 'r', encoding='utf-8'\\) as fh:\n        ast.parse\\(fh.read\\(\\)\\)\n    print\\(f'OK: {f}'\\)\nprint\\('Syntax check passed'\\)\n\")",
+      "Bash(PYTHONIOENCODING=utf-8 /c/Users/wogus/miniconda3/envs/quant/python.exe -c \"\nfrom scheduler.runner import TradingRunner\nprint\\('TradingRunner import OK'\\)\nprint\\('Methods:', [m for m in dir\\(TradingRunner\\) if not m.startswith\\('_'\\)]\\)\n\")",
+      "Bash(SERVER_DIR=/opt/quant)",
+      "Bash(__NEW_LINE_712c755288873882__ scp:*)",
+      "Bash(__NEW_LINE_46f1ae388c75025d__ scp:*)",
+      "Bash(ssh -i:*)",
+      "Bash(ssh -i \"$SSH_KEY\" root@77.42.78.9 \":*)",
+      "Bash(bash:*)",
+      "Bash(PYTHONIOENCODING=utf-8 /c/Users/wogus/miniconda3/envs/quant/python.exe -m backtest.compare_exit_strategies --test-days 120 --market domestic)",
+      "Bash(rsync -avz --delete --exclude=__pycache__ '--exclude=*.pyc' '--exclude=data/raw/*.parquet' '--exclude=data/processed/*.parquet' --exclude=logs/ --exclude=results/ '--exclude=saved_models/vol_transformer_epoch0[0-1][0-8].pt' --exclude=saved_models/paper_account.json --exclude=saved_models/open_positions.json '--exclude=saved_models/wf_*' v3/ root@77.42.78.9:/opt/quant/v3/)",
+      "WebFetch(domain:github.com)",
+      "Bash(awk -F= '{print $1, \"=\", \\(length\\($2\\)>10 ? \"SET\\(\" length\\($2\\) \"chars\\)\" : \"EMPTY_OR_SHORT\"\\)}')",
+      "Bash(awk -F= '{print $1, \"=\", $2}')",
+      "Bash(npx --version)",
+      "Bash(docker --version)",
+      "Bash(uv --version)",
+      "Bash(FRED_API_KEY=9d21048f6f75afdb6768aaba9195492d /c/Users/wogus/miniconda3/envs/quant/python.exe v3/backtest/alpha_weight_trainer.py --demo)",
+      "Bash(PYTHONPATH=. FRED_API_KEY=9d21048f6f75afdb6768aaba9195492d /c/Users/wogus/miniconda3/envs/quant/python.exe v3/backtest/alpha_weight_trainer.py --demo)",
+      "Bash(PYTHONPATH=. FRED_API_KEY=9d21048f6f75afdb6768aaba9195492d /c/Users/wogus/miniconda3/envs/quant/python.exe v3/backtest/alpha_weight_trainer.py --lookback-years 3 --step-days 5)",
+      "Bash(PYTHONPATH=. /c/Users/wogus/miniconda3/envs/quant/python.exe v3/strategy/regime_v2.py)",
+      "Bash(PYTHONPATH=. /c/Users/wogus/miniconda3/envs/quant/python.exe v3/strategy/opportunity.py)",
+      "Bash(PYTHONPATH=. /c/Users/wogus/miniconda3/envs/quant/python.exe -c \"from v3.backtest.walk_forward import *; print\\('walk_forward OK'\\)\")",
+      "Skill(update-config)",
+      "Skill(update-config:*)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(echo \"non-v3 exit=$?\")"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/c/Users/wogus/miniconda3/envs/quant/python.exe \"$CLAUDE_PROJECT_DIR/.claude/hooks/post_edit.py\"",
+            "timeout": 60,
+            "statusMessage": "v3-evaluator running pytest..."
+          }
+        ]
+      }
     ]
   }
 }

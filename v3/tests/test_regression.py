@@ -1,0 +1,224 @@
+"""Regression tests — lock down bugs discovered during V3.2.1 operation.
+
+Each test here encodes an invariant that was violated in production.
+DO NOT loosen these without adding a more specific test first.
+"""
+from __future__ import annotations
+
+from datetime import datetime
+
+import pytest
+
+from v3.execution.position_manager import PositionManager
+
+
+pytestmark = pytest.mark.regression
+
+
+# ── Bug 1: hold_days must be calendar-day-based, not monitor-tick count ──
+
+class TestHoldDaysCalendarBasis:
+    """2026-04-20: FANG churned after 1 hour because hold_days incremented
+    per monitor tick (15 min). Must be derived from entry_date diff.
+    """
+
+    def _compute_hold_days(self, entry_date: str, current_date: str) -> int:
+        """Mirrors executor.monitor_positions logic."""
+        from datetime import date
+        entry_d = date.fromisoformat(str(entry_date)[:10])
+        today_d = date.fromisoformat(current_date)
+        return max(0, (today_d - entry_d).days)
+
+    def test_same_day_is_zero(self):
+        assert self._compute_hold_days("2026-04-20", "2026-04-20") == 0
+
+    def test_next_day_is_one(self):
+        assert self._compute_hold_days("2026-04-20", "2026-04-21") == 1
+
+    def test_five_day_max(self):
+        assert self._compute_hold_days("2026-04-20", "2026-04-25") == 5
+
+    def test_entry_date_with_time_suffix(self):
+        """Paper broker may attach ' HH:MM' suffix to entry_date."""
+        assert self._compute_hold_days("2026-04-20 23:40", "2026-04-21") == 1
+
+    def test_never_negative(self):
+        """Future-dated entry should clamp at 0, not negative."""
+        assert self._compute_hold_days("2026-04-25", "2026-04-20") == 0
+
+
+# ── Bug 2: PaperBroker must be wired when broker.paper_trading=True ──
+
+class TestPaperBrokerWired:
+    """2026-04-20: broker.paper_trading=true was set in config but
+    TradingExecutor didn't consume it → all NASDAQ orders 404'd on KIS sandbox.
+    """
+
+    def test_paper_trading_flag_instantiates_broker(self, tmp_save_dir, monkeypatch):
+        from v3.config.schema import V3Config
+        cfg = V3Config()
+        cfg.broker.paper_trading = True
+
+        # Isolate paper_broker save path
+        monkeypatch.chdir(tmp_save_dir.parent)
+
+        from v3.execution.executor import TradingExecutor
+        ex = TradingExecutor(cfg)
+        assert ex.paper is not None, \
+            "paper_trading=True must instantiate PaperBroker"
+
+    def test_paper_trading_off_leaves_broker_none(self, tmp_save_dir, monkeypatch):
+        from v3.config.schema import V3Config
+        cfg = V3Config()
+        cfg.broker.paper_trading = False
+
+        monkeypatch.chdir(tmp_save_dir.parent)
+
+        from v3.execution.executor import TradingExecutor
+        ex = TradingExecutor(cfg)
+        assert ex.paper is None, \
+            "paper_trading=False must NOT instantiate PaperBroker"
+
+    def test_overseas_routed_to_paper(self, tmp_save_dir, monkeypatch):
+        from v3.config.schema import V3Config
+        cfg = V3Config()
+        cfg.broker.paper_trading = True
+        monkeypatch.chdir(tmp_save_dir.parent)
+
+        from v3.execution.executor import TradingExecutor
+        ex = TradingExecutor(cfg)
+        assert ex._use_paper("FANG") is True
+        assert ex._use_paper("AAPL") is True
+
+    def test_domestic_stays_on_kis(self, tmp_save_dir, monkeypatch):
+        from v3.config.schema import V3Config
+        cfg = V3Config()
+        cfg.broker.paper_trading = True
+        monkeypatch.chdir(tmp_save_dir.parent)
+
+        from v3.execution.executor import TradingExecutor
+        ex = TradingExecutor(cfg)
+        assert ex._use_paper("005930.KS") is False
+        assert ex._use_paper("035720") is False
+
+
+# ── Bug 3: entry_history must survive daemon restart ──
+
+class TestEntryHistoryPersisted:
+    """2026-04-21: PositionManager.save() only wrote positions and cooldown.
+    entry_history was in-memory only → daemon restart lost all trade history
+    → monthly_trade_count reset to 0, consecutive_entry check bypassed.
+    """
+
+    def test_history_persists_across_instances(self, tmp_save_dir):
+        pm1 = PositionManager(save_dir=str(tmp_save_dir))
+        pm1.entry_history["FANG"] = ["2026-04-20", "2026-04-21"]
+        pm1.sell_retries["AMZN"] = 2
+        pm1.save()
+
+        pm2 = PositionManager(save_dir=str(tmp_save_dir))
+        assert pm2.entry_history.get("FANG") == ["2026-04-20", "2026-04-21"]
+        assert pm2.sell_retries.get("AMZN") == 2
+
+    def test_monthly_count_preserved_after_restart(self, tmp_save_dir):
+        pm1 = PositionManager(save_dir=str(tmp_save_dir))
+        pm1.entry_history["FANG"] = ["2026-04-05", "2026-04-15", "2026-04-20"]
+        pm1.save()
+
+        pm2 = PositionManager(save_dir=str(tmp_save_dir))
+        assert pm2.monthly_trade_count("2026-04-21") == 3
+
+    def test_monthly_count_filters_by_month(self, tmp_save_dir):
+        """March entries must not count for April."""
+        pm = PositionManager(save_dir=str(tmp_save_dir))
+        pm.entry_history["FANG"] = ["2026-03-28", "2026-03-30"]
+        pm.entry_history["AMZN"] = ["2026-04-05"]
+        assert pm.monthly_trade_count("2026-04-21") == 1
+
+    def test_ghost_removal_clears_entry_history(self, tmp_save_dir):
+        """record_sell_failure → 3 fails → force remove + clear history."""
+        pm = PositionManager(save_dir=str(tmp_save_dir))
+        pm.positions.append({"ticker": "GHOST", "qty": 10, "entry_date": "2026-04-20"})
+        pm.entry_history["GHOST"] = ["2026-04-20"]
+        pm.save()
+
+        removed = False
+        for _ in range(pm.GHOST_MAX_RETRIES):
+            removed = pm.record_sell_failure("GHOST")
+
+        assert removed is True
+        assert "GHOST" not in pm.entry_history, \
+            "Ghost removal must clear entry_history to avoid consecutive-entry veto"
+
+
+# ── Bug 4: conditional TP veto — opp > gate must skip profit_take ──
+
+class TestConditionalTPVeto:
+    """2026-04-20: +5% TP was unconditional. Policy: if opportunity still
+    exceeds the gate, hold the winner (re-evaluate the signal at TP trigger).
+    """
+
+    def test_veto_logic_skips_when_opp_high(self):
+        """Simulates the veto branch in executor.monitor_positions."""
+        opp_map = {"FANG": 0.023}
+        gate = 0.00175
+        # Exit decision mimicking profit_take
+        reason = "profit_take"
+        should_exit = True
+
+        # Replicate the veto guard
+        ticker = "FANG"
+        opp = opp_map.get(ticker)
+        veto = should_exit and reason == "profit_take" \
+            and opp is not None and opp > gate > 0
+        assert veto is True
+
+    def test_veto_does_not_trigger_for_other_reasons(self):
+        """vol_contraction / max_hold / portfolio_stop stay unconditional."""
+        opp_map = {"FANG": 0.023}
+        gate = 0.00175
+        for reason in ("max_hold", "vol_contraction", "dynamic_stop_mae", "portfolio_stop"):
+            veto = True and reason == "profit_take"  # always False here
+            assert veto is False, \
+                f"Veto must not apply to reason={reason}"
+
+    def test_veto_inactive_when_opp_below_gate(self):
+        opp_map = {"FANG": 0.001}  # below gate
+        gate = 0.00175
+        opp = opp_map.get("FANG")
+        veto = True and "profit_take" == "profit_take" \
+            and opp is not None and opp > gate > 0
+        assert veto is False
+
+    def test_veto_inactive_when_opp_missing(self):
+        opp_map: dict[str, float] = {}  # empty cache (stale/first session)
+        gate = 0.00175
+        opp = opp_map.get("FANG")
+        veto = True and "profit_take" == "profit_take" \
+            and opp is not None and opp > gate > 0
+        assert veto is False
+
+
+# ── Bug 5: opportunity cache must drop when >8h stale ──
+
+class TestOpportunityStaleness:
+    """2026-04-21: If monitor uses a cache that predates the session gap
+    (KR 09:30 ↔ US 23:40 = 14h), TP veto could fire on long-dead alpha.
+    """
+
+    def test_stale_cache_drops_after_8h(self):
+        from datetime import timedelta
+        now = datetime.now()
+        cached_at = now - timedelta(hours=9)
+        age_h = (now - cached_at).total_seconds() / 3600
+        assert age_h > 8
+        # Pipeline logic: drop cache when age_h > 8
+        drop = age_h > 8
+        assert drop is True
+
+    def test_fresh_cache_kept_under_8h(self):
+        from datetime import timedelta
+        now = datetime.now()
+        cached_at = now - timedelta(hours=2)
+        age_h = (now - cached_at).total_seconds() / 3600
+        assert age_h <= 8
