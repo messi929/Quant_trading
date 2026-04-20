@@ -109,6 +109,7 @@ class LivePipeline:
         # Latest opportunity snapshot (for TP conditional re-evaluation)
         self._opportunity_map: dict[str, float] = {}
         self._opportunity_gate: float = 0.0
+        self._opportunity_at: datetime | None = None  # when the snapshot was taken
 
     # ──────────────────────────────────────────────────────────
     def collect_data(self) -> pd.DataFrame:
@@ -165,6 +166,7 @@ class LivePipeline:
         # Cache opportunity snapshot for TP conditional re-evaluation during monitor
         self._opportunity_map = dict(signal.opportunity_map)
         self._opportunity_gate = signal.opportunity_gate
+        self._opportunity_at = datetime.now()
 
         return {
             "action": signal.action,
@@ -181,10 +183,24 @@ class LivePipeline:
 
     def monitor(self) -> list[dict]:
         today = datetime.now().strftime("%Y-%m-%d")
+        # Stale-cache safeguard: if opportunity snapshot is >8h old
+        # (spans a session gap), drop it to avoid vetoing with outdated alpha.
+        if self._opportunity_at is not None:
+            age_h = (datetime.now() - self._opportunity_at).total_seconds() / 3600
+            if age_h > 8:
+                logger.warning(
+                    f"Opportunity cache stale ({age_h:.1f}h old) — "
+                    f"dropping for TP veto (safer to let TP fire unconditionally)"
+                )
+                opp_map, opp_gate = {}, 0.0
+            else:
+                opp_map, opp_gate = self._opportunity_map, self._opportunity_gate
+        else:
+            opp_map, opp_gate = {}, 0.0
         return self.executor.monitor_positions(
             today,
-            opportunity_map=self._opportunity_map,
-            opportunity_gate=self._opportunity_gate,
+            opportunity_map=opp_map,
+            opportunity_gate=opp_gate,
         )
 
     def run_session(self) -> dict:

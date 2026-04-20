@@ -319,7 +319,7 @@ class TradingExecutor:
             else:
                 return self.api.get_overseas_price(code, "NASD")
         except Exception as e:
-            logger.debug(f"Price fetch failed {ticker}: {e}")
+            logger.warning(f"Price fetch failed {ticker}: {e}")
             return None
 
     def _get_portfolio_value(self) -> float:

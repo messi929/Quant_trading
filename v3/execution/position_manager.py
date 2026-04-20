@@ -26,6 +26,7 @@ class PositionManager:
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.positions_path = self.save_dir / "open_positions.json"
         self.cooldown_path = self.save_dir / "ticker_cooldown.json"
+        self.history_path = self.save_dir / "entry_history.json"
         self.positions: list[dict] = []
         self.cooldown: dict[str, list] = {}
         self.sell_retries: dict[str, int] = {}
@@ -40,12 +41,26 @@ class PositionManager:
         if self.cooldown_path.exists():
             with open(self.cooldown_path, "r") as f:
                 self.cooldown = json.load(f)
+        if self.history_path.exists():
+            with open(self.history_path, "r") as f:
+                data = json.load(f)
+                self.entry_history = data.get("entry_history", {})
+                self.sell_retries = data.get("sell_retries", {})
+            logger.info(
+                f"Loaded entry_history: {len(self.entry_history)} tickers, "
+                f"sell_retries: {len(self.sell_retries)}"
+            )
 
     def save(self) -> None:
         with open(self.positions_path, "w") as f:
             json.dump(self.positions, f, indent=2, default=str)
         with open(self.cooldown_path, "w") as f:
             json.dump(self.cooldown, f, indent=2, default=str)
+        with open(self.history_path, "w") as f:
+            json.dump(
+                {"entry_history": self.entry_history, "sell_retries": self.sell_retries},
+                f, indent=2, default=str,
+            )
 
     def add_position(self, position: dict) -> None:
         self.positions.append(position)
@@ -87,6 +102,9 @@ class PositionManager:
         if self.sell_retries[ticker] >= self.GHOST_MAX_RETRIES:
             logger.warning(f"Ghost position: {ticker} — {self.GHOST_MAX_RETRIES} sell failures, force removing")
             self.remove_position(ticker)
+            # Clear entry_history to prevent consecutive-entry veto from a ghost
+            self.entry_history.pop(ticker, None)
+            self.save()
             return True
         return False
 
