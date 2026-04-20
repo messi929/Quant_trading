@@ -151,52 +151,47 @@ class TestEntryHistoryPersisted:
             "Ghost removal must clear entry_history to avoid consecutive-entry veto"
 
 
-# ── Bug 4: conditional TP veto — opp > gate must skip profit_take ──
+# ── Bug 4: conditional exit veto — opp > gate must skip profit_take AND max_hold ──
 
-class TestConditionalTPVeto:
-    """2026-04-20: +5% TP was unconditional. Policy: if opportunity still
-    exceeds the gate, hold the winner (re-evaluate the signal at TP trigger).
+class TestConditionalExitVeto:
+    """2026-04-20: +5% TP was unconditional. Extended 2026-04-21: max_hold also.
+    Policy: if opportunity still exceeds the gate, hold the position
+    (re-evaluate the signal at any time-based exit trigger).
+    Risk-based exits (vol_contraction, mae_stop, portfolio_stop) stay unconditional.
     """
+    VETOABLE = ("profit_take", "max_hold")
+    UNCONDITIONAL = ("vol_contraction", "dynamic_stop_mae", "portfolio_stop")
 
-    def test_veto_logic_skips_when_opp_high(self):
-        """Simulates the veto branch in executor.monitor_positions."""
-        opp_map = {"FANG": 0.023}
-        gate = 0.00175
-        # Exit decision mimicking profit_take
-        reason = "profit_take"
-        should_exit = True
+    def _apply_veto(self, reason: str, opp: float | None, gate: float) -> bool:
+        return (reason in self.VETOABLE) and (opp is not None) and (opp > gate > 0)
 
-        # Replicate the veto guard
-        ticker = "FANG"
-        opp = opp_map.get(ticker)
-        veto = should_exit and reason == "profit_take" \
-            and opp is not None and opp > gate > 0
-        assert veto is True
+    def test_profit_take_vetoed_when_opp_high(self):
+        assert self._apply_veto("profit_take", 0.023, 0.00175) is True
 
-    def test_veto_does_not_trigger_for_other_reasons(self):
-        """vol_contraction / max_hold / portfolio_stop stay unconditional."""
-        opp_map = {"FANG": 0.023}
-        gate = 0.00175
-        for reason in ("max_hold", "vol_contraction", "dynamic_stop_mae", "portfolio_stop"):
-            veto = True and reason == "profit_take"  # always False here
-            assert veto is False, \
-                f"Veto must not apply to reason={reason}"
+    def test_max_hold_vetoed_when_opp_high(self):
+        """Holding period exceeded but model still likes the ticker → hold."""
+        assert self._apply_veto("max_hold", 0.023, 0.00175) is True
+
+    def test_risk_reasons_never_vetoed(self):
+        """vol_contraction / MAE / portfolio_stop remain unconditional even
+        when opportunity is high — these are risk signals, not time exits."""
+        for reason in self.UNCONDITIONAL:
+            assert self._apply_veto(reason, 0.023, 0.00175) is False, \
+                f"Veto must not apply to risk-based reason={reason}"
 
     def test_veto_inactive_when_opp_below_gate(self):
-        opp_map = {"FANG": 0.001}  # below gate
-        gate = 0.00175
-        opp = opp_map.get("FANG")
-        veto = True and "profit_take" == "profit_take" \
-            and opp is not None and opp > gate > 0
-        assert veto is False
+        assert self._apply_veto("profit_take", 0.001, 0.00175) is False
+        assert self._apply_veto("max_hold", 0.001, 0.00175) is False
 
     def test_veto_inactive_when_opp_missing(self):
-        opp_map: dict[str, float] = {}  # empty cache (stale/first session)
-        gate = 0.00175
-        opp = opp_map.get("FANG")
-        veto = True and "profit_take" == "profit_take" \
-            and opp is not None and opp > gate > 0
-        assert veto is False
+        """Empty cache (first session / stale) → no veto, exit fires normally."""
+        assert self._apply_veto("profit_take", None, 0.00175) is False
+        assert self._apply_veto("max_hold", None, 0.00175) is False
+
+    def test_veto_inactive_when_gate_zero(self):
+        """Empty opportunity cache drops gate to 0 → safety: no veto fires."""
+        assert self._apply_veto("profit_take", 0.023, 0.0) is False
+        assert self._apply_veto("max_hold", 0.023, 0.0) is False
 
 
 # ── Bug 6: PaperBroker ↔ PositionManager divergence (orphan positions) ──

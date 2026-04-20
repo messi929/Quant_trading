@@ -175,15 +175,18 @@ class TradingExecutor:
                 low_price=price_info.get("low", current_price),
             )
 
-            # Conditional TP veto: if profit_take triggered BUT opportunity still
-            # exceeds the gate, hold. Other exit reasons remain unconditional.
-            if exit_decision.should_exit and exit_decision.reason == "profit_take":
+            # Conditional exit veto: if profit_take OR max_hold triggered BUT
+            # opportunity still exceeds the gate, hold. Risk-based exits
+            # (vol_contraction, dynamic_stop_mae, portfolio_stop) remain unconditional.
+            VETOABLE = ("profit_take", "max_hold")
+            if exit_decision.should_exit and exit_decision.reason in VETOABLE:
                 opp = opportunity_map.get(ticker)
                 if opp is not None and opp > opportunity_gate > 0:
                     ret = (current_price / pos["entry_price"] - 1) if pos["entry_price"] else 0
                     logger.info(
-                        f"TP HOLD {ticker}: ret={ret:+.2%} target hit, "
-                        f"but opportunity={opp:.5f} > gate={opportunity_gate:.5f} — hold"
+                        f"{exit_decision.reason.upper()} HOLD {ticker}: "
+                        f"ret={ret:+.2%} hold={hold_days}d, "
+                        f"opportunity={opp:.5f} > gate={opportunity_gate:.5f} — hold"
                     )
                     self.positions.save()
                     continue

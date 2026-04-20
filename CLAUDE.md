@@ -1030,14 +1030,16 @@ Entries: 1
 - 승자를 조기에 자르는 문제. 모델이 여전히 "진입할 만하다"(opportunity > gate)
   판단하는 종목을 TP 도달만으로 매도하면 edge 손실.
 
-**정책**
-- `reason == "profit_take"` 트리거 시:
+**정책** (2026-04-21 확장: max_hold 포함)
+- **시간 기반 청산**(`profit_take`, `max_hold`) 트리거 시:
   - `opportunity(ticker) > cost × 1.75` 성립 → **보유 유지** (veto + 로그)
-  - 그 외 → 기존대로 청산
-- 다른 청산 사유(`max_hold`, `vol_contraction`, `dynamic_stop_mae`,
-  `portfolio_stop`)는 **veto 금지** (무조건 체결)
+  - 그 외 → 청산
+- **리스크 기반 청산**(`vol_contraction`, `dynamic_stop_mae`, `portfolio_stop`)
+  은 **veto 금지** (무조건 체결). 리스크 신호는 시간 경과와 무관.
 - Phase 2의 진입 수식(`opportunity > cost × k`)을 **유지 판단에도 재사용**
   → 단일 진입/유지 기준 (설계 통일)
+- 원칙: "시간이 다 됐다"는 청산 사유가 아니라 **재평가 트리거**일 뿐.
+  모델이 여전히 진입할 만하다면 보유 유지하는 것이 edge 보존.
 
 **구현** (3파일)
 
