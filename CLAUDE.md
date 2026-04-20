@@ -1193,3 +1193,88 @@ Evaluator 리포트가 3섹션(regression / invariant / silent-failure) 모두 c
 - Evaluator 정의: `.claude/agents/v3-evaluator.md`
 - Hook 스크립트: `.claude/hooks/post_edit.py`
 - Hook 등록: `.claude/settings.local.json` `hooks.PostToolUse`
+
+---
+
+## 후속 과제 — 페르소나 정합성 점검 결과 (2026-04-21)
+
+"확신 있을 때만, 크게, 빠르게" 3대 원칙 기준 현재 시스템 정합성 평가.
+**즉시 수정 없음**. 관찰 후 데이터 기반 튜닝 예정.
+
+### 원칙 점수 (2026-04-21 기준)
+
+| 원칙 | 점수 | 상태 |
+|------|------|------|
+| 1. 확신 있을 때만 | 5/10 | 🔄 관찰 대상 |
+| 2. 크게 | 3/10 | 🔄 관찰 대상 (가장 심각) |
+| 3. 빠르게 | 8/10 | ✅ 현재 정책 적절 |
+
+### 원칙 3 "빠르게" 재해석 — 종결 (수정 없음)
+
+초안에선 "max_hold veto로 무기한 보유 가능 → hard ceiling 10d 필요"
+제안했으나 철회. 이유:
+
+- V3의 "빠르게" = "thesis 깨지면 빠져나오기"이지 "시간 됐으니 팔기"가 아님
+- Thesis 깨짐 신호(`vol_contraction`, `dynamic_stop_mae`, `portfolio_stop`)
+  가 **무조건 청산** 담당 → 이미 구현됨
+- 시간 기반(`profit_take`, `max_hold`)은 **opportunity 재평가 트리거** 역할
+- `opportunity_map >8h stale guard`가 세션 간 fail-safe 담당
+- 회전율 자체가 수익 공식 아님. Positive expectancy × 반복. 무의미한 churn =
+  expectancy 음수
+- V2(일단위 return 예측)의 "빠르게"를 V3(월 5회 vol 팽창)에 그대로 적용하면
+  principle conflict
+
+**결론**: 현재 conditional veto 정책 유지. 리스크 기반 청산이 "빠르게"의
+실질적 구현체.
+
+### 원칙 1 "확신 있을 때만" — 관찰 후 검토 (5/10)
+
+**현재 실태**:
+- `opp gate = cost × 1.75 = 0.00175` → 비용 회수 1.75배 수준
+- 이게 "확신"인가? "거래비용 약간 넘는 기댓값"인가?
+- 진입 gate와 유지 veto gate가 **동일 수식**. Phase 2 "단일 수식" 원칙은
+  우아하지만, 실전에서 "신규 진입"과 "지속 보유"의 필요 conviction은 다름
+- Regime=caution인데 게이트 불변 (가중치만 변경)
+- 편입된 ADI/AMZN는 `confidence=0.5` 합성값 — 실제 학습 시점 conviction 아님
+
+**검토할 개선안** (관찰 후 선택):
+1. **유지 veto gate 상향**: 유지는 `cost × 3.0 (=0.003)`, 진입보다 높은 bar.
+   이유: "계속 들고 있겠다"는 "신규로 들어가겠다"보다 강한 확신 필요.
+2. **Regime multiplier**: `caution → gate × 1.5`, `strong_bull → gate × 0.8`.
+   "경계 국면에선 더 엄격한 bar, 강세 국면엔 완화"
+3. **Reconciled 포지션의 veto 제외**: `confidence=0.5` 합성값 포지션은
+   max_hold 도달 시 강제 청산 (opp veto 금지)
+
+### 원칙 2 "크게" — 관찰 후 검토 (3/10, **가장 심각**)
+
+**현재 실태**:
+- Deployed capital **32%** / Cash **68%** — "집중 투자"와 거리 멀음
+- 최대 포지션 FANG 가중치 `0.18` (max_single_weight 0.40의 절반도 안 씀)
+- ADI 0.06, AMZN 0.07 → 1억 기준 **600~700만원**. 최소 거래 500만원 겨우 넘음
+- 의미 있는 수익이 나올 절대 금액 아님
+- 소자본 분산 회피 원칙에 정면 위배
+
+**검토할 개선안** (관찰 후 선택):
+1. **`min_position_weight 0.02 → 0.10`**: 10% 미만 후보는 drop, 기존 포지션에
+   재할당. 이유: "작게 여러 개"보다 "크게 1~2개"
+2. **position_scale 곡선 조정**: 현재 caution=0.47. 확신 있는 종목엔 최소
+   0.60 배치 가능하게. "확신 없으면 현금 OK, 확신 있는 종목엔 크게"
+3. **동적 capital deployment**: 포지션 수 대비 배치 비율 증가. 1종목이면 40%,
+   2종목이면 각 25%, 3종목이면 각 20%
+
+### 관찰 기간 + 데이터 수집
+
+**기간**: **1~2주** 또는 **5~10 거래 사이클** (어느 쪽이든 먼저 충족)
+
+**관찰 포인트**:
+1. Conditional veto가 실제 발동하는가 (TP/max_hold 트리거 시점 & 결과)
+2. 8h staleness guard가 세션 간격(KR↔US=14h)에서 의도대로 작동하는가
+3. Regime 전환(caution → neutral/bull) 시 position_scale이 자연스럽게 오르는가
+4. opportunity 분포: gate(0.00175) 대비 실제 분포(0.002~0.005인가, 0.01+인가)
+5. 포지션 크기 분포: 현실에서 0.10 이상 배치되는 경우가 얼마나 되는가
+
+**의사결정 게이트**: 위 5개 포인트 데이터 쌓인 후, 원칙 1·2 개선안 중
+**가장 영향 큰 1개씩만 선택 적용**. 동시 다발 수정 금지 (변경 효과 측정 불가).
+
+**절대 금지**: 관찰 기간 중 임의 튜닝. "그냥 느낌으로 올려보자" 금지.
+데이터 없이 정책 건드리면 백테스트-라이브 parity 깨짐.
