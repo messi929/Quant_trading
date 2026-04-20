@@ -199,6 +199,84 @@ class TestConditionalTPVeto:
         assert veto is False
 
 
+# ── Bug 6: PaperBroker ↔ PositionManager divergence (orphan positions) ──
+
+class TestPositionReconciliation:
+    """2026-04-21: Manual PaperBroker.buy during testing left positions in
+    paper_account.json that never reached PositionManager — executor's
+    monitor_positions cannot see them, so no auto-TP, no ghost removal,
+    no cooldown tracking.
+
+    Invariant: every overseas paper position must have a PositionManager entry.
+    """
+
+    def test_detect_orphans_when_pm_empty(self, tmp_save_dir):
+        import json
+        paper_path = tmp_save_dir / "paper_account.json"
+        paper_path.write_text(json.dumps({
+            "cash_krw": 90_000_000,
+            "positions": [
+                {"ticker": "ADI", "qty": 12, "entry_price_usd": 350.0,
+                 "entry_price_krw": 490000, "entry_date": "2026-04-11 20:41",
+                 "amount_krw": 5_880_000},
+            ],
+            "trade_history": [],
+        }))
+
+        from v3.execution.paper_broker import PaperBroker
+        from v3.scripts.reconcile_positions import detect_orphans
+
+        paper = PaperBroker(save_dir=str(tmp_save_dir))
+        pm = PositionManager(save_dir=str(tmp_save_dir))
+
+        orphans = detect_orphans(paper, pm)
+        assert len(orphans) == 1
+        assert orphans[0]["ticker"] == "ADI"
+
+    def test_fix_registers_orphans(self, tmp_save_dir):
+        import json
+        paper_path = tmp_save_dir / "paper_account.json"
+        paper_path.write_text(json.dumps({
+            "cash_krw": 90_000_000,
+            "positions": [
+                {"ticker": "ADI", "qty": 12, "entry_price_usd": 350.0,
+                 "entry_price_krw": 490000, "entry_date": "2026-04-11 20:41",
+                 "amount_krw": 5_880_000},
+                {"ticker": "AMZN", "qty": 21, "entry_price_usd": 238.0,
+                 "entry_price_krw": 333200, "entry_date": "2026-04-11 20:41",
+                 "amount_krw": 6_997_200},
+            ],
+            "trade_history": [],
+        }))
+
+        from v3.execution.paper_broker import PaperBroker
+        from v3.scripts.reconcile_positions import detect_orphans, to_pm_entry
+
+        paper = PaperBroker(save_dir=str(tmp_save_dir))
+        pm = PositionManager(save_dir=str(tmp_save_dir))
+
+        for o in detect_orphans(paper, pm):
+            pm.add_position(to_pm_entry(o))
+
+        # Re-load: invariant holds after reconcile
+        pm2 = PositionManager(save_dir=str(tmp_save_dir))
+        assert len(detect_orphans(paper, pm2)) == 0
+
+    def test_reconcile_preserves_entry_date(self, tmp_save_dir):
+        """entry_date with time suffix must be trimmed to YYYY-MM-DD
+        so hold_days calculation (date.fromisoformat) works."""
+        from v3.scripts.reconcile_positions import to_pm_entry
+
+        entry = to_pm_entry({
+            "ticker": "X", "qty": 10, "entry_price_usd": 100.0,
+            "entry_price_krw": 140000, "entry_date": "2026-04-11 20:41",
+            "amount_krw": 1_400_000,
+        })
+        assert entry["entry_date"] == "2026-04-11"
+        assert entry["qty"] == 10
+        assert entry["entry_price"] == 100.0
+
+
 # ── Bug 5: opportunity cache must drop when >8h stale ──
 
 class TestOpportunityStaleness:
