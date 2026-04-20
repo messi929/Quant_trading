@@ -977,3 +977,140 @@ bfea53e  feat: S5 — backtest/engine.py Phase 2 rewrite + legacy archive
     - Phase 1 threshold_multiplier 패치 → 1주간 CASH, 급등장 놓침
     - 패치 누적 금지, 원칙 훼손 발견 즉시 재설계
 ```
+
+---
+
+## V3.2.1 — 실행 인프라 보강 (2026-04-20)
+
+Phase 2 재설계 후 첫 TRADE 신호 발생(2026-04-20 09:30 KST, regime=caution,
+FANG opp=0.023) 과정에서 **두 가지 실행 레벨 결함**을 발견·수정.
+
+### 개선 1: PaperBroker 와이어링 (sandbox NASDAQ 체결 복구)
+
+**배경**
+- V3 universe는 NASDAQ-only. KIS sandbox는 **해외주식 API 미지원**
+  (`openapivts...:9443/.../overseas-stock/.../price` → 404).
+- `v3/config/v3_config.yaml`에 `broker.paper_trading: true`가 설정되어 있었으나
+  `TradingExecutor`가 이를 **읽지 않고** 항상 `KISApi`로 라우팅.
+- 결과: 09:30 세션에서 FANG 신호 발생했으나 `Buy order failed FANG: 404`로
+  **Entries=0**. Paper 검증 루프 자체가 성립하지 않음.
+
+**수정 내용** (`v3/execution/executor.py`)
+```python
+# __init__
+self.paper: PaperBroker | None = (
+    PaperBroker(initial_capital=cfg.backtest.initial_capital)
+    if cfg.broker.paper_trading else None
+)
+
+# 해외 티커 라우팅 헬퍼
+def _use_paper(self, ticker: str) -> bool:
+    return self.paper is not None and not is_domestic(ticker)
+```
+
+- `_place_buy_order`, `_place_sell_order`, `_get_price`,
+  `_get_portfolio_value`, `_get_holding_qty` 5개 메서드에 paper 분기 추가
+- 해외 티커(non-domestic) → PaperBroker(yfinance 실시간/전일종가)
+- 국내 티커 → 기존 KIS 경로 유지 (NASDAQ-only 환경이라 실제 해당 없음)
+- 포지션 dict에 `qty` 저장 (매도 시 필요 — 기존 누락 버그 동시 수정)
+
+**검증 결과** (22:16 KST 수동 세션)
+```
+PAPER BUY FANG: 82주 @ $180.45 = 20,715,691 KRW (수수료 2,072)
+Entries: 1
+```
+
+### 개선 2: Conditional TP (opportunity 재평가 후 유지/청산)
+
+**배경**
+- V3 exit 규칙은 시간감쇠 TP 도달 시 **무조건 청산**
+  (Day1 +5%, Day2 +4%, …, Day5 +1.5%).
+- 사용자 정책: "+5% 됐다고 무조건 청산하는 게 아니라 그 때의 시그널을 보고
+  또 판단하자"
+- 승자를 조기에 자르는 문제. 모델이 여전히 "진입할 만하다"(opportunity > gate)
+  판단하는 종목을 TP 도달만으로 매도하면 edge 손실.
+
+**정책**
+- `reason == "profit_take"` 트리거 시:
+  - `opportunity(ticker) > cost × 1.75` 성립 → **보유 유지** (veto + 로그)
+  - 그 외 → 기존대로 청산
+- 다른 청산 사유(`max_hold`, `vol_contraction`, `dynamic_stop_mae`,
+  `portfolio_stop`)는 **veto 금지** (무조건 체결)
+- Phase 2의 진입 수식(`opportunity > cost × k`)을 **유지 판단에도 재사용**
+  → 단일 진입/유지 기준 (설계 통일)
+
+**구현** (3파일)
+
+```python
+# v3/strategy/signal.py — TradeSignal 필드 추가
+opportunity_map: dict[str, float]  # 전 티커 opportunity
+opportunity_gate: float             # cost × gate_multiplier
+
+# v3/pipeline/live_pipeline.py — generate_signal 직후 캐시
+self._opportunity_map = dict(signal.opportunity_map)
+self._opportunity_gate = signal.opportunity_gate
+
+# executor에 전달
+self.executor.monitor_positions(
+    today,
+    opportunity_map=self._opportunity_map,
+    opportunity_gate=self._opportunity_gate,
+)
+
+# v3/execution/executor.py — monitor_positions veto 로직
+if exit_decision.should_exit and exit_decision.reason == "profit_take":
+    opp = opportunity_map.get(ticker)
+    if opp is not None and opp > opportunity_gate > 0:
+        logger.info(f"TP HOLD {ticker}: ret={ret:+.2%} target hit, "
+                    f"but opportunity={opp:.5f} > gate={opportunity_gate:.5f} — hold")
+        continue
+```
+
+### 매도 정책 — v3.2.1 개정
+
+```
+기존 (v3.2):
+  1. 시간감쇠 이익실현: Day1 +5% ~ Day5 +1.5% → 무조건 청산
+  2. Vol 수축 (진입 vol의 70% 이하 3일 지속) → 청산
+  3. 보유 만기 (5일) → 청산
+  4. 포트폴리오 일간 -1.0~2.0% → 전량 청산
+
+개정 (v3.2.1):
+  1. 시간감쇠 이익실현: Day1 +5% ~ Day5 +1.5%
+     → opportunity(ticker) > cost × 1.75 이면 **유지** (veto)
+     → 그 외 청산
+  2~4. 변경 없음 (무조건 청산)
+```
+
+### 검증 (2026-04-20 22:16~22:22 KST)
+
+```
+opportunity_map cached: 99 tickers, gate=0.00175
+  FANG: opp=0.02303  passes=True     (gate의 13배)
+  BKR:  opp=0.01691  passes=True
+  EXC:  opp=0.01144  passes=True
+  TMUS: opp=0.00730  passes=True
+  NFLX: opp=0.00547  passes=True
+
+PAPER BUY FANG: 82주 @ $180.45
+Entries: 1, Paper total: 100,679,152 KRW
+```
+
+### V3.2.1 커밋
+
+```
+<hash>  feat: V3 실행 보강 — PaperBroker 와이어링 + conditional TP
+```
+
+### V3.2.1 추가 교훈
+
+```
+11. 설정 필드는 반드시 코드가 소비해야 한다
+    - broker.paper_trading=true가 설정만 되고 코드 미소비 → 1주간 모든
+      NASDAQ 신호가 KIS 404로 체결 실패. "dead config"는 즉각 수정 대상.
+
+12. TP는 신호의 일부지, 신호 위에 올라앉은 규칙이 아니다
+    - +5% 도달을 "확정 청산"이 아닌 "재평가 트리거"로 재정의
+    - 진입과 유지를 동일 수식(opportunity > cost × k)으로 통일
+    - 승자 자르기 방지 = 손절만큼 중요한 edge 보존 메커니즘
+```

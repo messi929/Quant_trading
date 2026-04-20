@@ -49,6 +49,8 @@ class TradeSignal:
     n_candidates: int
     n_approved: int
     rejection_reasons: dict[str, int] = field(default_factory=dict)
+    opportunity_map: dict[str, float] = field(default_factory=dict)  # ticker → opportunity
+    opportunity_gate: float = 0.0                                     # cost × gate_multiplier
 
 
 class SignalGenerator:
@@ -139,6 +141,8 @@ class SignalGenerator:
             cost=cost,
         )
         opportunity_approved = report.approved
+        opp_map = {r.ticker: r.opportunity for r in report.rows}
+        opp_gate = cost * self.scorer.gate_multiplier
 
         # 4. Operational filtering — pick best candidates that pass ops checks
         selected: list[EntryCandidate] = []
@@ -192,6 +196,8 @@ class SignalGenerator:
                 n_candidates=len(report.rows),
                 n_approved=len(opportunity_approved),
                 rejection_reasons=rejections,
+                opportunity_map=opp_map,
+                opportunity_gate=opp_gate,
             )
 
         positions = self._size(selected, regime.position_scale, ohlcv, vol_scores)
@@ -215,6 +221,8 @@ class SignalGenerator:
             n_candidates=len(report.rows),
             n_approved=len(opportunity_approved),
             rejection_reasons=rejections,
+            opportunity_map=opp_map,
+            opportunity_gate=opp_gate,
         )
 
     # ── private ───────────────────────────────────────────

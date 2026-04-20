@@ -12,6 +12,7 @@ from loguru import logger
 
 from v3.config.schema import V3Config
 from v3.execution.broker import KISApi
+from v3.execution.paper_broker import PaperBroker
 from v3.execution.position_manager import PositionManager
 from v3.rules.exit import ExitRules
 from v3.strategy.risk import RiskManager
@@ -19,11 +20,16 @@ from v3.utils.ticker_utils import kis_code, is_domestic, round_to_tick
 
 
 class TradingExecutor:
-    """Executes V3 trades via KIS API."""
+    """Executes V3 trades via KIS API (domestic) or PaperBroker (overseas sandbox)."""
 
     def __init__(self, cfg: V3Config):
         self.cfg = cfg
         self.api = KISApi()
+        self.paper: PaperBroker | None = (
+            PaperBroker(initial_capital=cfg.backtest.initial_capital)
+            if cfg.broker.paper_trading
+            else None
+        )
         self.positions = PositionManager()
         self.risk = RiskManager(
             daily_loss_limit=cfg.risk.daily_loss_limit,
@@ -104,6 +110,7 @@ class TradingExecutor:
                     "ticker": ticker,
                     "entry_date": current_date,
                     "entry_price": order["price"],
+                    "qty": order.get("qty", 0),
                     "weight": weight,
                     "hold_days": 0,
                     "vol_score": pos.get("vol_score", 0),
@@ -116,11 +123,23 @@ class TradingExecutor:
 
         return executed
 
-    def monitor_positions(self, current_date: str) -> list[dict]:
+    def monitor_positions(
+        self,
+        current_date: str,
+        opportunity_map: dict[str, float] | None = None,
+        opportunity_gate: float = 0.0,
+    ) -> list[dict]:
         """Check exits on all open positions.
+
+        Args:
+            current_date: YYYY-MM-DD.
+            opportunity_map: Latest {ticker: opportunity}. Used to veto profit_take
+                when alpha signal still supports holding.
+            opportunity_gate: cost × gate_multiplier. TP veto only if opp > gate.
 
         Returns list of closed positions.
         """
+        opportunity_map = opportunity_map or {}
         closed = []
         portfolio_value = self._get_portfolio_value()
         self.risk.update(portfolio_value)
@@ -147,6 +166,19 @@ class TradingExecutor:
                 confidence=pos.get("confidence", 0.5),
                 low_price=price_info.get("low", current_price),
             )
+
+            # Conditional TP veto: if profit_take triggered BUT opportunity still
+            # exceeds the gate, hold. Other exit reasons remain unconditional.
+            if exit_decision.should_exit and exit_decision.reason == "profit_take":
+                opp = opportunity_map.get(ticker)
+                if opp is not None and opp > opportunity_gate > 0:
+                    ret = (current_price / pos["entry_price"] - 1) if pos["entry_price"] else 0
+                    logger.info(
+                        f"TP HOLD {ticker}: ret={ret:+.2%} target hit, "
+                        f"but opportunity={opp:.5f} > gate={opportunity_gate:.5f} — hold"
+                    )
+                    self.positions.save()
+                    continue
 
             if exit_decision.should_exit:
                 order = self._place_sell_order(ticker, pos)
@@ -198,9 +230,19 @@ class TradingExecutor:
 
     # ── Private Methods ──────────────────────────────────────
 
+    def _use_paper(self, ticker: str) -> bool:
+        """Route overseas tickers to PaperBroker when paper_trading is on."""
+        return self.paper is not None and not is_domestic(ticker)
+
     def _place_buy_order(self, ticker: str, amount: float) -> dict | None:
-        """Place a buy order via KIS API."""
+        """Place a buy order via KIS API (domestic) or PaperBroker (overseas paper)."""
         try:
+            if self._use_paper(ticker):
+                trade = self.paper.buy(ticker, amount)
+                if not trade:
+                    return None
+                return {"ticker": ticker, "price": trade["price_usd"], "qty": trade["qty"]}
+
             code = kis_code(ticker)
             if is_domestic(ticker):
                 price_info = self.api.get_domestic_price(code)
@@ -227,12 +269,18 @@ class TradingExecutor:
             return None
 
     def _place_sell_order(self, ticker: str, position: dict) -> dict | None:
-        """Place a sell order via KIS API."""
+        """Place a sell order via KIS API or PaperBroker."""
         try:
+            qty = int(position.get("qty", 0) or 0)
+
+            if self._use_paper(ticker):
+                trade = self.paper.sell(ticker, qty if qty > 0 else None)
+                if not trade:
+                    return None
+                return {"ticker": ticker, "price": trade["price_usd"], "qty": trade["qty"]}
+
             code = kis_code(ticker)
-            qty = position.get("qty", 0)
             if qty <= 0:
-                # Try to get qty from balance
                 qty = self._get_holding_qty(ticker)
                 if qty <= 0:
                     return None
@@ -253,6 +301,10 @@ class TradingExecutor:
     def _get_price(self, ticker: str) -> dict | None:
         """Get current price for a ticker."""
         try:
+            if self._use_paper(ticker):
+                info = self.paper.get_price(ticker)
+                return {"price": info["price"]} if info["price"] > 0 else None
+
             code = kis_code(ticker)
             if is_domestic(ticker):
                 return self.api.get_domestic_price(code)
@@ -263,8 +315,10 @@ class TradingExecutor:
             return None
 
     def _get_portfolio_value(self) -> float:
-        """Get total portfolio value from broker."""
+        """Get total portfolio value from broker (paper if enabled, else KIS)."""
         try:
+            if self.paper is not None:
+                return float(self.paper.get_balance()["total_eval"])
             balance = self.api.get_domestic_balance()
             return balance.get("total_eval", 100_000_000)
         except Exception:
@@ -273,6 +327,12 @@ class TradingExecutor:
     def _get_holding_qty(self, ticker: str) -> int:
         """Get actual holding quantity from broker balance."""
         try:
+            if self._use_paper(ticker):
+                for pos in self.paper.positions:
+                    if pos["ticker"] == ticker:
+                        return int(pos.get("qty", 0))
+                return 0
+
             code = kis_code(ticker)
             if is_domestic(ticker):
                 balance = self.api.get_domestic_balance()

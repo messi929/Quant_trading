@@ -106,6 +106,10 @@ class LivePipeline:
         # Execution
         self.executor = TradingExecutor(self.cfg)
 
+        # Latest opportunity snapshot (for TP conditional re-evaluation)
+        self._opportunity_map: dict[str, float] = {}
+        self._opportunity_gate: float = 0.0
+
     # ──────────────────────────────────────────────────────────
     def collect_data(self) -> pd.DataFrame:
         """Collect latest OHLCV data (incremental)."""
@@ -158,6 +162,10 @@ class LivePipeline:
             f"cash={signal.cash_weight:.0%}, rejections={signal.rejection_reasons}"
         )
 
+        # Cache opportunity snapshot for TP conditional re-evaluation during monitor
+        self._opportunity_map = dict(signal.opportunity_map)
+        self._opportunity_gate = signal.opportunity_gate
+
         return {
             "action": signal.action,
             "positions": signal.positions,
@@ -173,7 +181,11 @@ class LivePipeline:
 
     def monitor(self) -> list[dict]:
         today = datetime.now().strftime("%Y-%m-%d")
-        return self.executor.monitor_positions(today)
+        return self.executor.monitor_positions(
+            today,
+            opportunity_map=self._opportunity_map,
+            opportunity_gate=self._opportunity_gate,
+        )
 
     def run_session(self) -> dict:
         logger.info("=" * 60)
