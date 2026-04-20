@@ -1134,3 +1134,60 @@ hold_days = max(0, (today_d - entry_d).days)   # 달력 일수
 
 **교훈 13**: 시간 관련 카운터는 **호출 빈도가 아니라 도메인 시간축**을 기준으로
 측정해야 한다. 15분 tick이 "1일"이 되면 Day5 TP가 1시간 만에 도달.
+
+---
+
+## 개발 워크플로우 (V3.2.1+) — **검증 필수**
+
+Generator(코드 작성) / Evaluator(독립 검증) 분리 체계. **세션마다 일관되게 적용할 것.**
+
+### 자동 검증 — Hook Layer B (PostToolUse)
+
+V3 Python 파일 편집 시 pytest 회귀 suite(`v3/tests/`)가 자동 실행됨. 설정:
+`.claude/settings.local.json` PostToolUse + `.claude/hooks/post_edit.py`.
+
+- **Hook 실패(`[v3-evaluator hook] ✗`) 시 즉시 중단**. 다음 작업 금지.
+- 먼저 실패 원인 파악 → 코드 수정 → 재편집 → 통과 확인 후 진행.
+- 테스트 자체가 틀렸다고 판단되면 테스트부터 수정하되, "테스트가 까탈스러워서
+  끄겠다" 금지. 테스트를 완화하려면 더 구체적인 대체 테스트를 먼저 추가.
+
+### 명시적 검증 — Subagent Layer A (`v3-evaluator`)
+
+다음 조건 중 **하나라도** 해당하면 커밋 전 `Agent(subagent_type="v3-evaluator")`
+를 호출한다:
+
+1. 3파일 이상 동시 변경 (리팩터링, 다중 모듈 수정)
+2. 매수·매도·리스크·regime 등 **정책 로직** 변경
+3. `SignalGenerator` / `ExitRules` / `RegimeDetectorV2` 등 core 재작성
+4. 모델 재학습 후 live 파이프라인 수정
+5. 서버 배포 직전
+
+Evaluator 리포트가 3섹션(regression / invariant / silent-failure) 모두 clean이
+아니면 해결 전까지 커밋 금지.
+
+### 새 버그 발견 시 루틴 — **테스트 선행 원칙**
+
+```
+버그 제보 → v3/tests/test_regression.py에 회귀 테스트 추가 → 실패 재현 확인
+         → 코드 수정 → 테스트 통과 → 커밋 (테스트 + 수정 동일 커밋)
+```
+
+- **테스트 추가 없이 "수정했습니다" 보고 금지.**
+- 테스트 파일 내 분류는 버그 출처별 `TestXxx` 클래스. 기존 클래스에 추가하거나
+  새 클래스 생성.
+- 테스트는 invariant를 인코딩한다. 완화는 신중하게, 추가는 적극적으로.
+
+### 금지 사항
+
+- `pytest.skip`, `pytest.mark.skip`으로 실패 우회 금지
+- `--no-verify` / `--no-gpg-sign` 등 훅 우회 금지 (사용자 명시 지시 없이는)
+- 테스트 통과 못 한 상태에서 "일단 커밋하고 나중에 고치자" 금지
+- Hook 끄기(`disableAllHooks: true`) 금지. 해당 세션만 임시 해제도 금지.
+
+### 검증 도구 위치 참고
+
+- pytest 설정: `pytest.ini`
+- 회귀 테스트: `v3/tests/test_regression.py`
+- Evaluator 정의: `.claude/agents/v3-evaluator.md`
+- Hook 스크립트: `.claude/hooks/post_edit.py`
+- Hook 등록: `.claude/settings.local.json` `hooks.PostToolUse`
