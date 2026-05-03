@@ -121,8 +121,13 @@ class TestEntryHistoryPersisted:
         assert pm2.sell_retries.get("AMZN") == 2
 
     def test_monthly_count_preserved_after_restart(self, tmp_save_dir):
+        """Phase 25.1 옵션 C: 3 unique tickers in April → count=3."""
         pm1 = PositionManager(save_dir=str(tmp_save_dir))
-        pm1.entry_history["FANG"] = ["2026-04-05", "2026-04-15", "2026-04-20"]
+        pm1.entry_history = {
+            "FANG": ["2026-04-05"],
+            "AMZN": ["2026-04-15"],
+            "ADI": ["2026-04-20"],
+        }
         pm1.save()
 
         pm2 = PositionManager(save_dir=str(tmp_save_dir))
@@ -149,6 +154,72 @@ class TestEntryHistoryPersisted:
         assert removed is True
         assert "GHOST" not in pm.entry_history, \
             "Ghost removal must clear entry_history to avoid consecutive-entry veto"
+
+
+# ── Phase 25.1 옵션 C: monthly cap = unique-ticker count ──
+
+class TestMonthlyUniqueTickerCount:
+    """2026-04-21 진단 → 2026-05-03 적용. CLAUDE.md "Monthly Trade Cap 재설계".
+
+    4/11~4/24 데이터: BUY 7회 중 5회가 FANG churn (22:00 진입 → 09:30 청산
+    반복) → 4월 dynamic cap 7회를 5일 만에 소진 → 4/27~4/30 8세션 동안 31개
+    후보가 monthly_trades에 막혀 QQQ +1.55% 구간 통째로 놓침.
+
+    페르소나 원칙 1 ("확신 있을 때만")의 진짜 결정자가 conviction이 아니라
+    임의 cap이 된 implementation 결함. 동일 종목 churn은 unique 1로 카운트
+    하여 신규 종목 진입 여지를 보호한다.
+    """
+
+    def test_churn_counts_as_one(self, tmp_save_dir):
+        """FANG 5회 진입 → unique 1."""
+        pm = PositionManager(save_dir=str(tmp_save_dir))
+        pm.entry_history["FANG"] = [
+            "2026-04-20", "2026-04-21", "2026-04-22",
+            "2026-04-23", "2026-04-24",
+        ]
+        assert pm.monthly_trade_count("2026-04-24") == 1, \
+            "FANG 5회 churn은 unique 1로 카운트 (옵션 C)"
+
+    def test_distinct_tickers_counted(self, tmp_save_dir):
+        """5개 다른 ticker는 5로 카운트."""
+        pm = PositionManager(save_dir=str(tmp_save_dir))
+        pm.entry_history = {
+            "FANG": ["2026-04-20"],
+            "AMZN": ["2026-04-21"],
+            "ADI":  ["2026-04-22"],
+            "TSLA": ["2026-04-23"],
+            "NVDA": ["2026-04-24"],
+        }
+        assert pm.monthly_trade_count("2026-04-24") == 5
+
+    def test_april_history_proxy(self, tmp_save_dir):
+        """실제 4/11~4/24 paper history를 모사. BUY 7회 = unique 3 (FANG, ADI, AMZN).
+
+        옵션 C 적용 전: count=7 (cap 7 도달, 5/1까지 차단)
+        옵션 C 적용 후: count=3 (cap 7 여유 4 남음, 신규 진입 가능)
+        """
+        pm = PositionManager(save_dir=str(tmp_save_dir))
+        pm.entry_history = {
+            "ADI":  ["2026-04-11"],
+            "AMZN": ["2026-04-11"],
+            "FANG": [
+                "2026-04-20", "2026-04-20",  # 첫 진입 + rebuy
+                "2026-04-21", "2026-04-22", "2026-04-23",
+            ],
+        }
+        assert pm.monthly_trade_count("2026-04-24") == 3, \
+            "BUY 7회였지만 unique ticker 3개 (FANG churn 흡수)"
+
+    def test_consecutive_entry_unaffected(self, tmp_save_dir):
+        """연속 진입 가드는 entry_history 길이 기반 — unique cap과 독립."""
+        pm = PositionManager(save_dir=str(tmp_save_dir))
+        pm.entry_history["FANG"] = [
+            "2026-04-21", "2026-04-22", "2026-04-23",
+        ]
+        # 3회 연속 진입은 여전히 차단되어야 함
+        assert pm.is_consecutive_entry("FANG", "2026-04-24") is True
+        # 동시에 monthly_trade_count는 unique=1 유지
+        assert pm.monthly_trade_count("2026-04-24") == 1
 
 
 # ── Bug 4: conditional exit veto — opp > gate must skip profit_take AND max_hold ──

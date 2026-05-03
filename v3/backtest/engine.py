@@ -158,7 +158,7 @@ class BacktestEngine:
         )
 
         current_month: str | None = None
-        monthly_trades = 0
+        monthly_unique_tickers: set[str] = set()  # Phase 25.1 옵션 C
 
         for date in pred_dates:
             date_ts = pd.Timestamp(date)
@@ -166,7 +166,7 @@ class BacktestEngine:
             month = date_str[:7]
             if month != current_month:
                 current_month = month
-                monthly_trades = 0
+                monthly_unique_tickers = set()
 
             today_data = df_feat[df_feat["date"] == date_ts]
             if today_data.empty:
@@ -184,7 +184,7 @@ class BacktestEngine:
             circuit_breaker_active = self.risk_manager.circuit_breaker_scale(portfolio_value) < 1.0
             state = OperationalState(
                 current_positions=len(positions),
-                monthly_trades=monthly_trades,
+                monthly_trades=len(monthly_unique_tickers),
                 circuit_breaker_active=circuit_breaker_active,
             )
 
@@ -255,7 +255,7 @@ class BacktestEngine:
                                 "last_unrealized": init_unrealized,
                             })
                             cash -= allocated
-                            monthly_trades += 1
+                            monthly_unique_tickers.add(ticker)
 
                             if len(positions) >= self.cfg.trading.max_positions:
                                 break

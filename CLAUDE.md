@@ -1245,6 +1245,48 @@ Evaluator 리포트가 3섹션(regression / invariant / silent-failure) 모두 c
 3. **Reconciled 포지션의 veto 제외**: `confidence=0.5` 합성값 포지션은
    max_hold 도달 시 강제 청산 (opp veto 금지)
 
+### Monthly Trade Cap 재설계 — 단기 옵션 C 적용 (2026-05-03) ✅
+
+원칙 1의 implementation 결함. **2026-05-03 옵션 C 적용 완료** (Phase 25.1).
+
+**관찰 사실 (4/11~5/3 데이터)**:
+- 4/24 23:40 세션 31종목 opp gate 통과 → `rejections={'monthly_trades': 31}` 전부 차단
+- 4월 BUY 7회 중 **5회 FANG churn** (22:00 진입 → 09:30 청산 반복)
+- 4/27~4/30 8세션 100% CASH (opportunity=31 일관) — QQQ +1.55% 놓침
+
+**진단 — 페르소나 misalignment**:
+- 페르소나 본질은 "Conviction-or-Cash" (원칙 1)이지 "월 N회 이하"가 아님
+- monthly cap이 의도치 않게 conviction filter 역할 (opp gate 0.00175 너무 낮음)
+- 결과: 진짜 결정자가 conviction이 아니라 **임의 cap**이 됨
+
+**구조적 결함 3가지** (기록 보존):
+1. monthly cap이 "건수" 카운트 → FANG 5회 = 신규 5회와 동등 취급
+2. 동일 종목 재진입과 신규 진입을 구분 못함
+3. 8h staleness가 conditional veto 무효화 → churn 누적 → 월 budget 조기 소모
+
+**대안 비교 (당시 평가)**:
+
+| 옵션 | 본질 | 평가 |
+|------|------|------|
+| A. 현행 유지 | 건수 cap | 페르소나 misaligned |
+| B. cap 폐지 + opp gate 상향 (cost×3~5) | conviction | 중기 보류 (gate 튜닝 리스크) |
+| **C. cap 유지 + unique-ticker 카운트** | **종목 다양성** | **✅ 단기 채택** |
+| D. portfolio turnover 카운트 | 회전율 | 장기 보류 (구현 복잡) |
+
+**적용 내역 (2026-05-03)**:
+- `position_manager.py::monthly_trade_count` — set 기반 unique 카운트
+- `backtest/engine.py` — `monthly_unique_tickers: set[str]`로 parity 유지
+- `executor.py::execute_entry` — skip 사유 진단 로깅 추가 (정책 무변경)
+- `tests/test_regression.py` — `TestMonthlyUniqueTickerCount` 4개 테스트 추가
+- 변수명 `state.monthly_trades` 유지 (의미만 변경; 향후 정리는 후속 과제)
+- Hook 자동 회귀: 28/28 PASS
+
+**적용 후 검증 포인트** (5/4 영업일부터 1~2주 관찰):
+- monthly cap 도달까지 unique ticker 수
+- FANG 같은 churn 패턴이 다시 나오는지 (그때는 카운트되지 않음)
+- 5/1 entries=0 케이스 재현 시 executor 진단 로그로 사유 확정
+  (consecutive_entry / min_order_amount / _place_buy_order None 중 식별)
+
 ### 원칙 2 "크게" — 관찰 후 검토 (3/10, **가장 심각**)
 
 **현재 실태**:
@@ -1272,9 +1314,146 @@ Evaluator 리포트가 3섹션(regression / invariant / silent-failure) 모두 c
 3. Regime 전환(caution → neutral/bull) 시 position_scale이 자연스럽게 오르는가
 4. opportunity 분포: gate(0.00175) 대비 실제 분포(0.002~0.005인가, 0.01+인가)
 5. 포지션 크기 분포: 현실에서 0.10 이상 배치되는 경우가 얼마나 되는가
+6. monthly cap 도달 빈도, churn에 의한 budget 잠식 비율, opp gate 통과 종목
+   중 monthly cap에 막힌 비율 (Monthly Trade Cap 재설계 항목 참조)
 
-**의사결정 게이트**: 위 5개 포인트 데이터 쌓인 후, 원칙 1·2 개선안 중
-**가장 영향 큰 1개씩만 선택 적용**. 동시 다발 수정 금지 (변경 효과 측정 불가).
+**의사결정 게이트**: 위 6개 포인트 데이터 쌓인 후, 원칙 1·2 + Monthly Cap
+개선안 중 **가장 영향 큰 1개씩만 선택 적용**. 동시 다발 수정 금지
+(변경 효과 측정 불가).
 
 **절대 금지**: 관찰 기간 중 임의 튜닝. "그냥 느낌으로 올려보자" 금지.
 데이터 없이 정책 건드리면 백테스트-라이브 parity 깨짐.
+
+---
+
+## 후속 과제 — 옵션 C 적용 후 잔존 항목 (2026-05-03)
+
+옵션 C 단기 적용으로 monthly cap 항목은 종결. 아래는 **후속 단계로 이월된
+보류 사항 + 옵션 C 검증 과정에서 새로 발견된 결함**.
+
+### 신규 발견: Conditional Veto가 작동하지 않고 있음 (높은 우선순위)
+
+4/11~5/3 paper 로그 전수 조사 결과, V3.2.1에서 도입한 conditional TP/max_hold
+veto 정책이 **단 한 번도 발동된 적 없음**.
+
+**증상**:
+```
+TP 청산 5회 모두 다음 패턴:
+  WARN  Opportunity cache stale (8.2~14h old) — dropping for TP veto
+        (safer to let TP fire unconditionally)
+  INFO  EXIT FANG: profit_take ret=+1.65% hold=4d
+```
+
+**원인**:
+- 8h staleness threshold < 14h (KR 09:30 generate ↔ US 23:40 generate)
+- US 세션 시작 시점에 cache는 항상 stale
+- 모든 시간 기반 청산이 "fire unconditionally" 경로로 빠짐
+- **결과: V3.2.1 정책 자체가 죽은 코드**
+
+**영향 평가**:
+- 4/21 ADI +9.02%, AMZN +3.30% 같은 큰 winner도 무차별 청산됨
+- 다만 그 청산이 손해였는지 이득이었는지는 별개 평가 필요
+- 정책이 의도대로 작동 안 한다는 사실 자체는 확정
+
+**검토할 개선안**:
+1. **Staleness threshold 8h → 16h**: KR↔US 14h 간격 + 여유. 가장 단순.
+2. **세션 시작 시점에 즉시 generate_signal 호출**: cache freshness 보장.
+3. **정책 폐기**: veto 자체를 제거하고 무조건 청산으로 일관 (V2 회귀 위험 평가 필요).
+
+**적용 시점**: 옵션 C 효과 1~2주 검증 후. 동시 변경 금지 원칙 준수.
+
+---
+
+### 보류 1: 원칙 1 "확신 있을 때만" — opp gate 이원화 (중기)
+
+**현재 실태** (변경 없음):
+- `opp gate = cost × 1.75 = 0.00175` → "비용 회수 1.75배" ≠ "확신"
+- 진입 gate와 유지 veto gate가 동일 수식
+- Phase 2 "단일 수식" 원칙은 우아하나, 신규 진입 vs 지속 보유의 필요 conviction은 다름
+
+**검토할 개선안** (옵션 C 효과 검증 후):
+1. **유지 veto gate 상향**: 유지는 `cost × 3.0`, 진입보다 높은 bar
+   - 이유: "계속 들고 있겠다" > "신규로 들어가겠다"의 conviction 요구
+   - 이 항목은 위 "Conditional Veto 작동 안 함" 해결 후에 의미 있음
+2. **Regime multiplier**: `caution → gate × 1.5`, `strong_bull → gate × 0.8`
+3. **Reconciled 포지션의 veto 제외**: `confidence=0.5` 합성값 포지션은 max_hold 도달 시 강제 청산
+
+**적용 시점**: 옵션 C 검증 + Conditional Veto 수정 이후.
+
+---
+
+### 보류 2: 원칙 2 "크게" — 사이즈 확대 (중기, 가장 큰 잠재 효과)
+
+**현재 실태** (변경 없음, 4/11~5/3 데이터로 재확인):
+- Deployed capital 32% / Cash 68% — "집중 투자"와 거리 멀음
+- ADI 5.9M, AMZN 7.0M, FANG 18~21M (1억 기준)
+- ADI +9.02% 수익이 **531k원**에 그침 (사이즈 2배였다면 1M+)
+- 4월 +1.39% 누적 수익률의 직접 원인 = 사이즈 부족 (승률·손익비는 페르소나 통과)
+
+**검토할 개선안** (단일 변경 원칙 준수):
+1. **`min_position_weight 0.02 → 0.10`**: 10% 미만 후보 drop, 기존 포지션에 재할당
+2. **position_scale 곡선 조정**: caution=0.47 → 0.60 최소
+3. **동적 capital deployment**: 1종목=40%, 2종목=각25%, 3종목=각20%
+
+**적용 시점**: Conditional Veto + 원칙 1 안정화 이후. **이게 마지막 카드**.
+이유: 사이즈 확대는 손실 시 충격도 크므로 다른 안전장치가 작동 확인된 후 적용.
+
+---
+
+### 보류 3: 원칙 3 "빠르게" — 종결 (수정 없음)
+
+V3 페르소나 재해석 결과 "thesis 깨지면 빠져나오기" = 리스크 기반 청산. 이미
+구현됨 (`vol_contraction`, `dynamic_stop_mae`, `portfolio_stop`).
+시간 기반은 재평가 트리거 역할. 회전율 자체는 수익 공식 아님.
+
+**유지**: 현재 정책. 단 위 "Conditional Veto 작동 안 함"이 해결되면 비로소
+정책이 의도대로 동작하기 시작함.
+
+---
+
+### 보류 4: 변수명/메서드명 정리 (저우선순위, 명세 정리)
+
+옵션 C 적용 시 변경 표면 최소화를 위해 의미만 바꾸고 이름은 유지:
+- `state.monthly_trades` (의미: unique tickers this month)
+- `monthly_trade_count()` (의미: unique-ticker count)
+
+**검토할 정리** (영향 작은 정비 작업으로 별도 PR):
+- 변수명 → `monthly_unique_tickers`
+- 메서드명 → `monthly_unique_ticker_count()`
+- 호출처 7곳 일괄 변경
+- 회귀 테스트 동시 갱신
+
+---
+
+### 보류 5: 옵션 D (portfolio turnover) — 장기
+
+진정한 회전율 기반 cap. 옵션 C로 충분치 않을 때 (예: 진짜 다양한 종목으로
+churn하는 패턴이 등장할 때) 검토. 현재 우선순위 낮음.
+
+---
+
+### 보류 6: 5/2~5/3 monitor의 weekend stale warning (cosmetic)
+
+`monitor` 루프에 `weekday() < 5` 가드 없음 → 주말에도 매 15분 깨고 cache
+staleness warning 누적. 동작에는 영향 없으나 로그 노이즈 + "신호 죽었나?"
+오해 유발.
+
+**수정안**: monitor에 weekday 가드 추가 또는 stale 경고를 주말에만 INFO로
+demote.
+
+**우선순위**: 낮음. 다른 변경과 동시 묶지 말 것.
+
+---
+
+### 적용 순서 정리
+
+```
+[완료]   2026-05-03  옵션 C: monthly cap → unique-ticker 카운트
+[관찰중] 5/4~        옵션 C 효과 1~2주 측정
+[다음]   미정        Conditional Veto 작동 수정 (스테일 16h or 정책 재설계)
+[그다음] 미정        원칙 1 opp gate 이원화 (신규 strict, 유지 loose)
+[최종]   미정        원칙 2 사이즈 확대 (가장 영향 크고 가장 위험)
+[저우선] 미정        변수명 정리, weekend monitor guard, 옵션 D
+```
+
+**철칙 유지**: 동시 다발 수정 금지. 한 번에 한 가지 변경, 1~2주 검증, 다음.

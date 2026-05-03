@@ -154,9 +154,19 @@ class PositionManager:
     # ── Monthly Trade Count ──────────────────────────────────
 
     def monthly_trade_count(self, current_date: str) -> int:
-        """Count trades this month across all tickers."""
+        """Count UNIQUE tickers entered this month (Phase 25.1 옵션 C).
+
+        CLAUDE.md "Monthly Trade Cap 재설계" 적용. 4/11~4/24 데이터에서 BUY
+        7회 중 5회가 FANG churn으로 4월 한도(7회)를 조기 소진했고, 이후
+        4/27~4/30 8세션 동안 31개 후보가 monthly_trades에 막혀 QQQ +1.55%
+        구간을 통째로 놓쳤음. 페르소나 원칙 1 ("확신 있을 때만")의 진짜
+        결정자가 conviction이 아니라 임의 cap이 된 implementation 결함을
+        해소하기 위해 "건수"가 아닌 "unique 종목 수"로 카운트한다. FANG 5회
+        churn = 1로 카운트.
+        """
         month = current_date[:7]
-        count = 0
-        for ticker, dates in self.entry_history.items():
-            count += sum(1 for d in dates if d.startswith(month))
-        return count
+        unique_tickers = {
+            ticker for ticker, dates in self.entry_history.items()
+            if any(d.startswith(month) for d in dates)
+        }
+        return len(unique_tickers)

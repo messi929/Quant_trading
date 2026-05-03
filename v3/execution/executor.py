@@ -76,16 +76,17 @@ class TradingExecutor:
             weight = pos["weight"] * cb_scale
             confidence = pos.get("confidence", 0.5)
 
-            # Cooldown check
+            # Cooldown check (logs internally)
             if self.positions.is_cooled_down(ticker, current_date):
                 continue
 
-            # Consecutive entry check
+            # Consecutive entry check (logs internally)
             if self.positions.is_consecutive_entry(ticker, current_date):
                 continue
 
             # Skip if already in position
             if self.positions.get_position(ticker):
+                logger.info(f"SKIP {ticker}: already in position")
                 continue
 
             # Monthly limit
@@ -96,11 +97,20 @@ class TradingExecutor:
 
             # Position capacity
             if self.positions.count() >= self.cfg.trading.max_positions:
+                logger.info(
+                    f"SKIP {ticker}: position capacity full "
+                    f"({self.positions.count()}/{self.cfg.trading.max_positions})"
+                )
                 break
 
             # Calculate order size
             order_amount = balance * weight
             if order_amount < self.cfg.trading.min_order_amount_krw:
+                logger.info(
+                    f"SKIP {ticker}: order_amount {order_amount:,.0f} < "
+                    f"min {self.cfg.trading.min_order_amount_krw:,.0f} "
+                    f"(weight={weight:.4f}, balance={balance:,.0f})"
+                )
                 continue
 
             # Execute order
@@ -120,6 +130,11 @@ class TradingExecutor:
                 })
                 executed.append(order)
                 logger.info(f"BUY {ticker}: {order_amount:,.0f} KRW @ {order['price']}")
+            else:
+                logger.warning(
+                    f"BUY {ticker} failed: _place_buy_order returned None "
+                    f"(amount={order_amount:,.0f})"
+                )
 
         return executed
 
