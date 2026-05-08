@@ -1,0 +1,265 @@
+# 후속 과제 (Follow-ups)
+
+CLAUDE.md 정책 본문에서 분리된 active tracking. 페르소나 정합성 점검(2026-04-21) +
+Phase 25.1 옵션 C 적용 후(2026-05-03) 잔존 항목.
+
+**철칙**: 동시 다발 수정 금지. 한 번에 한 가지 변경, 1~2주 검증, 다음.
+
+---
+
+## 페르소나 원칙 점수 (2026-04-21 기준)
+
+"확신 있을 때만, 크게, 빠르게" 3대 원칙 기준 시스템 정합성 평가.
+
+| 원칙 | 점수 | 상태 |
+|------|------|------|
+| 1. 확신 있을 때만 | 5/10 | 🔄 관찰 대상 |
+| 2. 크게 | 3/10 | 🔄 관찰 대상 (가장 심각) |
+| 3. 빠르게 | 8/10 | ✅ 현재 정책 적절 |
+
+### 원칙 3 "빠르게" 재해석 — 종결 (수정 없음)
+
+초안에선 "max_hold veto로 무기한 보유 가능 → hard ceiling 10d 필요"
+제안했으나 철회. 이유:
+
+- V3의 "빠르게" = "thesis 깨지면 빠져나오기"이지 "시간 됐으니 팔기"가 아님
+- Thesis 깨짐 신호(`vol_contraction`, `dynamic_stop_mae`, `portfolio_stop`)
+  가 **무조건 청산** 담당 → 이미 구현됨
+- 시간 기반(`profit_take`, `max_hold`)은 **opportunity 재평가 트리거** 역할
+- `opportunity_map >8h stale guard`가 세션 간 fail-safe 담당
+- 회전율 자체가 수익 공식 아님. Positive expectancy × 반복. 무의미한 churn =
+  expectancy 음수
+- V2(일단위 return 예측)의 "빠르게"를 V3(월 5회 vol 팽창)에 그대로 적용하면
+  principle conflict
+
+**결론**: 현재 conditional veto 정책 유지. 리스크 기반 청산이 "빠르게"의
+실질적 구현체.
+
+---
+
+## 적용 순서 (2026-05-07 업데이트)
+
+```
+[완료]   2026-05-03  옵션 C: monthly cap → unique-ticker 카운트
+[완료]   2026-05-07  Phase 25.2 — observation tools + sizer floor 0.05→0.15
+                     · alpha-retrain systemd timer (monthly, 6/1 첫 실행)
+                     · recommendation_log JSONL
+                     · sizer floor 5/7 23:40 boundary 보정 (0.12 → 0.15)
+[관찰중] 5/8~        통합 효과 1~2주 측정 (옵션 C + 사이즈 확대)
+[다음]   미정        Conditional Veto 작동 수정 (스테일 16h or 정책 재설계)
+[그다음] 미정        원칙 1 opp gate 이원화 (신규 strict, 유지 loose)
+[저우선] 미정        변수명 정리, weekend monitor guard, 옵션 D
+```
+
+**Phase 25.2 진단 reframe**: 4/27~5/7 진입 0의 진짜 1차 단속점은 옵션 C가
+풀려고 했던 monthly cap이 아니라 **사이저 floor**였음. 옵션 C는 정책으로
+옳지만 cap이 단속점 아니었어서 효과 측정 거리 없음. Phase 25.2 사이즈 변경이
+페르소나 원칙 2 (3/10)의 직접 처방.
+
+---
+
+## 신규 발견: Conditional Veto가 작동하지 않고 있음 (높은 우선순위)
+
+4/11~5/3 paper 로그 전수 조사 결과, V3.2.1에서 도입한 conditional TP/max_hold
+veto 정책이 **단 한 번도 발동된 적 없음**.
+
+### 증상
+
+```
+TP 청산 5회 모두 다음 패턴:
+  WARN  Opportunity cache stale (8.2~14h old) — dropping for TP veto
+        (safer to let TP fire unconditionally)
+  INFO  EXIT FANG: profit_take ret=+1.65% hold=4d
+```
+
+### 원인
+
+- 8h staleness threshold < 14h (KR 09:30 generate ↔ US 23:40 generate)
+- US 세션 시작 시점에 cache는 항상 stale
+- 모든 시간 기반 청산이 "fire unconditionally" 경로로 빠짐
+- **결과: V3.2.1 정책 자체가 죽은 코드**
+
+### 영향 평가
+
+- 4/21 ADI +9.02%, AMZN +3.30% 같은 큰 winner도 무차별 청산됨
+- 다만 그 청산이 손해였는지 이득이었는지는 별개 평가 필요
+- 정책이 의도대로 작동 안 한다는 사실 자체는 확정
+
+### 검토할 개선안
+
+1. **Staleness threshold 8h → 16h**: KR↔US 14h 간격 + 여유. 가장 단순.
+2. **세션 시작 시점에 즉시 generate_signal 호출**: cache freshness 보장.
+3. **정책 폐기**: veto 자체를 제거하고 무조건 청산으로 일관 (V2 회귀 위험 평가 필요).
+
+**적용 시점**: 옵션 C 효과 1~2주 검증 후. 동시 변경 금지 원칙 준수.
+
+**Phase 25.2 후 재평가**: 5/7 사이즈 변경 후 진입이 발생하면 자동으로
+TP/max_hold 트리거 가능 → conditional veto 발동 여부 처음으로 측정 가능해짐.
+즉 사이즈 수정이 이 항목의 사전 조건. 진입 누적 후 재진단.
+
+---
+
+## 신규 발견 (Phase 25.2): alpha_weights 재학습 자동화 ✅ 완료 (2026-05-07)
+
+### 발견
+
+- `alpha_weights.json` 4/18 19:40 freeze 후 미갱신
+- `alpha_weights_history/`에 `alpha_weights_2026-04.json` 1개만 존재
+- crontab 비어있음, systemd timer 없음
+- CLAUDE.md/CHANGELOG에 "매월 1일 재학습" 정책 명시되었으나 수동 only
+
+### 적용
+
+`/etc/systemd/system/alpha-retrain.service` + `alpha-retrain.timer` 신설.
+매월 1일 06:00 KST 자동 실행. 다음 실행: **2026-06-01 06:00 KST**.
+
+5/1 catch-up은 미실행 (3년 lookback이라 20일 차이 영향 미미).
+
+### 후속 모니터링
+
+- 6/1 첫 자동 실행 결과 `/var/log/alpha-retrain.log`에서 확인
+- `v3/config/alpha_weights_history/alpha_weights_2026-06.json` 생성 확인
+- 학습 결과 `vanilla_ic` 변화 추이 (3년 rolling이라 1개월 단위 변화는 작지만 trend 추적)
+
+---
+
+## 보류 1: 원칙 1 "확신 있을 때만" — opp gate 이원화 (중기)
+
+### 현재 실태 (변경 없음)
+
+- `opp gate = cost × 1.75 = 0.00175` → "비용 회수 1.75배" ≠ "확신"
+- 진입 gate와 유지 veto gate가 동일 수식
+- Phase 2 "단일 수식" 원칙은 우아하나, 신규 진입 vs 지속 보유의 필요 conviction은 다름
+- Regime=caution인데 게이트 불변 (가중치만 변경)
+- 편입된 ADI/AMZN는 `confidence=0.5` 합성값 — 실제 학습 시점 conviction 아님
+
+### 검토할 개선안 (옵션 C 효과 검증 후)
+
+1. **유지 veto gate 상향**: 유지는 `cost × 3.0`, 진입보다 높은 bar
+   - 이유: "계속 들고 있겠다" > "신규로 들어가겠다"의 conviction 요구
+   - 이 항목은 위 "Conditional Veto 작동 안 함" 해결 후에 의미 있음
+2. **Regime multiplier**: `caution → gate × 1.5`, `strong_bull → gate × 0.8`
+3. **Reconciled 포지션의 veto 제외**: `confidence=0.5` 합성값 포지션은 max_hold 도달 시 강제 청산
+
+**적용 시점**: 옵션 C 검증 + Conditional Veto 수정 이후.
+
+---
+
+## 보류 2: 원칙 2 "크게" — 사이즈 확대 ✅ Phase 25.2에서 적용 (2026-05-07)
+
+### 적용 내역
+
+5/4~5/7 13세션 연속 entries=0 데이터 분석 결과, 진입 부재의 1차 단속점이
+**사이저 floor 0.05 + min_order_amount 5M의 수학적 미달**임이 확인됨
+(regime 무관 — neutral에서도 동일). 우선순위 상향 후 즉시 적용.
+
+채택안: **sizer.min_position_weight 0.05 → 0.15** (`v3/strategy/sizing.py:23`)
+
+이유:
+- 단일 lever, 단일 파일 변경
+- 백테스트-라이브 parity 자동 유지 (양쪽 default 사용)
+- caution 최저 scale 0.35에서도 5M 통과 (0.15 × 0.35 = 0.0525 = 5.32M)
+- bull 1종목 13.5%, 3종목 균등 40.5% — 페르소나 "1~3종목 집중" 부합
+
+미채택안 + 사유:
+- SignalGenerator min_weight 0.02 → 0.10: cutoff만 변경, 통과 사이즈 무영향
+- position_scale 곡선 상향: caution regime 의미 약화 (페르소나 충돌)
+- 동적 capital deployment: 사이저 철학 대체, 변경 표면 큼
+
+### 적용 과정의 boundary 보정
+
+1차 0.12 적용 (5/7 23:33): caution scale 0.42 가정. 실제 5/7 23:40 세션에서
+scale 0.411로 산출되어 PYPL weight 0.0493 = 4,997,999 KRW → 1,001 KRW
+차이로 SKIP 발생.
+
+2차 0.15 재적용 (5/7 23:47): caution 영역 관측 최저 scale 0.35 anchor.
+회귀 테스트도 0.42 → 0.35로 강화. 5/8~ 모든 caution 세션에서 통과 보장.
+
+### 4/11~5/3 데이터 (참고용 보존)
+
+- Deployed capital 32% / Cash 68% — "집중 투자"와 거리 멀음
+- 최대 포지션 FANG 가중치 0.18 (max_single_weight 0.40의 절반도 안 씀)
+- ADI 5.9M, AMZN 7.0M, FANG 18~21M (1억 기준)
+- ADI +9.02% 수익이 531k원에 그침 (사이즈 2배였다면 1M+)
+- 4월 +1.39% 누적 수익률의 직접 원인 = 사이즈 부족
+
+### 검증 단계 (5/8~5/14)
+
+1주 paper 관찰. 측정 항목:
+- 진입 발생 횟수 (목표: ≥3건/주)
+- 평균 deploy 비율 (목표: ≥10% caution / ≥30% bull)
+- 평균 실현 PnL/거래 (참고)
+- vol-target 15% 위배 여부 (sanity 한도 30%)
+
+결과 미흡 시 (예: caution 지속 + 진입 0 패턴 재현) 후속 검토:
+- `min_position_weight` 추가 인상
+- position_scale 곡선 동시 조정 (보류 2의 미채택안 #2 재검토)
+
+---
+
+## 보류 3: 변수명/메서드명 정리 (저우선순위)
+
+옵션 C 적용 시 변경 표면 최소화를 위해 의미만 바꾸고 이름은 유지했음:
+
+- `state.monthly_trades` (의미: unique tickers this month)
+- `monthly_trade_count()` (의미: unique-ticker count)
+
+### 검토할 정리 (영향 작은 정비 작업으로 별도 PR)
+
+- 변수명 → `monthly_unique_tickers`
+- 메서드명 → `monthly_unique_ticker_count()`
+- 호출처 7곳 일괄 변경
+- 회귀 테스트 동시 갱신
+
+---
+
+## 보류 4: 옵션 D (portfolio turnover) — 장기
+
+진정한 회전율 기반 cap. 옵션 C로 충분치 않을 때 (예: 진짜 다양한 종목으로
+churn하는 패턴이 등장할 때) 검토. 현재 우선순위 낮음.
+
+---
+
+## 보류 5: 5/2~5/3 monitor의 weekend stale warning (cosmetic)
+
+`monitor` 루프에 `weekday() < 5` 가드 없음 → 주말에도 매 15분 깨고 cache
+staleness warning 누적. 동작에는 영향 없으나 로그 노이즈 + "신호 죽었나?"
+오해 유발.
+
+### 수정안
+
+monitor에 weekday 가드 추가 또는 stale 경고를 주말에만 INFO로 demote.
+
+**우선순위**: 낮음. 다른 변경과 동시 묶지 말 것.
+
+---
+
+## 관찰 기간 + 데이터 수집 (5/8부터 본격화)
+
+### 관찰 도구 (Phase 25.2 신설)
+
+- **`v3/saved_models/recommendation_log.jsonl`**: 매 세션 1줄 누적
+  - 필드: regime, opp_gate, top_opportunities (top10), selected_positions,
+    rejections, entries/exits, open_positions
+  - 6개 관찰 포인트 4·5·6번을 직접 측정 가능
+- **`/var/log/alpha-retrain.log`**: 6/1 자동 재학습 결과 (이후 매월)
+- **`/opt/quant/v3/saved_models/paper_account.json`**: 누적 trade history
+- **`/opt/quant/v3/logs/v3_YYYY-MM-DD.log`**: 일별 trace
+
+### 관찰 포인트
+
+1. Conditional veto가 실제 발동하는가 (TP/max_hold 트리거 시점 & 결과)
+   — Phase 25.2 사이즈 변경 후 진입 발생해야 측정 가능
+2. 8h staleness guard가 세션 간격(KR↔US=14h)에서 의도대로 작동하는가
+3. Regime 전환(caution → neutral/bull) 시 position_scale이 자연스럽게 오르는가
+4. opportunity 분포: gate(0.00175) 대비 실제 분포 (recommendation_log top10)
+5. 포지션 크기 분포: floor 0.15 적용 후 실제 sized weight 추이
+6. monthly cap 도달 빈도, churn에 의한 budget 잠식 비율
+
+### 의사결정 게이트
+
+위 6개 포인트 데이터 쌓인 후, 원칙 1·2 + Conditional Veto 개선안 중
+**가장 영향 큰 1개씩만 선택 적용**. 동시 다발 수정 금지 (변경 효과 측정 불가).
+
+**절대 금지**: 관찰 기간 중 임의 튜닝. "그냥 느낌으로 올려보자" 금지.
+데이터 없이 정책 건드리면 백테스트-라이브 parity 깨짐.
