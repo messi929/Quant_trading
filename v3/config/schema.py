@@ -172,6 +172,37 @@ class BacktestConfig(BaseModel):
     walk_forward_step_days: int = 63
 
 
+class FeatureFlagsConfig(BaseModel):
+    """V3.3 feature flags. All OFF by default → V3.2.1 동작 보존.
+
+    Activation order: docs/V3.3_ROADMAP.md §5 참조.
+    Phase 1 (no_trade_logger / tc_monitor / execution_quality) is read-only.
+    Other policies are gated behind backtest ablation 합격 후 paper promotion.
+    """
+    # Phase 1 (read-only diagnostics)
+    no_trade_logger: bool = False
+    tc_monitor: bool = False
+    execution_quality: bool = False
+    # Phase 2 (decision-affecting — calibration 후)
+    edge_calibrator: bool = False
+    edge_engine: bool = False
+    edge_tier: bool = False
+    allocation: bool = False
+    # Phase 3 (exit policies)
+    conditional_veto: bool = False
+    exit_thesis: bool = False
+    partial_exit: bool = False
+    signal_decay: bool = False
+    # Phase 4 (capital expansion)
+    pyramid: bool = False
+    rotation: bool = False
+
+    @classmethod
+    def all_off(cls) -> "FeatureFlagsConfig":
+        """V3.2.1 동작 모드 — 모든 flag OFF (회귀 테스트용)."""
+        return cls()
+
+
 class V3Config(BaseModel):
     """Root configuration for V3 Vol Expansion Trader."""
 
@@ -190,6 +221,7 @@ class V3Config(BaseModel):
     schedule: ScheduleConfig = ScheduleConfig()
     broker: BrokerConfig = BrokerConfig()
     backtest: BacktestConfig = BacktestConfig()
+    features: FeatureFlagsConfig = FeatureFlagsConfig()
 
     def cost_for_market(self, market: str) -> float:
         if market in ("KOSPI", "KOSDAQ"):
