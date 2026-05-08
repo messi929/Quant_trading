@@ -171,6 +171,26 @@ class NoTradeLog:
 
 
 # ──────────────────────────────────────────────────────────────
+# TCSnapshot (Transfer Coefficient diagnostic — PR-1.2)
+# ──────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class TCSnapshot:
+    """Daily transfer coefficient + top decile capture snapshot.
+
+    transfer_coefficient: Spearman correlation between net_edge ranking
+        and final_weight ranking. ∈ [-1, 1]. Higher = better signal-to-weight.
+    top_decile_capture: weight in top edge decile / total deployed weight.
+        ∈ [0, 1]. 1.0 = perfect concentration on best signals.
+    """
+    date: pd.Timestamp
+    transfer_coefficient: float
+    top_decile_capture: float
+    n_candidates: int
+    n_deployed: int
+    total_deployed_weight: float
+
+
+# ──────────────────────────────────────────────────────────────
 # CalibrationBucket
 # ──────────────────────────────────────────────────────────────
 @dataclass(frozen=True)

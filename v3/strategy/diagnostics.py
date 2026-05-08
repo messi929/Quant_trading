@@ -29,7 +29,7 @@ import pandas as pd
 from loguru import logger as _logger
 
 from v3.strategy._base import DiagnosticSink
-from v3.strategy.types import NoTradeLog
+from v3.strategy.types import NoTradeLog, TCSnapshot
 
 
 # ──────────────────────────────────────────────────────────────
@@ -198,4 +198,214 @@ class NoTradeReasonLogger:
 
     def buffer_size(self) -> int:
         """Current in-memory buffer size (for testing)."""
+        return len(self._buffer)
+
+
+# ──────────────────────────────────────────────────────────────
+# TransferCoefficientMonitor (PR-1.2)
+# ──────────────────────────────────────────────────────────────
+def _rank(values: list[float]) -> list[float]:
+    """Average ranks (1-indexed, handles ties).
+
+    No scipy dependency. Tied values get average rank.
+    """
+    n = len(values)
+    if n == 0:
+        return []
+    sorted_pairs = sorted(enumerate(values), key=lambda p: p[1])
+    ranks = [0.0] * n
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and sorted_pairs[j + 1][1] == sorted_pairs[i][1]:
+            j += 1
+        avg_rank = (i + j) / 2.0 + 1.0  # 1-indexed
+        for k in range(i, j + 1):
+            ranks[sorted_pairs[k][0]] = avg_rank
+        i = j + 1
+    return ranks
+
+
+def _spearman(x: list[float], y: list[float]) -> float:
+    """Spearman rank correlation. No scipy dependency.
+
+    Returns 0.0 for degenerate cases (n<2, constant series).
+    """
+    n = len(x)
+    if n < 2 or len(y) != n:
+        return 0.0
+    rx = _rank(x)
+    ry = _rank(y)
+    mean_rx = sum(rx) / n
+    mean_ry = sum(ry) / n
+    cov = sum((a - mean_rx) * (b - mean_ry) for a, b in zip(rx, ry)) / n
+    var_rx = sum((a - mean_rx) ** 2 for a in rx) / n
+    var_ry = sum((b - mean_ry) ** 2 for b in ry) / n
+    if var_rx <= 0 or var_ry <= 0:
+        return 0.0
+    return cov / ((var_rx ** 0.5) * (var_ry ** 0.5))
+
+
+class TransferCoefficientMonitor:
+    """Edge-rank vs weight-rank correlation tracking.
+
+    Implements DiagnosticSink protocol. Read-only.
+
+    transfer_coefficient = Spearman corr (net_edge_rank, final_weight_rank)
+    top_decile_capture   = weight in top edge decile / total deployed weight
+
+    Threshold semantics (default):
+      tc < 0.10  → critical: signals not reaching portfolio
+      tc < 0.30  → warning: weak signal-to-weight transfer
+      tc ≥ 0.30  → ok
+
+    Use:
+        mon = TransferCoefficientMonitor()
+        snap = mon.compute(candidates, final_weights)
+        mon.record({"snapshot": snap})
+        mon.flush()
+    """
+
+    name = "tc_monitor"
+
+    def __init__(
+        self,
+        log_path: str | Path = "v3/saved_models/tc_history.jsonl",
+        warning_threshold: float = 0.30,
+        critical_threshold: float = 0.10,
+        top_decile_capture_min: float = 0.40,
+        enabled: bool = True,
+    ):
+        self.log_path = Path(log_path)
+        if enabled:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.warning_threshold = warning_threshold
+        self.critical_threshold = critical_threshold
+        self.top_decile_capture_min = top_decile_capture_min
+        self._enabled = enabled
+        self._buffer: list[TCSnapshot] = []
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def compute(
+        self,
+        candidates: list,
+        final_weights: dict[str, float],
+        as_of: pd.Timestamp | None = None,
+    ) -> TCSnapshot:
+        """Compute TC + top decile capture from candidates and weights.
+
+        Args:
+            candidates: list of objects with `.ticker` and `.net_edge_5d` attrs,
+                or dicts with same keys. None values treated as 0.
+            final_weights: {ticker: weight}. Weights ≤ 0 treated as not deployed.
+            as_of: snapshot timestamp. Defaults to today (normalized).
+
+        Returns:
+            Immutable TCSnapshot.
+        """
+        as_of = as_of if as_of is not None else pd.Timestamp.now().normalize()
+
+        edges: list[float] = []
+        tickers: list[str] = []
+        for c in candidates:
+            ticker = getattr(c, "ticker", None)
+            if ticker is None and isinstance(c, dict):
+                ticker = c.get("ticker", "")
+            edge = getattr(c, "net_edge_5d", None)
+            if edge is None and isinstance(c, dict):
+                edge = c.get("net_edge_5d")
+            tickers.append(str(ticker or ""))
+            edges.append(float(edge) if edge is not None else 0.0)
+
+        weights_aligned = [float(final_weights.get(t, 0.0)) for t in tickers]
+
+        n_candidates = len(candidates)
+        deployed_weight = sum(w for w in final_weights.values() if w > 0)
+        n_deployed = sum(1 for w in final_weights.values() if w > 0)
+
+        # Spearman correlation
+        tc = _spearman(edges, weights_aligned) if n_candidates > 1 else 0.0
+
+        # Top decile capture
+        if n_candidates == 0 or deployed_weight <= 0:
+            capture = 0.0
+        else:
+            top_n = max(1, n_candidates // 10)
+            sorted_idx = sorted(
+                range(n_candidates), key=lambda i: edges[i], reverse=True
+            )
+            top_tickers = {tickers[i] for i in sorted_idx[:top_n]}
+            top_weight = sum(
+                w for t, w in final_weights.items()
+                if t in top_tickers and w > 0
+            )
+            capture = top_weight / deployed_weight
+
+        return TCSnapshot(
+            date=as_of,
+            transfer_coefficient=tc,
+            top_decile_capture=capture,
+            n_candidates=n_candidates,
+            n_deployed=n_deployed,
+            total_deployed_weight=deployed_weight,
+        )
+
+    def record(self, event: dict) -> None:
+        """Buffer a TCSnapshot.
+
+        Two formats accepted:
+          {"snapshot": TCSnapshot(...)}  — preferred
+          {"date": ..., "transfer_coefficient": ..., ...}  — manual fields
+        """
+        if not self._enabled:
+            return
+        try:
+            snap = event.get("snapshot")
+            if isinstance(snap, TCSnapshot):
+                self._buffer.append(snap)
+                return
+            self._buffer.append(TCSnapshot(
+                date=pd.Timestamp(event["date"]),
+                transfer_coefficient=float(event["transfer_coefficient"]),
+                top_decile_capture=float(event["top_decile_capture"]),
+                n_candidates=int(event["n_candidates"]),
+                n_deployed=int(event["n_deployed"]),
+                total_deployed_weight=float(event["total_deployed_weight"]),
+            ))
+        except (KeyError, ValueError, TypeError) as exc:
+            _logger.warning(f"TransferCoefficientMonitor.record: {exc}")
+
+    def flush(self) -> None:
+        """Append buffered snapshots to JSONL. Clears buffer."""
+        if not self._enabled or not self._buffer:
+            return
+        try:
+            with self.log_path.open("a", encoding="utf-8") as f:
+                for snap in self._buffer:
+                    rec = {
+                        "date": snap.date.isoformat(),
+                        "tc": snap.transfer_coefficient,
+                        "top_decile_capture": snap.top_decile_capture,
+                        "n_candidates": snap.n_candidates,
+                        "n_deployed": snap.n_deployed,
+                        "deployed_weight": snap.total_deployed_weight,
+                    }
+                    f.write(json.dumps(rec, default=float) + "\n")
+        except (OSError, TypeError, ValueError) as exc:
+            _logger.warning(f"TransferCoefficientMonitor.flush: {exc}")
+            return
+        self._buffer.clear()
+
+    def alert_level(self, snapshot: TCSnapshot) -> str:
+        """Classify snapshot severity. Returns 'critical' | 'warning' | 'ok'."""
+        if snapshot.transfer_coefficient < self.critical_threshold:
+            return "critical"
+        if snapshot.transfer_coefficient < self.warning_threshold:
+            return "warning"
+        return "ok"
+
+    def buffer_size(self) -> int:
         return len(self._buffer)
