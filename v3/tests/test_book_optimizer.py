@@ -466,7 +466,7 @@ class TestPyramidIntegration:
             edge_calibrator=True, edge_engine=True, edge_tier=True,
             exit_thesis=True, pyramid=True,
         )
-        # Lenient thresholds so synthetic candidates pass full pipeline
+        # Lenient thresholds so synthetic candidates pass full pipeline as KEEP
         lenient_thresholds = TierThresholds(
             s_tier_net_edge=-0.999, a_tier_net_edge=-0.999, b_tier_net_edge=-0.999,
             s_tier_winprob=0.0, a_tier_winprob=0.0,
@@ -478,8 +478,11 @@ class TestPyramidIntegration:
             edge_calibrator=_make_calibrator(),
             edge_engine=EdgeEngine(),
             edge_tier=EdgeTierSystem(thresholds=lenient_thresholds),
+            # Make ExitThesis fall through to KEEP for any positive-or-near-zero edge
             exit_thesis=ExitThesisEngine(policy=ExitPolicy(
-                hold_min_residual_edge=-0.999,
+                hold_min_residual_edge=-0.999,    # never EXIT on residual
+                reduce_zone_edge=-0.999,          # never TRIM
+                rotation_margin=99.999,           # never ROTATE
             )),
             pyramid=PyramidPolicyEngine(policy=PyramidPolicy(
                 min_unrealized_pnl_for_add=0.01,
