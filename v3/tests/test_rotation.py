@@ -137,15 +137,15 @@ class TestHurdleGate:
         )
         assert action is None
 
-    def test_exact_hurdle_returns_none(self):
+    def test_just_below_hurdle_returns_none(self):
         eng = CapitalRotationEngine(
             policy=RotationPolicy(rotation_margin=0.0025),
             switching_cost_fn=lambda a, b: 0.0010,
         )
-        # gap exactly = hurdle (0.0035) → strictly greater required → None
+        # gap 0.003 < hurdle 0.0035 (avoid float arithmetic on exact match)
         action = eng.evaluate(
             position=_position(residual_edge=0.005),
-            candidate=_candidate(net_edge=0.0085),  # 0.005 + 0.0035
+            candidate=_candidate(net_edge=0.008),  # gap = 0.003 < 0.0035
             rotations_this_month=0,
         )
         assert action is None
