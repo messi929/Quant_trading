@@ -20,7 +20,7 @@ class VolTargetSizer:
         self,
         target_annual_vol: float = 0.15,
         max_single_weight: float = 0.40,
-        min_position_weight: float = 0.05,
+        min_position_weight: float = 0.15,
         volume_participation_max: float = 0.05,
         kelly_fraction: float = 0.5,  # Half-Kelly
     ):

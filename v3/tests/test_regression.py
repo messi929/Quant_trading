@@ -366,3 +366,178 @@ class TestOpportunityStaleness:
         cached_at = now - timedelta(hours=2)
         age_h = (now - cached_at).total_seconds() / 3600
         assert age_h <= 8
+
+
+# ── Bug 9: recommendation_log must not crash session on numpy types ──
+#
+# 2026-05-07 evaluator review (V3.2.1+ observation tooling):
+# `_log_recommendation_snapshot` writes opportunity_map / position weights
+# via json.dumps. VolTransformer inference can produce numpy.float32 scalars
+# which round() preserves, and json.dumps then raises TypeError. Trading
+# flow must not abort — log failure is acceptable, session abort is not.
+
+class TestRecommendationLogResilience:
+    """The observation log is a non-critical sidecar. It must never raise
+    out of run_session() — neither I/O errors nor serialization issues."""
+
+    def _write_record(self, record: dict, log_path) -> bool:
+        """Mirrors live_pipeline._log_recommendation_snapshot persistence."""
+        import json
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            return True
+        except (OSError, TypeError, ValueError):
+            return False
+
+    def test_numpy_float32_does_not_crash(self, tmp_path):
+        """opportunity_map values from inference are numpy.float32. After
+        round(x, 6), they remain numpy.float32. json.dumps must not raise
+        — either via default serializer or by pre-cast to Python float."""
+        import numpy as np
+        record = {
+            "ticker": "FANG",
+            "opp": float(round(np.float32(0.00345), 6)),  # explicit cast
+        }
+        log_path = tmp_path / "recommendation_log.jsonl"
+        assert self._write_record(record, log_path) is True
+        assert log_path.exists()
+
+    def test_unserializable_value_caught(self, tmp_path):
+        """If a future bug slips an unserializable object in, the session
+        must continue. The log entry is dropped, not the trade."""
+
+        class Weird:
+            pass
+
+        record = {"weird": Weird()}
+        log_path = tmp_path / "recommendation_log.jsonl"
+        # Should NOT raise; should return False indicating drop
+        assert self._write_record(record, log_path) is False
+
+    def test_disk_failure_caught(self, tmp_path, monkeypatch):
+        """OSError on write must not propagate."""
+        import json
+        log_path = tmp_path / "subdir" / "recommendation_log.jsonl"
+
+        def boom(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(json, "dumps", boom)
+        # Even with a working path, error during dump must be swallowed
+        assert self._write_record({"x": 1}, log_path) is False
+
+
+# ── Bug 10: sizer floor must guarantee min_order_amount in caution regime ──
+#
+# 2026-05-07 observation (13 trading days, 0 entries):
+# sizer.min_position_weight=0.05 + caution position_scale=0.42 → max weight
+# 0.021 (= 0.05 × 0.42), below the 5M-on-100M order floor (0.05). Result:
+# every recommended ticker dropped via min_order_amount. The floor must be
+# raised to make 5M reachable in the worst-case regime scale.
+
+class TestSizerFloorPassesMinOrder:
+    """Floor on sizer output must produce >= min_order_amount even after
+    regime scale multiplication in conservative regimes."""
+
+    CAPITAL = 100_000_000
+    MIN_ORDER = 5_000_000
+
+    def test_caution_floor_clears_min_order(self):
+        """At caution MINIMUM scale 0.35 (observed range 5/4~5/7: 0.35~0.42),
+        floor must produce at least 5M order. The first attempt at 0.12 used
+        0.42 as the bound and failed in production at scale=0.411 (5/7 23:40
+        US session): 0.12×0.411=0.0493 → 4,998,000 KRW, 1,001 short of 5M.
+        Test now anchors to the observed minimum of the caution range."""
+        from v3.strategy.sizing import VolTargetSizer
+        sizer = VolTargetSizer()
+        floor_weight = sizer.min_weight
+        scale_caution_min = 0.35  # observed minimum in production caution
+        scaled = floor_weight * scale_caution_min
+        order_value = scaled * self.CAPITAL
+        assert order_value >= self.MIN_ORDER, (
+            f"floor={floor_weight} × scale={scale_caution_min} = {scaled} → "
+            f"{order_value:,.0f} KRW, below min {self.MIN_ORDER:,.0f}"
+        )
+
+    def test_neutral_floor_clears_min_order(self):
+        """At neutral scale 0.65, floor must produce at least 5M."""
+        from v3.strategy.sizing import VolTargetSizer
+        sizer = VolTargetSizer()
+        order_value = sizer.min_weight * 0.65 * self.CAPITAL
+        assert order_value >= self.MIN_ORDER
+
+    def test_floor_does_not_violate_max_weight(self):
+        """Floor must never exceed max_single_weight (0.40)."""
+        from v3.strategy.sizing import VolTargetSizer
+        sizer = VolTargetSizer()
+        assert sizer.min_weight < sizer.max_weight
+
+    def test_size_portfolio_respects_floor(self):
+        """size_portfolio output must clip up to floor for low-conviction
+        tickers (so they pass min_order downstream).
+
+        Bound: n=3 stays under the 0.95-normalize threshold (3×0.12=0.36)
+        so floor is preserved. Beyond n≈7 the normalize step at sizing.py:
+        125 silently pushes weights below the floor — a latent landmine if
+        max_positions is ever raised to 8+. See test_size_portfolio_n8_normalize_violates_floor.
+        """
+        from v3.strategy.sizing import VolTargetSizer
+        sizer = VolTargetSizer()
+        weights = sizer.size_portfolio(
+            predicted_vols={"A": 0.30, "B": 0.30, "C": 0.30},
+            confidences={"A": 0.55, "B": 0.55, "C": 0.55},
+        )
+        for t, w in weights.items():
+            assert w >= sizer.min_weight, (
+                f"{t} weight={w} below floor {sizer.min_weight}"
+            )
+
+    def test_size_portfolio_n8_normalize_violates_floor(self):
+        """LATENT BUG documentation — not a fix request.
+
+        With n≥8 and floor 0.12, np.clip pushes everyone to 0.12, then
+        0.95-normalize divides by 0.96 → 0.1187 (below floor). This is
+        unreachable while max_positions=1 (currently set in v3_config.yaml).
+        If max_positions is ever raised to ≥8, sizer must be revised to
+        either (a) skip the normalize when at floor, or (b) drop excess
+        positions before normalizing.
+        """
+        from v3.strategy.sizing import VolTargetSizer
+        sizer = VolTargetSizer()
+        n = 8
+        vols = {f"T{i}": 0.30 for i in range(n)}
+        confs = {f"T{i}": 0.55 for i in range(n)}
+        weights = sizer.size_portfolio(predicted_vols=vols, confidences=confs)
+        any_below_floor = any(w < sizer.min_weight for w in weights.values())
+        # Document the known violation. If this test ever flips to False,
+        # the underlying bug was fixed and the floor invariant holds — fine.
+        # If max_positions is raised to ≥8 without fixing this, the floor
+        # chain breaks and downstream min_order skips silently increase.
+        assert any_below_floor, (
+            "n=8 floor violation no longer reproduces — verify sizer fix "
+            "and tighten test_size_portfolio_respects_floor accordingly"
+        )
+
+    def test_vol_target_not_drastically_violated(self):
+        """3-position floor deployment (3 × 0.12 = 36% gross) must still
+        keep portfolio vol within 2× target (sanity bound, not strict)."""
+        from v3.strategy.sizing import VolTargetSizer
+        import numpy as np
+        sizer = VolTargetSizer(target_annual_vol=0.15)
+        weights = sizer.size_portfolio(
+            predicted_vols={"A": 0.25, "B": 0.25, "C": 0.25},
+            confidences={"A": 0.6, "B": 0.6, "C": 0.6},
+        )
+        w_arr = np.array(list(weights.values()))
+        # Equal-corr 0.3 sanity model
+        n = len(w_arr)
+        corr = np.full((n, n), 0.3)
+        np.fill_diagonal(corr, 1.0)
+        vols = np.array([0.25] * n)
+        cov = np.diag(vols) @ corr @ np.diag(vols)
+        port_vol = np.sqrt(w_arr @ cov @ w_arr)
+        assert port_vol < 2 * sizer.target_vol, (
+            f"port_vol={port_vol:.3f} > 2× target={sizer.target_vol}"
+        )

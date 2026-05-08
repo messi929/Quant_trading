@@ -8,7 +8,9 @@ Single canonical path:
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 from loguru import logger
@@ -110,6 +112,7 @@ class LivePipeline:
         self._opportunity_map: dict[str, float] = {}
         self._opportunity_gate: float = 0.0
         self._opportunity_at: datetime | None = None  # when the snapshot was taken
+        self._last_signal = None
 
     # ──────────────────────────────────────────────────────────
     def collect_data(self) -> pd.DataFrame:
@@ -167,6 +170,7 @@ class LivePipeline:
         self._opportunity_map = dict(signal.opportunity_map)
         self._opportunity_gate = signal.opportunity_gate
         self._opportunity_at = datetime.now()
+        self._last_signal = signal
 
         return {
             "action": signal.action,
@@ -224,7 +228,65 @@ class LivePipeline:
             "open_positions": self.executor.positions.count(),
         }
         logger.info(f"Session complete: {summary}")
+        self._log_recommendation_snapshot(summary, entries, exits)
         return summary
+
+    def _log_recommendation_snapshot(
+        self, summary: dict, entries: list[dict], exits: list[dict]
+    ) -> None:
+        """Append per-session recommendation snapshot to JSONL log.
+
+        Observation tool only — does not affect policy. Captures top-10
+        opportunities, sized positions, rejections, and execution outcome
+        so we can distinguish 'market quiet' from 'sizer too conservative'.
+        """
+        sig = getattr(self, "_last_signal", None)
+        if sig is None:
+            return
+        sorted_opps = sorted(sig.opportunity_map.items(), key=lambda x: -x[1])[:10]
+        record = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "date": summary["date"],
+            "regime": {
+                "name": sig.regime_name,
+                "score": round(sig.regime_score, 4),
+                "scale": round(sig.position_scale, 4),
+            },
+            "n_candidates": sig.n_candidates,
+            "n_approved": sig.n_approved,
+            "opp_gate": round(sig.opportunity_gate, 6),
+            "top_opportunities": [
+                {"ticker": t, "opp": round(o, 6)} for t, o in sorted_opps
+            ],
+            "selected_positions": [
+                {
+                    "ticker": p["ticker"],
+                    "weight": round(p.get("weight", 0.0), 4),
+                    "opportunity": round(p.get("opportunity", 0.0), 6),
+                    "conviction": round(p.get("conviction", 0.0), 4),
+                    "direction": round(p.get("direction", 0.0), 6),
+                }
+                for p in sig.positions
+            ],
+            "rejections": dict(sig.rejection_reasons),
+            "entries_count": len(entries),
+            "entered_tickers": [e.get("ticker", "?") for e in entries],
+            "exits_count": len(exits),
+            "exited": [
+                {"ticker": e.get("ticker", "?"), "reason": e.get("reason", "?")}
+                for e in exits
+            ],
+            "open_positions": summary["open_positions"],
+        }
+        log_path = Path(self.cfg.paths.models) / "recommendation_log.jsonl"
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as f:
+                # default=float covers numpy.float32/64 from inference;
+                # broad exception below catches anything else (e.g., custom types).
+                f.write(json.dumps(record, ensure_ascii=False, default=float) + "\n")
+        except (OSError, TypeError, ValueError) as exc:
+            logger.warning(f"Failed to write recommendation log: {exc}")
 
     # ── internal helpers ──────────────────────────────────────
     def _detect_regime(self, ohlcv: pd.DataFrame):
