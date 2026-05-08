@@ -44,6 +44,7 @@ from loguru import logger
 from v3.config.schema import FeatureFlagsConfig
 from v3.execution.execution_quality import ExecutionQualityMonitor
 from v3.rules.entry import OperationalState
+from v3.strategy.allocation import AllocationEngine
 from v3.strategy.diagnostics import (
     NoTradeReasonLogger,
     RejectReason,
@@ -52,9 +53,14 @@ from v3.strategy.diagnostics import (
 from v3.strategy.edge_calibrator import EdgeCalibrator
 from v3.strategy.edge_engine import EdgeEngine
 from v3.strategy.edge_tier import EdgeTierSystem
+from v3.strategy.exit_thesis import ExitThesisEngine
+from v3.strategy.partial_exit import PartialExitEngine
+from v3.strategy.pyramid import PyramidPolicyEngine
 from v3.strategy.regime_v2 import Regime
+from v3.strategy.rotation import CapitalRotationEngine
 from v3.strategy.signal import SignalGenerator, TradeSignal
-from v3.strategy.types import BookAction, EdgeCandidate
+from v3.strategy.signal_decay import SignalDecayEngine
+from v3.strategy.types import BookAction, EdgeCandidate, PositionState
 
 
 # ──────────────────────────────────────────────────────────────
@@ -107,15 +113,34 @@ class BookOptimizer:
         edge_calibrator: Optional[EdgeCalibrator] = None,
         edge_engine: Optional[EdgeEngine] = None,
         edge_tier: Optional[EdgeTierSystem] = None,
+        # Phase 3 — exit policies
+        exit_thesis: Optional[ExitThesisEngine] = None,
+        partial_exit: Optional[PartialExitEngine] = None,
+        signal_decay: Optional[SignalDecayEngine] = None,
+        # Phase 4 — capital expansion
+        allocation: Optional[AllocationEngine] = None,
+        pyramid: Optional[PyramidPolicyEngine] = None,
+        rotation: Optional[CapitalRotationEngine] = None,
+        # Diagnostics (read-only)
         no_trade_logger: Optional[NoTradeReasonLogger] = None,
         tc_monitor: Optional[TransferCoefficientMonitor] = None,
         execution_quality: Optional[ExecutionQualityMonitor] = None,
     ):
         self.signal_gen = signal_gen
         self.features = features
+        # Edge layer
         self.edge_calibrator = edge_calibrator
         self.edge_engine = edge_engine
         self.edge_tier = edge_tier
+        # Phase 3
+        self.exit_thesis = exit_thesis
+        self.partial_exit = partial_exit
+        self.signal_decay = signal_decay
+        # Phase 4
+        self.allocation = allocation
+        self.pyramid = pyramid
+        self.rotation = rotation
+        # Diagnostics
         self.no_trade_logger = no_trade_logger
         self.tc_monitor = tc_monitor
         self.execution_quality = execution_quality
@@ -133,6 +158,13 @@ class BookOptimizer:
         sector_map: Optional[dict[str, str]] = None,
         ticker_vol_map: Optional[dict[str, float]] = None,
         liquidity_bucket_map: Optional[dict[str, str]] = None,
+        # PR-4.4: Position-level inputs
+        positions: Optional[list[PositionState]] = None,
+        exit_triggers: Optional[dict[str, str]] = None,
+        signal_age_hours: float = 0.0,
+        rotations_this_month: int = 0,
+        adds_per_position: Optional[dict[str, int]] = None,
+        initial_weights: Optional[dict[str, float]] = None,
     ) -> list[BookAction]:
         """Generate the day's BookActions.
 
@@ -142,6 +174,12 @@ class BookOptimizer:
             ticker_volume_map, sector_map: per-ticker context maps
             ticker_vol_map: per-ticker annualized vol for slippage_buffer
             liquidity_bucket_map: per-ticker {high/mid/low}
+            positions: existing PositionState list for exit/pyramid/rotation
+            exit_triggers: {ticker: trigger_name from ExitRules}
+            signal_age_hours: shared age for stale-signal refresh logic
+            rotations_this_month: count for rotation cap
+            adds_per_position: {ticker: count of pyramid adds so far}
+            initial_weights: {ticker: original entry weight} for pyramid sizing
 
         Returns:
             Action-priority sorted list of BookActions.
@@ -150,6 +188,10 @@ class BookOptimizer:
         ticker_vol_map = ticker_vol_map or {}
         liquidity_bucket_map = liquidity_bucket_map or {}
         sector_map = sector_map or {}
+        positions = positions or []
+        exit_triggers = exit_triggers or {}
+        adds_per_position = adds_per_position or {}
+        initial_weights = initial_weights or {}
 
         # Step 1: V3.2.1 SignalGenerator (unchanged)
         signal = self.signal_gen.generate(
@@ -174,13 +216,47 @@ class BookOptimizer:
         # Step 3: (flag) Edge layer enrichment
         candidates = self._apply_edge_layer(candidates, ticker_vol_map)
 
-        # Step 4: Generate BookActions from SignalGenerator positions
-        actions = self._signal_to_actions(signal, as_of)
+        # Step 4: Position-level decisions (Phase 3 — exit_thesis, partial_exit)
+        position_actions, keep_positions = self._evaluate_positions(
+            positions=positions,
+            candidates=candidates,
+            exit_triggers=exit_triggers,
+            signal_age_hours=signal_age_hours,
+            as_of=as_of,
+        )
 
-        # Step 5: Diagnostics (read-only, flag-gated)
+        # Step 5: Pyramid (KEEP positions only) — Phase 4
+        pyramid_actions = self._evaluate_pyramid(
+            keep_positions=keep_positions,
+            adds_per_position=adds_per_position,
+            initial_weights=initial_weights,
+            as_of=as_of,
+        )
+
+        # Step 6: Rotation (KEEP positions × new candidates) — Phase 4
+        rotation_actions = self._evaluate_rotation(
+            keep_positions=keep_positions,
+            candidates=candidates,
+            rotations_this_month=rotations_this_month,
+            as_of=as_of,
+        )
+
+        # Step 7: New entries — AllocationEngine override or SignalGenerator
+        entry_actions = self._generate_entries(
+            signal=signal,
+            candidates=candidates,
+            regime=regime,
+            sector_map=sector_map,
+            existing_tickers={p.ticker for p in positions},
+            as_of=as_of,
+        )
+
+        actions = position_actions + pyramid_actions + rotation_actions + entry_actions
+
+        # Step 8: Diagnostics (read-only, flag-gated)
         self._record_diagnostics(signal, candidates, actions, as_of)
 
-        # Step 6: Sort by priority
+        # Step 9: Sort by priority
         return sorted(actions, key=lambda a: ACTION_PRIORITY.get(a.action_type, 99))
 
     # ── Internal: candidate construction ──────────────────────
@@ -249,20 +325,174 @@ class BookOptimizer:
 
         return candidates
 
-    # ── Internal: signal → actions (parity passthrough) ───────
-    def _signal_to_actions(
+    # ── Internal: position-level evaluation (Phase 3) ─────────
+    def _evaluate_positions(
         self,
-        signal: TradeSignal,
+        positions: list[PositionState],
+        candidates: list[EdgeCandidate],
+        exit_triggers: dict[str, str],
+        signal_age_hours: float,
         as_of: pd.Timestamp,
-    ) -> list[BookAction]:
-        """Convert TradeSignal positions → ADD_NEW BookActions.
+    ) -> tuple[list[BookAction], list[tuple[PositionState, Optional[EdgeCandidate]]]]:
+        """Phase 3 exit policies for each position.
 
-        Parity contract: 1:1 mapping. SignalGenerator decisions canonical.
+        Returns:
+            (position_actions, keep_positions) where keep_positions is a list
+            of (PositionState, EdgeCandidate) for KEEP-action positions
+            (used by pyramid/rotation downstream).
         """
         actions: list[BookAction] = []
+        keep_positions: list[tuple[PositionState, Optional[EdgeCandidate]]] = []
 
+        for position in positions:
+            position_edge = self._find_candidate(candidates, position.ticker)
+            trigger = exit_triggers.get(position.ticker, "max_hold")
+
+            if self.features.exit_thesis and self.exit_thesis is not None:
+                action = self.exit_thesis.decide(
+                    position=position,
+                    exit_trigger=trigger,
+                    current_edge=position_edge,
+                    replacement_candidates=[
+                        c for c in candidates if c.ticker != position.ticker
+                    ],
+                    signal_age_hours=signal_age_hours,
+                    now=as_of,
+                )
+            elif self.features.partial_exit and self.partial_exit is not None:
+                residual = (
+                    position_edge.net_edge_5d
+                    if position_edge and position_edge.net_edge_5d is not None
+                    else position.residual_edge
+                )
+                thesis_break = (
+                    "vol_contraction" if trigger == "vol_contraction" else None
+                )
+                action = self.partial_exit.evaluate(
+                    position=position,
+                    residual_edge=residual,
+                    thesis_break=thesis_break,
+                    now=as_of,
+                )
+            else:
+                # No exit policy active → KEEP (V3.2.1 ExitRules handled externally)
+                action = BookAction(
+                    date=as_of,
+                    action_type="KEEP",
+                    ticker=position.ticker,
+                    target_weight=position.current_weight,
+                    current_weight=position.current_weight,
+                    reason="passthrough_keep",
+                    source_policy="passthrough",
+                )
+
+            actions.append(action)
+            if action.action_type == "KEEP":
+                keep_positions.append((position, position_edge))
+
+        return actions, keep_positions
+
+    # ── Internal: pyramid (Phase 4) ───────────────────────────
+    def _evaluate_pyramid(
+        self,
+        keep_positions: list[tuple[PositionState, Optional[EdgeCandidate]]],
+        adds_per_position: dict[str, int],
+        initial_weights: dict[str, float],
+        as_of: pd.Timestamp,
+    ) -> list[BookAction]:
+        if not (self.features.pyramid and self.pyramid is not None):
+            return []
+
+        actions: list[BookAction] = []
+        for position, position_edge in keep_positions:
+            if position_edge is None:
+                continue
+            adds = adds_per_position.get(position.ticker, 0)
+            initial = initial_weights.get(position.ticker, position.current_weight)
+            add_action = self.pyramid.evaluate(
+                position=position,
+                candidate=position_edge,
+                adds_so_far=adds,
+                initial_weight=initial,
+                now=as_of,
+            )
+            if add_action is not None:
+                actions.append(add_action)
+        return actions
+
+    # ── Internal: rotation (Phase 4) ──────────────────────────
+    def _evaluate_rotation(
+        self,
+        keep_positions: list[tuple[PositionState, Optional[EdgeCandidate]]],
+        candidates: list[EdgeCandidate],
+        rotations_this_month: int,
+        as_of: pd.Timestamp,
+    ) -> list[BookAction]:
+        if not (self.features.rotation and self.rotation is not None):
+            return []
+
+        # Candidates not currently held with positive net_edge
+        held_tickers = {p.ticker for p, _ in keep_positions}
+        new_candidates = [
+            c for c in candidates
+            if c.ticker not in held_tickers
+            and c.entry_pass
+            and c.net_edge_5d is not None and c.net_edge_5d > 0
+        ]
+        # Sort highest first
+        new_candidates.sort(key=lambda c: c.net_edge_5d or 0.0, reverse=True)
+
+        actions: list[BookAction] = []
+        rotations_used = rotations_this_month
+        for position, _ in keep_positions:
+            for cand in new_candidates:
+                rot = self.rotation.evaluate(
+                    position=position,
+                    candidate=cand,
+                    rotations_this_month=rotations_used,
+                    now=as_of,
+                )
+                if rot is not None:
+                    actions.append(rot)
+                    rotations_used += 1
+                    break  # one rotation per position
+        return actions
+
+    # ── Internal: new entries (Phase 4 Allocation or passthrough) ──
+    def _generate_entries(
+        self,
+        signal: TradeSignal,
+        candidates: list[EdgeCandidate],
+        regime: Regime,
+        sector_map: dict[str, str],
+        existing_tickers: set[str],
+        as_of: pd.Timestamp,
+    ) -> list[BookAction]:
+        """New entries via AllocationEngine override or SignalGenerator passthrough."""
+        if self.features.allocation and self.allocation is not None:
+            new_weights = self.allocation.allocate(
+                candidates=candidates,
+                regime=regime,
+                sector_map=sector_map,
+            )
+            return [
+                BookAction(
+                    date=as_of,
+                    action_type="ADD_NEW",
+                    ticker=ticker,
+                    target_weight=weight,
+                    current_weight=0.0,
+                    reason=f"allocation_engine_entry(weight={weight:.4f})",
+                    source_policy="AllocationEngine",
+                    expected_impact=self._candidate_edge(candidates, ticker),
+                )
+                for ticker, weight in new_weights.items()
+                if ticker not in existing_tickers
+            ]
+
+        # Passthrough (V3.2.1 parity)
         if signal.action == "CASH":
-            actions.append(BookAction(
+            return [BookAction(
                 date=as_of,
                 action_type="NO_ACTION",
                 ticker="",
@@ -270,11 +500,10 @@ class BookOptimizer:
                 current_weight=0.0,
                 reason=f"CASH (regime={signal.regime_name})",
                 source_policy="SignalGenerator",
-            ))
-            return actions
+            )]
 
-        for pos in signal.positions:
-            actions.append(BookAction(
+        return [
+            BookAction(
                 date=as_of,
                 action_type="ADD_NEW",
                 ticker=str(pos["ticker"]),
@@ -283,8 +512,26 @@ class BookOptimizer:
                 reason=f"signal_generator_entry (opp={pos.get('opportunity', 0.0):.5f})",
                 source_policy="SignalGenerator",
                 expected_impact=float(pos.get("opportunity", 0.0)),
-            ))
-        return actions
+            )
+            for pos in signal.positions
+            if str(pos["ticker"]) not in existing_tickers
+        ]
+
+    @staticmethod
+    def _find_candidate(
+        candidates: list[EdgeCandidate], ticker: str,
+    ) -> Optional[EdgeCandidate]:
+        for c in candidates:
+            if c.ticker == ticker:
+                return c
+        return None
+
+    @staticmethod
+    def _candidate_edge(
+        candidates: list[EdgeCandidate], ticker: str,
+    ) -> Optional[float]:
+        c = BookOptimizer._find_candidate(candidates, ticker)
+        return c.net_edge_5d if c else None
 
     # ── Internal: diagnostics ─────────────────────────────────
     def _record_diagnostics(

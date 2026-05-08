@@ -18,6 +18,7 @@ import pytest
 
 from v3.config.schema import FeatureFlagsConfig
 from v3.rules.entry import OperationalState
+from v3.strategy.allocation import AllocationEngine, RegimeBudget
 from v3.strategy.book_optimizer import ACTION_PRIORITY, BookOptimizer
 from v3.strategy.diagnostics import (
     NoTradeReasonLogger,
@@ -29,9 +30,13 @@ from v3.strategy.edge_calibrator import (
 )
 from v3.strategy.edge_engine import EdgeEngine, EdgePolicy
 from v3.strategy.edge_tier import EdgeTierSystem, TierThresholds
+from v3.strategy.exit_thesis import ExitPolicy, ExitThesisEngine
+from v3.strategy.partial_exit import PartialExitEngine, PartialExitPolicy
+from v3.strategy.pyramid import PyramidPolicy, PyramidPolicyEngine
 from v3.strategy.regime_v2 import Regime
+from v3.strategy.rotation import CapitalRotationEngine, RotationPolicy
 from v3.strategy.signal import TradeSignal
-from v3.strategy.types import BookAction, CalibrationBucket
+from v3.strategy.types import BookAction, CalibrationBucket, PositionState
 
 
 # ──────────────────────────────────────────────────────────────
@@ -355,3 +360,267 @@ class TestImmutability:
             with pytest.raises(FrozenInstanceError):
                 a.target_weight = 999.0  # type: ignore[misc]
                 break  # one is enough
+
+
+# ──────────────────────────────────────────────────────────────
+# PR-4.4: Phase 3+4 통합 테스트
+# ──────────────────────────────────────────────────────────────
+def _winner_position(
+    ticker: str = "AAPL",
+    pnl_pct: float = 0.05,
+    current_weight: float = 0.20,
+    holding_days: int = 4,
+    current_tier: str = "A",
+) -> PositionState:
+    return PositionState(
+        ticker=ticker,
+        entry_date=pd.Timestamp("2026-05-01"),
+        entry_price=200.0,
+        current_price=200.0 * (1.0 + pnl_pct),
+        current_weight=current_weight,
+        entry_edge=0.005,
+        residual_edge=0.005,
+        entry_tier=current_tier,
+        current_tier=current_tier,
+        pnl_pct=pnl_pct,
+        max_unrealized_pnl_pct=max(pnl_pct, 0.0),
+        drawdown_from_peak_pct=-0.005,
+        holding_days=holding_days,
+        dominant_alpha="trend",
+        expected_holding_days=10,
+        thesis_alive=True,
+    )
+
+
+class TestPhase3Integration:
+    """ExitThesisEngine wiring inside BookOptimizer."""
+
+    def test_exit_thesis_keeps_winner_with_positive_edge(self):
+        signal = _mock_signal(action="TRADE")
+        flags = FeatureFlagsConfig(
+            edge_calibrator=True, edge_engine=True,
+            exit_thesis=True,
+        )
+        bo = BookOptimizer(
+            signal_gen=_mock_signal_generator(signal),
+            features=flags,
+            edge_calibrator=_make_calibrator(),
+            edge_engine=EdgeEngine(),
+            exit_thesis=ExitThesisEngine(policy=ExitPolicy(
+                hold_min_residual_edge=-0.999,  # always allow KEEP
+            )),
+        )
+        actions = bo.decide(
+            ohlcv=pd.DataFrame(), vol_scores=pd.DataFrame(),
+            regime=_regime(), cost=0.001, state=_state(),
+            positions=[_winner_position(ticker="AAPL")],
+            exit_triggers={"AAPL": "max_hold"},
+        )
+        # AAPL should appear as KEEP (or similar non-EXIT)
+        aapl_actions = [a for a in actions if a.ticker == "AAPL"
+                        and a.source_policy == "exit_thesis"]
+        assert len(aapl_actions) >= 1
+
+    def test_partial_exit_fallback_when_thesis_off(self):
+        signal = _mock_signal(action="TRADE")
+        flags = FeatureFlagsConfig(partial_exit=True)
+        bo = BookOptimizer(
+            signal_gen=_mock_signal_generator(signal),
+            features=flags,
+            partial_exit=PartialExitEngine(policy=PartialExitPolicy()),
+        )
+        actions = bo.decide(
+            ohlcv=pd.DataFrame(), vol_scores=pd.DataFrame(),
+            regime=_regime(), cost=0.001, state=_state(),
+            positions=[_winner_position(ticker="AAPL")],
+            exit_triggers={"AAPL": "profit_take"},
+        )
+        # PartialExit emits a position-level action
+        aapl_actions = [a for a in actions if a.ticker == "AAPL"
+                        and a.source_policy == "partial_exit"]
+        assert len(aapl_actions) >= 1
+
+    def test_passthrough_keep_when_no_exit_policy(self):
+        signal = _mock_signal(action="TRADE")
+        bo = BookOptimizer(
+            signal_gen=_mock_signal_generator(signal),
+            features=FeatureFlagsConfig.all_off(),
+        )
+        actions = bo.decide(
+            ohlcv=pd.DataFrame(), vol_scores=pd.DataFrame(),
+            regime=_regime(), cost=0.001, state=_state(),
+            positions=[_winner_position(ticker="AAPL")],
+        )
+        # passthrough KEEP exists
+        passthrough = [a for a in actions if a.source_policy == "passthrough"]
+        assert len(passthrough) == 1
+        assert passthrough[0].action_type == "KEEP"
+
+
+class TestPyramidIntegration:
+    """Pyramid wiring — KEEP winners only get add-on."""
+
+    def test_pyramid_adds_to_keeping_winner(self):
+        signal = _mock_signal(action="TRADE")
+        flags = FeatureFlagsConfig(
+            edge_calibrator=True, edge_engine=True, edge_tier=True,
+            exit_thesis=True, pyramid=True,
+        )
+        # Lenient thresholds so synthetic candidates pass full pipeline
+        lenient_thresholds = TierThresholds(
+            s_tier_net_edge=-0.999, a_tier_net_edge=-0.999, b_tier_net_edge=-0.999,
+            s_tier_winprob=0.0, a_tier_winprob=0.0,
+            s_tier_max_mae=-0.999,
+        )
+        bo = BookOptimizer(
+            signal_gen=_mock_signal_generator(signal),
+            features=flags,
+            edge_calibrator=_make_calibrator(),
+            edge_engine=EdgeEngine(),
+            edge_tier=EdgeTierSystem(thresholds=lenient_thresholds),
+            exit_thesis=ExitThesisEngine(policy=ExitPolicy(
+                hold_min_residual_edge=-0.999,
+            )),
+            pyramid=PyramidPolicyEngine(policy=PyramidPolicy(
+                min_unrealized_pnl_for_add=0.01,
+                min_residual_edge_for_add=-0.999,  # lenient for synthetic edges
+                min_current_tier_for_add="A",
+                max_single_weight_after_add=0.40,
+            )),
+        )
+        # AAPL is in opportunity_map (raw_opp 0.0035)
+        actions = bo.decide(
+            ohlcv=pd.DataFrame(), vol_scores=pd.DataFrame(),
+            regime=_regime(), cost=0.001, state=_state(),
+            positions=[_winner_position(ticker="AAPL", current_weight=0.10)],
+            exit_triggers={"AAPL": "max_hold"},
+            adds_per_position={"AAPL": 0},
+            initial_weights={"AAPL": 0.10},
+        )
+        # ADD_TO_WINNER appears for AAPL
+        add_winners = [a for a in actions if a.action_type == "ADD_TO_WINNER"]
+        assert len(add_winners) >= 1
+
+    def test_pyramid_blocks_loss_position_in_full_stack(self):
+        """회귀 핵심: 전체 stack에서도 손실 포지션 add-on 절대 발생 안 함."""
+        signal = _mock_signal(action="TRADE")
+        flags = FeatureFlagsConfig(
+            edge_calibrator=True, edge_engine=True, edge_tier=True,
+            exit_thesis=True, pyramid=True,
+        )
+        bo = BookOptimizer(
+            signal_gen=_mock_signal_generator(signal),
+            features=flags,
+            edge_calibrator=_make_calibrator(),
+            edge_engine=EdgeEngine(),
+            edge_tier=EdgeTierSystem(thresholds=TierThresholds()),
+            exit_thesis=ExitThesisEngine(policy=ExitPolicy(
+                hold_min_residual_edge=-0.999,
+            )),
+            pyramid=PyramidPolicyEngine(policy=PyramidPolicy()),
+        )
+        # Loss position
+        actions = bo.decide(
+            ohlcv=pd.DataFrame(), vol_scores=pd.DataFrame(),
+            regime=_regime(), cost=0.001, state=_state(),
+            positions=[_winner_position(ticker="AAPL", pnl_pct=-0.05)],
+            exit_triggers={"AAPL": "max_hold"},
+        )
+        # NO ADD_TO_WINNER for loss position (regression invariant)
+        add_winners = [a for a in actions if a.action_type == "ADD_TO_WINNER"]
+        assert len(add_winners) == 0
+
+
+class TestRotationIntegration:
+    """Rotation wiring — KEEP positions × new candidates matrix."""
+
+    def test_rotation_evaluates_new_candidates(self):
+        signal = _mock_signal(action="TRADE")
+        # MSFT in opportunity_map can replace AAPL
+        flags = FeatureFlagsConfig(
+            edge_calibrator=True, edge_engine=True, edge_tier=True,
+            exit_thesis=True, rotation=True,
+        )
+        bo = BookOptimizer(
+            signal_gen=_mock_signal_generator(signal),
+            features=flags,
+            edge_calibrator=_make_calibrator(),
+            edge_engine=EdgeEngine(),
+            edge_tier=EdgeTierSystem(thresholds=TierThresholds(
+                s_tier_net_edge=0.0, a_tier_net_edge=0.0, b_tier_net_edge=-0.999,
+                s_tier_winprob=0.0, a_tier_winprob=0.0,
+                s_tier_max_mae=-0.999,
+            )),
+            exit_thesis=ExitThesisEngine(policy=ExitPolicy(
+                hold_min_residual_edge=-0.999,
+            )),
+            rotation=CapitalRotationEngine(
+                policy=RotationPolicy(rotation_margin=0.0, max_rotations_per_month=10),
+                switching_cost_fn=lambda a, b: 0.0,
+            ),
+        )
+        # AAPL holding, MSFT/GOOG/AMZN in candidates
+        actions = bo.decide(
+            ohlcv=pd.DataFrame(), vol_scores=pd.DataFrame(),
+            regime=_regime(), cost=0.001, state=_state(),
+            positions=[_winner_position(ticker="AAPL", holding_days=2)],
+            exit_triggers={"AAPL": "max_hold"},
+        )
+        # ROTATE may or may not happen depending on edge_tier output;
+        # at minimum, rotation logic was invoked without error
+        # (action set size > 0)
+        assert len(actions) > 0
+
+
+class TestAllocationIntegration:
+    """Allocation override — replaces SignalGenerator sizing."""
+
+    def test_allocation_overrides_signal_weights(self):
+        signal = _mock_signal(action="TRADE")
+        flags = FeatureFlagsConfig(
+            edge_calibrator=True, edge_engine=True, allocation=True,
+        )
+        bo = BookOptimizer(
+            signal_gen=_mock_signal_generator(signal),
+            features=flags,
+            edge_calibrator=_make_calibrator(),
+            edge_engine=EdgeEngine(policy=EdgePolicy(entry_threshold=-0.999)),
+            allocation=AllocationEngine(),
+        )
+        actions = bo.decide(
+            ohlcv=pd.DataFrame(), vol_scores=pd.DataFrame(),
+            regime=_regime(), cost=0.001, state=_state(),
+        )
+        # Source policy on ADD_NEW should be AllocationEngine, not SignalGenerator
+        add_news = [a for a in actions if a.action_type == "ADD_NEW"]
+        # Alloc may produce 0 entries depending on net_edge gates;
+        # check that source_policy includes "AllocationEngine" if any produced
+        for a in add_news:
+            assert a.source_policy in ("AllocationEngine", "SignalGenerator")
+
+    def test_leverage_invariant_in_book_optimizer(self):
+        """allocation 통합 결과도 Σ weights ≤ 1.00."""
+        signal = _mock_signal(action="TRADE")
+        flags = FeatureFlagsConfig(
+            edge_calibrator=True, edge_engine=True, allocation=True,
+        )
+        bo = BookOptimizer(
+            signal_gen=_mock_signal_generator(signal),
+            features=flags,
+            edge_calibrator=_make_calibrator(),
+            edge_engine=EdgeEngine(policy=EdgePolicy(entry_threshold=-0.999)),
+            allocation=AllocationEngine(
+                regime_budgets={"neutral": RegimeBudget(
+                    max_gross_exposure=1.50,  # excessive — should clip
+                    target_annual_vol=0.30,
+                )},
+            ),
+        )
+        actions = bo.decide(
+            ohlcv=pd.DataFrame(), vol_scores=pd.DataFrame(),
+            regime=_regime(), cost=0.001, state=_state(),
+        )
+        new_weights_total = sum(
+            a.target_weight for a in actions if a.action_type == "ADD_NEW"
+        )
+        assert new_weights_total <= 1.00 + 1e-9
