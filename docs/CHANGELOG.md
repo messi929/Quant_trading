@@ -15,6 +15,8 @@ CLAUDE.md에서 분리된 Phase별 이력. 운영 지침 자체는 CLAUDE.md, �
 - [V3.2.1 — PaperBroker + Conditional TP (2026-04-20)](#v321--paperbroker--conditional-tp-2026-04-20)
 - [V3.2.1 핫픽스 — hold_days 달력 일수 (2026-04-21)](#v321-핫픽스--hold_days-달력-일수-2026-04-21)
 - [Phase 25.1 — Monthly Cap 옵션 C (2026-05-03)](#phase-251--monthly-cap-옵션-c-2026-05-03)
+- [Phase 25.2 — Sizer floor 0.05→0.15 (2026-05-07)](#phase-252--sizer-floor-005015-2026-05-07)
+- [Phase 26 (V3.3) — Profitability Engine (2026-05-09)](#phase-26-v33--profitability-engine-2026-05-09)
 
 ---
 
@@ -1000,4 +1002,126 @@ TBD  feat: Phase 25.2 — observation tools + sizer floor 0.05→0.15
        - recommendation_log JSONL (per-session snapshot)
        - sizer floor 0.05 → 0.15 (caution 5M passing)
        - 9 new regression tests (28 → 37, all pass)
+```
+
+---
+
+## Phase 25.2 — Sizer floor 0.05→0.15 (2026-05-07)
+
+페르소나 §2 "크게" (3/10) 직접 처방. 4/27~5/7 13세션 entries=0의 1차
+단속점이 sizer floor 5M 미달임을 확인 후 인상.
+
+### 변경
+- `v3/strategy/sizing.py`: `min_position_weight` 0.05 → 0.15
+  - caution scale 0.35 하한에서도 0.15 × 0.35 = 5.25M ≥ 5M 통과 보장
+- `v3/pipeline/live_pipeline.py`: `recommendation_log.jsonl` per-session 누적
+- `v3/tests/test_regression.py`: floor 0.15 회귀 (caution 0.35 anchor)
+- `alpha-retrain.timer` systemd: 매월 1일 06:00 KST 자동 재학습
+
+### 1주 검증 (5/8~5/14 진행 중, 5/9 시점)
+- bull regime 1종목 가중치 13.5%, 3종목 균등 40.5%
+- caution 최저 사이즈 5.25M (이전 1.75M에서 3배)
+
+---
+
+## Phase 26 (V3.3) — Profitability Engine (2026-05-09)
+
+> **"Vol Expansion Trader" → "기대수익 기반 자본 재배분 엔진"**
+
+V3.2.1 위에 13개 신규 모듈 + BookOptimizer orchestrator 추가.
+**features.* OFF default → V3.2.1 동작 100% 보존.**
+실 활성화는 5/14 검증 종료 후 paper promotion 주차별.
+
+### 24+ commits, 450 tests, ~14,000 line
+
+### Phase 1 (5 PR) — Diagnostics + Research foundation
+
+| PR | 모듈 |
+|----|------|
+| 1.0 | V3.3 skeleton + features section + Protocol + frozen types (8 dataclass) |
+| 1.1 | NoTradeReasonLogger + RejectReason enum (15) |
+| 1.2 | TransferCoefficientMonitor + Spearman/rank pure-python |
+| 1.3 | ExecutionQualityMonitor + FillRecord |
+| 1.4 | build_edge_dataset.py + lookahead-safe forward outcomes |
+
+### Phase 2 (4 PR) — Calibration & Edge Engine
+
+| PR | 모듈 |
+|----|------|
+| 2.1 | EdgeCalibrator + calibrate_edge.py + validate_edge.py |
+| 2.2 | EdgeEngine + cost decomposition + threshold derivation |
+| 2.3 | EdgeTierSystem + 분위수 기반 임계값 도출 |
+| 2.4 | BookOptimizer skeleton (parity standalone) |
+
+### Phase 3 (5 PR) — Exit policies (FOLLOW_UPS 1순위 해결)
+
+| PR | 모듈 |
+|----|------|
+| 3.1 | Conditional Veto 정상화 (max_signal_staleness 8h → 16h) |
+| 3.2 | ExitThesisEngine 본체 (HOLD/REDUCE/ROTATE/EXIT) |
+| 3.3 | SignalDecayEngine (alpha별 holding profile) |
+| 3.4 | PartialExitEngine (winner protection + Phase 25.2 floor 동기화) |
+| 3.5 | Phase 3 통합 테스트 + 회귀 시나리오 (4/21 ADI) |
+
+### Phase 4 (4 PR) — Capital Expansion
+
+| PR | 모듈 |
+|----|------|
+| 4.1 | AllocationEngine (LEVERAGE_CAP 1.00 영구 거부, net_edge / risk sizing) |
+| 4.2 | PyramidPolicyEngine (winner-only, averaging-down 절대 금지) |
+| 4.3 | CapitalRotationEngine (switching cost + 월간 cap 4) |
+| 4.4 | BookOptimizer 완성 (모든 정책 wiring) |
+
+### Phase 5 (2 PR) — Ablation
+
+| PR | 모듈 |
+|----|------|
+| 5.1 | Ablation infrastructure (16 specs + runner + report) |
+| 5.2 | Promotion plan + sweep CLI |
+
+### 통합 (3 PR) — Production wiring
+
+| PR | 작업 |
+|----|------|
+| 2.5 | BookOptimizer ↔ BacktestEngine + LivePipeline (DecisionContext) |
+| 2.6 | Ablation sweep production wiring (BacktestEngine 호출) |
+| 2.7 | CLAUDE.md / CHANGELOG.md V3.3 narrative (이 commit) |
+
+### 페르소나 점수 변화 예상
+
+- 원칙 1 (확신): 5/10 → **7~8/10** (calibration → 진짜 expected_return)
+- 원칙 2 (크게): 3/10 → **6~7/10** (allocation + pyramid + Phase 25.2)
+- 원칙 3 (빠르게): 8/10 → **9/10** (Conditional Veto 정상화 + ExitThesis)
+
+### FOLLOW_UPS 1순위 해결
+
+V3.2.1 Conditional Veto bug:
+- max_signal_staleness 8h < KR↔US 14h gap → 항상 stale → unconditional fire
+- 4/11~5/3 paper TP 5건 모두 stale 청산 (4/21 ADI +9.02% 자르기)
+
+V3.3 fix:
+- max_signal_staleness 16h
+- refresh_at_session_start
+- evaluate_conditional_veto 명시적 분기 (risk vs time)
+- 회귀 테스트 ADI 시나리오 KEEP 검증
+
+### 합격 기준 (V3.3_AB_PLAN §6)
+
+| 측정 | V3.2.1 baseline (BT) | V3.3 Full 목표 |
+|------|---------------------|---------------|
+| Sharpe | 1.65 | ≥ 1.50 |
+| MDD | 4% | ≤ 8% |
+| Profit Factor | 3.93 | ≥ 2.0 |
+| Avg Deployed | ~60% | ≥ 75% |
+| TC | (미측정) | ≥ 0.30 |
+| LEVERAGE_CAP 위반 | 0 | 0 (영구 invariant) |
+
+### 다음 단계
+
+```
+5/14: Phase 25.2 검증 종료
+5/15: feature/v3.3-phase1 → main 머지
+5/15+: server에서 build_edge_dataset → calibrate_edge → validate_edge
+5/15+: Paper Week 0 — 진단 3개 활성화
+6월~7월: 주차별 정책 활성화 (rollback 자동)
 ```

@@ -171,3 +171,27 @@ backtest:
   walk_forward_train_days: 252
   walk_forward_test_days: 63
   walk_forward_step_days: 63
+
+# ------------------------------------------------------------------
+# V3.3 Feature Flags (default all OFF — V3.2.1 동작 보존)
+# ------------------------------------------------------------------
+# 모든 신규 정책은 feature flag로 격리. 활성화 순서는 docs/V3.3_ROADMAP.md 참조.
+# Phase 1 진단 3개는 read-only이라 활성화 시에도 거래 결정 무영향.
+features:
+  # Phase 1 (read-only diagnostics)
+  no_trade_logger: false
+  tc_monitor: false
+  execution_quality: false
+  # Phase 2 (decision-affecting — calibration 후 활성화)
+  edge_calibrator: false
+  edge_engine: false
+  edge_tier: false
+  allocation: false
+  # Phase 3 (exit policies)
+  conditional_veto: false
+  exit_thesis: false
+  partial_exit: false
+  signal_decay: false
+  # Phase 4 (capital expansion)
+  pyramid: false
+  rotation: false

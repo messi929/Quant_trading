@@ -96,6 +96,131 @@ ssh $USER@$SERVER "
     tail -5 /var/log/quant-v3.log 2>/dev/null || echo '  (no logs yet)'
 "
 
+# 7. (V3.3 P5) Install calibration auto-retrain timer
+echo "[7/7] Installing V3.3 calibration auto-retrain timer..."
+ssh $USER@$SERVER "
+    cat > /etc/systemd/system/calibration-retrain.service << 'CSVEOF'
+[Unit]
+Description=V3.3 monthly calibration pipeline (build->calibrate->validate)
+After=network.target alpha-retrain.service
+Wants=alpha-retrain.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/quant
+Environment=PYTHONPATH=/opt/quant
+EnvironmentFile=/opt/quant/.env
+ExecStart=/opt/quant/venv/bin/python -u v3/scripts/run_calibration_pipeline.py \\
+    --ohlcv-path data/research/ohlcv_panel.parquet \\
+    --macro-path data/research/macro_pctl.parquet \\
+    --vol-pred-path data/research/vol_predictions.parquet \\
+    --years-back 5 \\
+    --oos-days 180 \\
+    --output-dir data/research \\
+    --report-dir research/reports \\
+    --latest-calibration-path v3/config/edge_calibration.json
+StandardOutput=append:/var/log/calibration-retrain.log
+StandardError=append:/var/log/calibration-retrain-error.log
+CSVEOF
+
+    cat > /etc/systemd/system/calibration-retrain.timer << 'CTMEOF'
+[Unit]
+Description=Monthly V3.3 calibration auto-retrain (1st @ 07:00 KST)
+
+[Timer]
+OnCalendar=*-*-01 07:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+CTMEOF
+
+    systemctl daemon-reload
+    systemctl enable calibration-retrain.timer 2>/dev/null || true
+    systemctl start calibration-retrain.timer 2>/dev/null || true
+    echo '  Calibration timer installed; first run on next 1st @ 07:00 KST'
+    echo '  NOTE: requires data/research/ohlcv_panel.parquet etc. (manual prep)'
+"
+
+# 8. (V3.3 P6) Install daily diagnostic report timer
+echo "[8/8] Installing V3.3 daily diagnostic report timer..."
+ssh $USER@$SERVER "
+    cat > /etc/systemd/system/v33-daily-report.service << 'DRSEOF'
+[Unit]
+Description=V3.3 daily diagnostic report (no_trade + TC + execution_quality)
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/quant
+Environment=PYTHONPATH=/opt/quant
+ExecStart=/opt/quant/venv/bin/python -u v3/scripts/run_daily_report.py \\
+    --log-dir v3/saved_models \\
+    --output-dir research/reports/daily
+StandardOutput=append:/var/log/v33-daily-report.log
+StandardError=append:/var/log/v33-daily-report-error.log
+DRSEOF
+
+    cat > /etc/systemd/system/v33-daily-report.timer << 'DRTEOF'
+[Unit]
+Description=V3.3 daily report (16:00 KST after market close)
+
+[Timer]
+OnCalendar=*-*-* 16:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+DRTEOF
+
+    systemctl daemon-reload
+    systemctl enable v33-daily-report.timer 2>/dev/null || true
+    systemctl start v33-daily-report.timer 2>/dev/null || true
+    echo '  Daily report timer installed; runs daily at 16:00 KST'
+"
+
+# 9. (V3.3 P7) Install rollback check timer
+echo "[9/9] Installing V3.3 rollback check timer..."
+ssh $USER@$SERVER "
+    cat > /etc/systemd/system/v33-rollback-check.service << 'RBSEOF'
+[Unit]
+Description=V3.3 daily rollback check (1w PnL -2% → feature OFF)
+After=network.target v33-daily-report.service
+Wants=v33-daily-report.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/quant
+Environment=PYTHONPATH=/opt/quant
+ExecStart=/opt/quant/venv/bin/python -u v3/scripts/run_rollback_check.py \\
+    --window-days 7 \\
+    --threshold -0.02
+StandardOutput=append:/var/log/v33-rollback.log
+StandardError=append:/var/log/v33-rollback-error.log
+RBSEOF
+
+    cat > /etc/systemd/system/v33-rollback-check.timer << 'RBTEOF'
+[Unit]
+Description=V3.3 rollback check (16:30 KST after daily report)
+
+[Timer]
+OnCalendar=*-*-* 16:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+RBTEOF
+
+    systemctl daemon-reload
+    systemctl enable v33-rollback-check.timer 2>/dev/null || true
+    systemctl start v33-rollback-check.timer 2>/dev/null || true
+    echo '  Rollback timer installed; runs daily at 16:30 KST'
+    echo '  NOTE: rollback yaml mutation requires service restart (manual)'
+"
+
 echo ""
 echo "=== V3 Deployment Complete ==="
 echo "  Server:  $SERVER"
@@ -104,3 +229,12 @@ echo "  Logs:    ssh $USER@$SERVER tail -f /var/log/quant-v3.log"
 echo "  Status:  ssh $USER@$SERVER systemctl status $SERVICE_NAME"
 echo "  Stop:    ssh $USER@$SERVER systemctl stop $SERVICE_NAME"
 echo "  V2 restore: ssh $USER@$SERVER 'rm -rf /opt/quant && mv /opt/quant_v2_backup /opt/quant'"
+echo ""
+echo "V3.3 timers (manual check):"
+echo "  alpha-retrain:        ssh $USER@$SERVER systemctl status alpha-retrain.timer"
+echo "  calibration-retrain:  ssh $USER@$SERVER systemctl status calibration-retrain.timer"
+echo "  v33-daily-report:     ssh $USER@$SERVER systemctl status v33-daily-report.timer"
+echo "  v33-rollback-check:   ssh $USER@$SERVER systemctl status v33-rollback-check.timer"
+echo ""
+echo "Daily reports: ssh $USER@$SERVER ls research/reports/daily/"
+echo "Rollback log:  ssh $USER@$SERVER tail -20 v3/saved_models/rollback_history.jsonl"
