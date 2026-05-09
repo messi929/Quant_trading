@@ -220,6 +220,42 @@ churn하는 패턴이 등장할 때) 검토. 현재 우선순위 낮음.
 
 ---
 
+## V3.3 F3 — BookOptimizer ctx.actions consumption ✅ 완료 (2026-05-09)
+
+**Status**: 풀 통합 완료. BacktestEngine이 features.exit_thesis ON 시
+ctx.actions의 EXIT/TRIM/ROTATE/ADD_NEW/ADD_TO_WINNER 모두 dispatch.
+
+추가된 helpers (v3/backtest/engine.py):
+- `_convert_to_position_states`: dict → PositionState
+- `_check_triggers_v33`: ExitRules.check → ticker→trigger map
+- `_handle_exit_action` / `_handle_trim_action` / `_handle_add_new_action`
+  / `_handle_pyramid_action`
+- `_process_book_actions`: multi-action dispatch + portfolio update
+
+run() loop:
+- features.exit_thesis OFF → V3.2.1 path (parity 보장, 547 tests)
+- features.exit_thesis ON → V3.3 path (ctx.actions 사용)
+
+테스트 (test_backtest_v33_integration.py, 21 신규):
+- _convert_to_position_states (4)
+- _check_triggers_v33 (3): no_exit / exit / missing_today
+- _handle_exit_action (2): trade 생성, unknown 안전
+- _handle_trim_action (2): partial trade, no-op when target == current
+- _handle_add_new_action (3): 신규, 중복 차단, min_order 차단
+- _handle_pyramid_action (3): weighted-avg, unknown 안전, target<current 안전
+- _process_book_actions (4): KEEP, EXIT+ADD_NEW, NO_ACTION, BLOCKED
+
+검증:
+- pytest v3/tests/ → 547/547 통과 (이전 526 + F3 신규 21)
+- features OFF default → 모든 기존 회귀 통과
+- features ON 시 V3.3 path 모든 helper 동작
+
+원본 issue (Evaluator):
+
+---
+
+(원본 항목 archive — 위 ✅ 완료 narrative 참조)
+
 ## V3.3 F3 — BookOptimizer ctx.actions consumption (Week 4 전 필수)
 
 V3.3 evaluator (2026-05-09) 발견 critical issue. F1+F2는 즉시 fix됐으나

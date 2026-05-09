@@ -33,6 +33,7 @@ from v3.strategy.regime_v2 import RegimeDetectorV2
 from v3.strategy.risk import RiskManager
 from v3.strategy.signal import SignalGenerator
 from v3.strategy.sizing import VolTargetSizer
+from v3.strategy.types import BookAction, DecisionContext, PositionState
 
 
 @dataclass
@@ -184,35 +185,37 @@ class BacktestEngine:
 
             self.risk_manager.update(portfolio_value)
 
-            # 1. Exit check on existing positions
-            positions, new_trades, cash, daily_pnl = self._check_exits(
-                positions, today_data, date_str, cash
-            )
-            trades.extend(new_trades)
-
-            # 2. Entry via SignalGenerator (live-parity)
             circuit_breaker_active = self.risk_manager.circuit_breaker_scale(portfolio_value) < 1.0
-            state = OperationalState(
-                current_positions=len(positions),
-                monthly_trades=len(monthly_unique_tickers),
-                circuit_breaker_active=circuit_breaker_active,
-            )
-
             df_up_to_t = df_feat[df_feat["date"] <= date_ts]
             vol_scores_today = vol_predictions[vol_predictions["date"] == date][
                 ["ticker", "vol_score", "confidence"]
             ]
+            ticker_volume_map = self._build_volume_map(today_data)
 
-            if not vol_scores_today.empty and not circuit_breaker_active:
+            # F3 fix: features.exit_thesis ON 시 V3.3 ctx.actions path 사용
+            if (
+                self.cfg.features.exit_thesis
+                and not vol_scores_today.empty
+                and not circuit_breaker_active
+            ):
                 regime = (
                     self.regime_detector.detect(macro_pctl, as_of=date_ts)
                     if not macro_pctl.empty else None
                 )
-                if regime is None:
-                    pass  # Skip entries when no regime
-                else:
-                    ticker_volume_map = self._build_volume_map(today_data)
-                    # V3.3 BookOptimizer routing (features.* OFF → V3.2.1 parity)
+                if regime is not None:
+                    # V3.3 path
+                    deployed_pre = 1.0 - (cash / max(portfolio_value, 1))
+                    triggers = self._check_triggers_v33(
+                        positions, today_data, deployed_pre,
+                    )
+                    position_states = self._convert_to_position_states(
+                        positions, today_data,
+                    )
+                    state = OperationalState(
+                        current_positions=len(positions),
+                        monthly_trades=len(monthly_unique_tickers),
+                        circuit_breaker_active=circuit_breaker_active,
+                    )
                     ctx = self.book_optimizer.decide_with_context(
                         ohlcv=df_up_to_t,
                         vol_scores=vol_scores_today,
@@ -221,57 +224,106 @@ class BacktestEngine:
                         state=state,
                         as_of=date_ts,
                         ticker_volume_map=ticker_volume_map,
+                        positions=position_states,
+                        exit_triggers=triggers,
                     )
-                    signal = ctx.signal  # parity: 기존 entry 처리 코드와 호환
+                    positions, new_trades, cash, daily_pnl = (
+                        self._process_book_actions(
+                            ctx, positions, today_data, vol_scores_today,
+                            date_str, cash, monthly_unique_tickers,
+                        )
+                    )
+                    trades.extend(new_trades)
+                else:
+                    # No regime → fall through to V3.2.1 _check_exits
+                    positions, new_trades, cash, daily_pnl = self._check_exits(
+                        positions, today_data, date_str, cash
+                    )
+                    trades.extend(new_trades)
+            else:
+                # V3.2.1 path (parity preserved when features.exit_thesis OFF)
 
-                    if signal.action == "TRADE":
-                        for pos_dict in signal.positions:
-                            ticker = pos_dict["ticker"]
-                            if any(p["ticker"] == ticker for p in positions):
-                                continue
+                # 1. Exit check on existing positions
+                positions, new_trades, cash, daily_pnl = self._check_exits(
+                    positions, today_data, date_str, cash
+                )
+                trades.extend(new_trades)
 
-                            ticker_row = today_data[today_data["ticker"] == ticker]
-                            if ticker_row.empty:
-                                continue
-                            row = ticker_row.iloc[0]
+                # 2. Entry via SignalGenerator (live-parity)
+                state = OperationalState(
+                    current_positions=len(positions),
+                    monthly_trades=len(monthly_unique_tickers),
+                    circuit_breaker_active=circuit_breaker_active,
+                )
 
-                            market = self._market_of(ticker)
-                            ticker_vol = float(row.get("vol_cc_5d", 0.2) or 0.2)
-                            slippage = self.get_realistic_slippage(market, ticker_vol)
-                            entry_price = float(row["open"]) * (1 + slippage)
-                            if entry_price <= 0:
-                                continue
+                if not vol_scores_today.empty and not circuit_breaker_active:
+                    regime = (
+                        self.regime_detector.detect(macro_pctl, as_of=date_ts)
+                        if not macro_pctl.empty else None
+                    )
+                    if regime is None:
+                        pass  # Skip entries when no regime
+                    else:
+                        # V3.3 BookOptimizer routing (features.* OFF → V3.2.1 parity)
+                        ctx = self.book_optimizer.decide_with_context(
+                            ohlcv=df_up_to_t,
+                            vol_scores=vol_scores_today,
+                            regime=regime,
+                            cost=self._cost_for_market(today_data),
+                            state=state,
+                            as_of=date_ts,
+                            ticker_volume_map=ticker_volume_map,
+                        )
+                        signal = ctx.signal  # parity: 기존 entry 처리 코드와 호환
 
-                            weight = pos_dict["weight"]
-                            allocated = cash * weight
-                            if allocated < self.cfg.trading.min_order_amount_krw:
-                                continue
+                        if signal.action == "TRADE":
+                            for pos_dict in signal.positions:
+                                ticker = pos_dict["ticker"]
+                                if any(p["ticker"] == ticker for p in positions):
+                                    continue
 
-                            init_unrealized = (
-                                row["close"] / entry_price - 1
-                                if entry_price > 0 else 0.0
-                            )
-                            positions.append({
-                                "ticker": ticker,
-                                "entry_date": date_str,
-                                "entry_price": entry_price,
-                                "weight": weight,
-                                "hold_days": 0,
-                                "entry_vol": ticker_vol,
-                                "vol_score": (
-                                    vol_scores_today[vol_scores_today["ticker"] == ticker]
-                                    ["vol_score"].iloc[0]
-                                    if ticker in vol_scores_today["ticker"].values else 0.0
-                                ),
-                                "opportunity": pos_dict.get("opportunity", 0.0),
-                                "capital_allocated": allocated,
-                                "last_unrealized": init_unrealized,
-                            })
-                            cash -= allocated
-                            monthly_unique_tickers.add(ticker)
+                                ticker_row = today_data[today_data["ticker"] == ticker]
+                                if ticker_row.empty:
+                                    continue
+                                row = ticker_row.iloc[0]
 
-                            if len(positions) >= self.cfg.trading.max_positions:
-                                break
+                                market = self._market_of(ticker)
+                                ticker_vol = float(row.get("vol_cc_5d", 0.2) or 0.2)
+                                slippage = self.get_realistic_slippage(market, ticker_vol)
+                                entry_price = float(row["open"]) * (1 + slippage)
+                                if entry_price <= 0:
+                                    continue
+
+                                weight = pos_dict["weight"]
+                                allocated = cash * weight
+                                if allocated < self.cfg.trading.min_order_amount_krw:
+                                    continue
+
+                                init_unrealized = (
+                                    row["close"] / entry_price - 1
+                                    if entry_price > 0 else 0.0
+                                )
+                                positions.append({
+                                    "ticker": ticker,
+                                    "entry_date": date_str,
+                                    "entry_price": entry_price,
+                                    "weight": weight,
+                                    "hold_days": 0,
+                                    "entry_vol": ticker_vol,
+                                    "vol_score": (
+                                        vol_scores_today[vol_scores_today["ticker"] == ticker]
+                                        ["vol_score"].iloc[0]
+                                        if ticker in vol_scores_today["ticker"].values else 0.0
+                                    ),
+                                    "opportunity": pos_dict.get("opportunity", 0.0),
+                                    "capital_allocated": allocated,
+                                    "last_unrealized": init_unrealized,
+                                })
+                                cash -= allocated
+                                monthly_unique_tickers.add(ticker)
+
+                                if len(positions) >= self.cfg.trading.max_positions:
+                                    break
 
             # 3. Portfolio mark-to-market
             invested = sum(
@@ -392,6 +444,401 @@ class BacktestEngine:
                 daily_pnl += (unrealized - prev_unrealized) * pos["weight"]
                 pos["last_unrealized"] = unrealized
                 new_positions.append(pos)
+
+        return new_positions, new_trades, cash, daily_pnl
+
+    # ──────────────────────────────────────────────────────────────
+    # F3 — V3.3 ctx.actions consumption path (features.exit_thesis ON)
+    # ──────────────────────────────────────────────────────────────
+    def _convert_to_position_states(
+        self,
+        positions: list[dict],
+        today_data: pd.DataFrame,
+    ) -> list[PositionState]:
+        """V3.2.1 dict positions → V3.3 PositionState for BookOptimizer."""
+        states: list[PositionState] = []
+        for pos in positions:
+            ticker = pos["ticker"]
+            tdata = today_data[today_data["ticker"] == ticker]
+            current_price = (
+                float(tdata.iloc[0]["close"])
+                if not tdata.empty else float(pos["entry_price"])
+            )
+            entry_price = float(pos["entry_price"])
+            pnl_pct = current_price / entry_price - 1.0 if entry_price > 0 else 0.0
+            states.append(PositionState(
+                ticker=ticker,
+                entry_date=pd.Timestamp(pos["entry_date"]),
+                entry_price=entry_price,
+                current_price=current_price,
+                current_weight=float(pos["weight"]),
+                entry_edge=float(pos.get("opportunity", 0.0)),
+                residual_edge=0.0,
+                entry_tier="A",
+                current_tier="A",
+                pnl_pct=pnl_pct,
+                max_unrealized_pnl_pct=max(pnl_pct, 0.0),
+                drawdown_from_peak_pct=min(pnl_pct, 0.0),
+                holding_days=int(pos.get("hold_days", 0)) + 1,
+                dominant_alpha="trend",
+                expected_holding_days=10,
+                thesis_alive=pnl_pct > 0,
+            ))
+        return states
+
+    def _check_triggers_v33(
+        self,
+        positions: list[dict],
+        today_data: pd.DataFrame,
+        portfolio_deployed: float,
+    ) -> dict[str, str]:
+        """ExitRules.check 결과를 ticker → trigger_name dict로."""
+        triggers: dict[str, str] = {}
+        for pos in positions:
+            tdata = today_data[today_data["ticker"] == pos["ticker"]]
+            if tdata.empty:
+                continue
+            row = tdata.iloc[0]
+            current_price = float(row["close"])
+            current_vol = float(
+                row.get("vol_cc_5d", pos.get("entry_vol", 0.3)) or 0.3
+            )
+            hold_days = int(pos.get("hold_days", 0)) + 1
+            decision = self.exit_rules.check(
+                entry_price=float(pos["entry_price"]),
+                current_price=current_price,
+                hold_days=hold_days,
+                entry_vol=float(pos.get("entry_vol", 0.3)),
+                current_vol=current_vol,
+                confidence=0.5,
+                low_price=float(row.get("low", current_price)),
+                portfolio_deployed=portfolio_deployed,
+            )
+            triggers[pos["ticker"]] = (
+                decision.reason if decision.should_exit else "max_hold"
+            )
+        return triggers
+
+    def _handle_exit_action(
+        self,
+        action: BookAction,
+        positions: list[dict],
+        today_data: pd.DataFrame,
+        date_str: str,
+    ) -> tuple[list[dict], TradeRecord | None, float, float]:
+        """EXIT/ROTATE BookAction → trade + position 제거.
+
+        Returns: (new_positions, trade_or_None, cash_delta, pnl_delta)
+        cash_delta = capital recovered (positive)
+        """
+        idx = next(
+            (i for i, p in enumerate(positions) if p["ticker"] == action.ticker),
+            None,
+        )
+        if idx is None:
+            return positions, None, 0.0, 0.0
+        pos = positions[idx]
+
+        tdata = today_data[today_data["ticker"] == pos["ticker"]]
+        if tdata.empty:
+            return positions, None, 0.0, 0.0
+        row = tdata.iloc[0]
+        current_price = float(row["close"])
+        current_vol = float(
+            row.get("vol_cc_5d", pos.get("entry_vol", 0.3)) or 0.3
+        )
+
+        market = self._market_of(pos["ticker"])
+        cost = self.cfg.cost_for_market(market)
+        slippage = self.get_realistic_slippage(market, current_vol)
+        exit_price = current_price * (1 - slippage)
+        gross_ret = exit_price / pos["entry_price"] - 1.0
+        net_ret = gross_ret - cost
+
+        trade = TradeRecord(
+            entry_date=pos["entry_date"],
+            exit_date=date_str,
+            ticker=pos["ticker"],
+            market=market,
+            direction="long",
+            entry_price=pos["entry_price"],
+            exit_price=exit_price,
+            weight=pos["weight"],
+            gross_return=gross_ret,
+            net_return=net_ret,
+            cost=cost,
+            exit_reason=action.reason,
+            hold_days=int(pos.get("hold_days", 0)) + 1,
+            vol_score=pos.get("vol_score", 0),
+            opportunity=pos.get("opportunity", 0.0),
+        )
+        cash_delta = pos["capital_allocated"] * (1 + net_ret)
+        pnl_delta = net_ret * pos["weight"]
+        new_positions = positions[:idx] + positions[idx + 1:]
+        return new_positions, trade, cash_delta, pnl_delta
+
+    def _handle_trim_action(
+        self,
+        action: BookAction,
+        positions: list[dict],
+        today_data: pd.DataFrame,
+        date_str: str,
+    ) -> tuple[list[dict], TradeRecord | None, float, float]:
+        """TRIM BookAction → 부분 trade + position weight 감소."""
+        idx = next(
+            (i for i, p in enumerate(positions) if p["ticker"] == action.ticker),
+            None,
+        )
+        if idx is None:
+            return positions, None, 0.0, 0.0
+        pos = positions[idx]
+        if pos["weight"] <= 0:
+            return positions, None, 0.0, 0.0
+        trim_fraction = 1.0 - (action.target_weight / pos["weight"])
+        if trim_fraction <= 1e-9:
+            return positions, None, 0.0, 0.0
+
+        tdata = today_data[today_data["ticker"] == pos["ticker"]]
+        if tdata.empty:
+            return positions, None, 0.0, 0.0
+        row = tdata.iloc[0]
+        current_price = float(row["close"])
+        current_vol = float(
+            row.get("vol_cc_5d", pos.get("entry_vol", 0.3)) or 0.3
+        )
+
+        market = self._market_of(pos["ticker"])
+        cost = self.cfg.cost_for_market(market)
+        slippage = self.get_realistic_slippage(market, current_vol)
+        exit_price = current_price * (1 - slippage)
+        gross_ret = exit_price / pos["entry_price"] - 1.0
+        net_ret = gross_ret - cost
+
+        trim_capital = pos["capital_allocated"] * trim_fraction
+        trade = TradeRecord(
+            entry_date=pos["entry_date"],
+            exit_date=date_str,
+            ticker=pos["ticker"],
+            market=market,
+            direction="long",
+            entry_price=pos["entry_price"],
+            exit_price=exit_price,
+            weight=pos["weight"] * trim_fraction,
+            gross_return=gross_ret,
+            net_return=net_ret,
+            cost=cost,
+            exit_reason=f"TRIM:{action.reason}",
+            hold_days=int(pos.get("hold_days", 0)) + 1,
+            vol_score=pos.get("vol_score", 0),
+            opportunity=pos.get("opportunity", 0.0),
+        )
+        cash_delta = trim_capital * (1 + net_ret)
+        pnl_delta = net_ret * pos["weight"] * trim_fraction
+
+        new_positions = list(positions)
+        new_positions[idx] = dict(pos)
+        new_positions[idx]["weight"] = action.target_weight
+        new_positions[idx]["capital_allocated"] = (
+            pos["capital_allocated"] * (1.0 - trim_fraction)
+        )
+        return new_positions, trade, cash_delta, pnl_delta
+
+    def _handle_add_new_action(
+        self,
+        action: BookAction,
+        positions: list[dict],
+        today_data: pd.DataFrame,
+        vol_scores_today: pd.DataFrame,
+        date_str: str,
+        cash: float,
+        monthly_unique_tickers: set[str],
+    ) -> tuple[list[dict], float]:
+        """ADD_NEW BookAction → 새 position. (cash_delta는 음수 = 차감)"""
+        ticker = action.ticker
+        if any(p["ticker"] == ticker for p in positions):
+            return positions, 0.0
+
+        tdata = today_data[today_data["ticker"] == ticker]
+        if tdata.empty:
+            return positions, 0.0
+        row = tdata.iloc[0]
+
+        market = self._market_of(ticker)
+        ticker_vol = float(row.get("vol_cc_5d", 0.2) or 0.2)
+        slippage = self.get_realistic_slippage(market, ticker_vol)
+        entry_price = float(row["open"]) * (1 + slippage)
+        if entry_price <= 0:
+            return positions, 0.0
+
+        weight = action.target_weight
+        allocated = cash * weight
+        if allocated < self.cfg.trading.min_order_amount_krw:
+            return positions, 0.0
+
+        init_unrealized = (
+            row["close"] / entry_price - 1.0 if entry_price > 0 else 0.0
+        )
+
+        # Lookup vol_score
+        vol_score = 0.0
+        if (
+            not vol_scores_today.empty
+            and ticker in vol_scores_today["ticker"].values
+        ):
+            vol_score = float(
+                vol_scores_today[vol_scores_today["ticker"] == ticker]
+                ["vol_score"].iloc[0]
+            )
+
+        new_pos = {
+            "ticker": ticker,
+            "entry_date": date_str,
+            "entry_price": entry_price,
+            "weight": weight,
+            "hold_days": 0,
+            "entry_vol": ticker_vol,
+            "vol_score": vol_score,
+            "opportunity": float(action.expected_impact or 0.0),
+            "capital_allocated": allocated,
+            "last_unrealized": init_unrealized,
+        }
+        new_positions = list(positions) + [new_pos]
+        monthly_unique_tickers.add(ticker)
+        return new_positions, -allocated
+
+    def _handle_pyramid_action(
+        self,
+        action: BookAction,
+        positions: list[dict],
+        today_data: pd.DataFrame,
+        date_str: str,
+        cash: float,
+    ) -> tuple[list[dict], float]:
+        """ADD_TO_WINNER → 기존 position에 추가 capital, weighted-avg entry_price."""
+        idx = next(
+            (i for i, p in enumerate(positions) if p["ticker"] == action.ticker),
+            None,
+        )
+        if idx is None:
+            return positions, 0.0
+        pos = positions[idx]
+        add_weight = action.target_weight - pos["weight"]
+        if add_weight <= 0:
+            return positions, 0.0
+
+        tdata = today_data[today_data["ticker"] == action.ticker]
+        if tdata.empty:
+            return positions, 0.0
+        row = tdata.iloc[0]
+
+        market = self._market_of(action.ticker)
+        ticker_vol = float(
+            row.get("vol_cc_5d", pos.get("entry_vol", 0.2)) or 0.2
+        )
+        slippage = self.get_realistic_slippage(market, ticker_vol)
+        add_entry_price = float(row["open"]) * (1 + slippage)
+        if add_entry_price <= 0:
+            return positions, 0.0
+
+        add_capital = cash * add_weight
+        if add_capital < self.cfg.trading.min_order_amount_krw:
+            return positions, 0.0
+
+        # Weighted-average entry_price
+        old_capital = pos["capital_allocated"]
+        new_capital = old_capital + add_capital
+        weighted_entry = (
+            (pos["entry_price"] * old_capital + add_entry_price * add_capital)
+            / new_capital
+        )
+
+        new_positions = list(positions)
+        new_positions[idx] = dict(pos)
+        new_positions[idx]["weight"] = action.target_weight
+        new_positions[idx]["capital_allocated"] = new_capital
+        new_positions[idx]["entry_price"] = weighted_entry
+        return new_positions, -add_capital
+
+    def _process_book_actions(
+        self,
+        ctx: DecisionContext,
+        positions: list[dict],
+        today_data: pd.DataFrame,
+        vol_scores_today: pd.DataFrame,
+        date_str: str,
+        cash: float,
+        monthly_unique_tickers: set[str],
+    ) -> tuple[list[dict], list[TradeRecord], float, float]:
+        """V3.3 path: ctx.actions를 trade + position 변경으로 dispatch.
+
+        Action types handled:
+          EXIT, ROTATE → trade + position 제거 (replacement entry는 ADD_NEW로 별도 emit)
+          TRIM        → 부분 trade + position weight 감소
+          ADD_NEW     → 새 position
+          ADD_TO_WINNER → 기존 weight 증가
+          KEEP, NO_ACTION, BLOCKED → 변동 없음
+        """
+        new_positions = list(positions)
+        new_trades: list[TradeRecord] = []
+        daily_pnl = 0.0
+
+        for action in ctx.actions:
+            at = action.action_type
+            if at in ("KEEP", "NO_ACTION", "BLOCKED"):
+                continue
+            if at in ("EXIT", "ROTATE"):
+                new_positions, trade, cash_delta, pnl_delta = (
+                    self._handle_exit_action(
+                        action, new_positions, today_data, date_str,
+                    )
+                )
+                if trade is not None:
+                    new_trades.append(trade)
+                    cash += cash_delta
+                    daily_pnl += pnl_delta
+            elif at == "TRIM":
+                new_positions, trade, cash_delta, pnl_delta = (
+                    self._handle_trim_action(
+                        action, new_positions, today_data, date_str,
+                    )
+                )
+                if trade is not None:
+                    new_trades.append(trade)
+                    cash += cash_delta
+                    daily_pnl += pnl_delta
+            elif at == "ADD_NEW":
+                new_positions, cash_delta = self._handle_add_new_action(
+                    action, new_positions, today_data, vol_scores_today,
+                    date_str, cash, monthly_unique_tickers,
+                )
+                cash += cash_delta
+                if len(new_positions) >= self.cfg.trading.max_positions:
+                    # Skip remaining ADD_NEW actions
+                    pass
+            elif at == "ADD_TO_WINNER":
+                new_positions, cash_delta = self._handle_pyramid_action(
+                    action, new_positions, today_data, date_str, cash,
+                )
+                cash += cash_delta
+
+        # Update unrealized + hold_days for surviving positions
+        for pos in new_positions:
+            if pos.get("hold_days", 0) == 0:
+                # Just-entered ADD_NEW; skip increment (entry day)
+                continue
+            tdata = today_data[today_data["ticker"] == pos["ticker"]]
+            if tdata.empty:
+                continue
+            row = tdata.iloc[0]
+            current_price = float(row["close"])
+            unrealized = (
+                current_price / pos["entry_price"] - 1.0
+                if pos["entry_price"] > 0 else 0.0
+            )
+            prev_unrealized = pos.get("last_unrealized", unrealized)
+            daily_pnl += (unrealized - prev_unrealized) * pos["weight"]
+            pos["last_unrealized"] = unrealized
+            pos["hold_days"] = pos.get("hold_days", 0) + 1
 
         return new_positions, new_trades, cash, daily_pnl
 
