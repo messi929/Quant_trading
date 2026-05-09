@@ -29,6 +29,7 @@ from v3.model.vol_transformer import VolTransformer
 from v3.rules.entry import EntryFilter, OperationalState
 from v3.strategy.alpha_sources import DEFAULT_CONVICTION, DEFAULT_DIRECTIONAL
 from v3.strategy.book_optimizer import BookOptimizer
+from v3.strategy.feature_tracker import record_features_on_startup
 from v3.strategy.opportunity import OpportunityScorer
 from v3.strategy.regime_v2 import RegimeDetectorV2
 from v3.strategy.signal import SignalGenerator
@@ -112,6 +113,15 @@ class LivePipeline:
         self.book_optimizer = BookOptimizer(
             signal_gen=self.signal_gen,
             features=self.cfg.features,
+        )
+
+        # F2 fix — record feature activations for rollback safety net
+        models_dir = Path(self.cfg.paths.models)
+        record_features_on_startup(
+            current=self.cfg.features,
+            history_path=models_dir / "feature_activations.jsonl",
+            snapshot_path=models_dir / "feature_state_snapshot.json",
+            activated_by="live_pipeline_startup",
         )
 
         # Execution
