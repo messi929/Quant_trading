@@ -143,6 +143,44 @@ CTMEOF
     echo '  NOTE: requires data/research/ohlcv_panel.parquet etc. (manual prep)'
 "
 
+# 8. (V3.3 P6) Install daily diagnostic report timer
+echo "[8/8] Installing V3.3 daily diagnostic report timer..."
+ssh $USER@$SERVER "
+    cat > /etc/systemd/system/v33-daily-report.service << 'DRSEOF'
+[Unit]
+Description=V3.3 daily diagnostic report (no_trade + TC + execution_quality)
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/quant
+Environment=PYTHONPATH=/opt/quant
+ExecStart=/opt/quant/venv/bin/python -u v3/scripts/run_daily_report.py \\
+    --log-dir v3/saved_models \\
+    --output-dir research/reports/daily
+StandardOutput=append:/var/log/v33-daily-report.log
+StandardError=append:/var/log/v33-daily-report-error.log
+DRSEOF
+
+    cat > /etc/systemd/system/v33-daily-report.timer << 'DRTEOF'
+[Unit]
+Description=V3.3 daily report (16:00 KST after market close)
+
+[Timer]
+OnCalendar=*-*-* 16:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+DRTEOF
+
+    systemctl daemon-reload
+    systemctl enable v33-daily-report.timer 2>/dev/null || true
+    systemctl start v33-daily-report.timer 2>/dev/null || true
+    echo '  Daily report timer installed; runs daily at 16:00 KST'
+"
+
 echo ""
 echo "=== V3 Deployment Complete ==="
 echo "  Server:  $SERVER"
@@ -155,3 +193,6 @@ echo ""
 echo "V3.3 timers (manual check):"
 echo "  alpha-retrain:        ssh $USER@$SERVER systemctl status alpha-retrain.timer"
 echo "  calibration-retrain:  ssh $USER@$SERVER systemctl status calibration-retrain.timer"
+echo "  v33-daily-report:     ssh $USER@$SERVER systemctl status v33-daily-report.timer"
+echo ""
+echo "Daily reports: ssh $USER@$SERVER ls research/reports/daily/"
