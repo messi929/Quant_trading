@@ -60,7 +60,12 @@ from v3.strategy.regime_v2 import Regime
 from v3.strategy.rotation import CapitalRotationEngine
 from v3.strategy.signal import SignalGenerator, TradeSignal
 from v3.strategy.signal_decay import SignalDecayEngine
-from v3.strategy.types import BookAction, EdgeCandidate, PositionState
+from v3.strategy.types import (
+    BookAction,
+    DecisionContext,
+    EdgeCandidate,
+    PositionState,
+)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -146,7 +151,15 @@ class BookOptimizer:
         self.execution_quality = execution_quality
 
     # ── Public API ────────────────────────────────────────────
-    def decide(
+    def decide(self, *args, **kwargs) -> list[BookAction]:
+        """Thin wrapper around decide_with_context() returning only actions.
+
+        Preserved for PR-2.4 callers. New code should prefer
+        decide_with_context() to access TradeSignal + EdgeCandidate metadata.
+        """
+        return self.decide_with_context(*args, **kwargs).actions
+
+    def decide_with_context(
         self,
         ohlcv: pd.DataFrame,
         vol_scores: pd.DataFrame,
@@ -165,7 +178,7 @@ class BookOptimizer:
         rotations_this_month: int = 0,
         adds_per_position: Optional[dict[str, int]] = None,
         initial_weights: Optional[dict[str, float]] = None,
-    ) -> list[BookAction]:
+    ) -> DecisionContext:
         """Generate the day's BookActions.
 
         Args:
@@ -257,7 +270,14 @@ class BookOptimizer:
         self._record_diagnostics(signal, candidates, actions, as_of)
 
         # Step 9: Sort by priority
-        return sorted(actions, key=lambda a: ACTION_PRIORITY.get(a.action_type, 99))
+        sorted_actions = sorted(
+            actions, key=lambda a: ACTION_PRIORITY.get(a.action_type, 99)
+        )
+        return DecisionContext(
+            actions=sorted_actions,
+            signal=signal,
+            candidates=candidates,
+        )
 
     # ── Internal: candidate construction ──────────────────────
     def _build_candidates(

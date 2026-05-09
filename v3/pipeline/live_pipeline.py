@@ -28,6 +28,7 @@ from v3.model.inference import VolInference
 from v3.model.vol_transformer import VolTransformer
 from v3.rules.entry import EntryFilter, OperationalState
 from v3.strategy.alpha_sources import DEFAULT_CONVICTION, DEFAULT_DIRECTIONAL
+from v3.strategy.book_optimizer import BookOptimizer
 from v3.strategy.opportunity import OpportunityScorer
 from v3.strategy.regime_v2 import RegimeDetectorV2
 from v3.strategy.signal import SignalGenerator
@@ -105,6 +106,14 @@ class LivePipeline:
         )
         logger.info("Regime engine: cross-asset (Phase 2 unified)")
 
+        # V3.3 BookOptimizer (PR-2.5 integration).
+        # features.* OFF default → V3.2.1 100% parity.
+        # Phase 2/3/4 dependencies wired conditionally as features activate.
+        self.book_optimizer = BookOptimizer(
+            signal_gen=self.signal_gen,
+            features=self.cfg.features,
+        )
+
         # Execution
         self.executor = TradingExecutor(self.cfg)
 
@@ -151,15 +160,17 @@ class LivePipeline:
         # Ticker volume map (liquidity check)
         ticker_volume_map = self._build_volume_map(df)
 
-        # Signal generation
-        signal = self.signal_gen.generate(
+        # V3.3 BookOptimizer routing (features.* OFF → V3.2.1 parity)
+        ctx = self.book_optimizer.decide_with_context(
             ohlcv=df,
             vol_scores=vol_scores,
             regime=regime,
             cost=self.cfg.trading.costs.us_roundtrip,
             state=state,
+            as_of=pd.Timestamp(today),
             ticker_volume_map=ticker_volume_map,
         )
+        signal = ctx.signal  # parity: 기존 signal 처리 코드와 호환
 
         logger.info(
             f"Signal: {signal.action} — {len(signal.positions)} positions, "

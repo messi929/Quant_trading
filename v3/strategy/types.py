@@ -191,6 +191,22 @@ class TCSnapshot:
 
 
 # ──────────────────────────────────────────────────────────────
+# DecisionContext (BookOptimizer rich return type — PR-2.5)
+# ──────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class DecisionContext:
+    """Rich return from BookOptimizer.decide_with_context().
+
+    Includes the underlying TradeSignal and EdgeCandidate list for
+    callers that need diagnostic context (logging, metrics, etc.).
+    Plain decide() returns only `actions`.
+    """
+    actions: list["BookAction"]
+    signal: object        # TradeSignal — typed as object to avoid circular import
+    candidates: list[EdgeCandidate]
+
+
+# ──────────────────────────────────────────────────────────────
 # CalibrationBucket
 # ──────────────────────────────────────────────────────────────
 @dataclass(frozen=True)

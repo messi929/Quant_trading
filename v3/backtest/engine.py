@@ -27,6 +27,7 @@ from v3.data.feature_engineer import VolFeatureEngineer
 from v3.rules.entry import EntryFilter, OperationalState
 from v3.rules.exit import ExitRules
 from v3.strategy.alpha_sources import DEFAULT_CONVICTION, DEFAULT_DIRECTIONAL
+from v3.strategy.book_optimizer import BookOptimizer
 from v3.strategy.opportunity import OpportunityScorer
 from v3.strategy.regime_v2 import RegimeDetectorV2
 from v3.strategy.risk import RiskManager
@@ -116,6 +117,15 @@ class BacktestEngine:
             max_single_weight=cfg.trading.max_single_weight,
         )
 
+        # V3.3 BookOptimizer (PR-2.5 integration).
+        # All Phase 2/3/4 dependencies default None — features.* OFF는 V3.2.1
+        # 동작 100% 보존. features 활성화 시 Edge layer / exit policies /
+        # capital expansion engine을 BookOptimizer가 wiring.
+        self.book_optimizer = BookOptimizer(
+            signal_gen=self.signal_gen,
+            features=cfg.features,
+        )
+
     def run(
         self,
         df: pd.DataFrame,
@@ -202,14 +212,17 @@ class BacktestEngine:
                     pass  # Skip entries when no regime
                 else:
                     ticker_volume_map = self._build_volume_map(today_data)
-                    signal = self.signal_gen.generate(
+                    # V3.3 BookOptimizer routing (features.* OFF → V3.2.1 parity)
+                    ctx = self.book_optimizer.decide_with_context(
                         ohlcv=df_up_to_t,
                         vol_scores=vol_scores_today,
                         regime=regime,
                         cost=self._cost_for_market(today_data),
                         state=state,
+                        as_of=date_ts,
                         ticker_volume_map=ticker_volume_map,
                     )
+                    signal = ctx.signal  # parity: 기존 entry 처리 코드와 호환
 
                     if signal.action == "TRADE":
                         for pos_dict in signal.positions:

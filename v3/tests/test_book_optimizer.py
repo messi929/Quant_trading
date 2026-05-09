@@ -344,6 +344,58 @@ class TestActionPriority:
 # ──────────────────────────────────────────────────────────────
 # Immutability
 # ──────────────────────────────────────────────────────────────
+class TestDecisionContext:
+    """PR-2.5 — decide_with_context returns rich context for backtest/live."""
+
+    def test_ctx_signal_is_underlying_trade_signal(self):
+        signal = _mock_signal(action="TRADE")
+        bo = BookOptimizer(
+            signal_gen=_mock_signal_generator(signal),
+            features=FeatureFlagsConfig.all_off(),
+        )
+        ctx = bo.decide_with_context(
+            ohlcv=pd.DataFrame(), vol_scores=pd.DataFrame(),
+            regime=_regime(), cost=0.001, state=_state(),
+        )
+        # ctx.signal is the same TradeSignal returned by signal_gen.generate()
+        assert ctx.signal is signal
+
+    def test_ctx_actions_match_decide(self):
+        """decide() == decide_with_context().actions (thin wrapper invariant)."""
+        signal = _mock_signal(action="TRADE")
+        bo = BookOptimizer(
+            signal_gen=_mock_signal_generator(signal),
+            features=FeatureFlagsConfig.all_off(),
+        )
+        actions_direct = bo.decide(
+            ohlcv=pd.DataFrame(), vol_scores=pd.DataFrame(),
+            regime=_regime(), cost=0.001, state=_state(),
+        )
+        ctx = bo.decide_with_context(
+            ohlcv=pd.DataFrame(), vol_scores=pd.DataFrame(),
+            regime=_regime(), cost=0.001, state=_state(),
+        )
+        # Same length and same structure (BookActions are frozen → equal by fields)
+        assert len(actions_direct) == len(ctx.actions)
+        for a, b in zip(actions_direct, ctx.actions):
+            assert a.action_type == b.action_type
+            assert a.ticker == b.ticker
+            assert a.target_weight == b.target_weight
+
+    def test_ctx_candidates_populated(self):
+        signal = _mock_signal(action="TRADE")
+        bo = BookOptimizer(
+            signal_gen=_mock_signal_generator(signal),
+            features=FeatureFlagsConfig.all_off(),
+        )
+        ctx = bo.decide_with_context(
+            ohlcv=pd.DataFrame(), vol_scores=pd.DataFrame(),
+            regime=_regime(), cost=0.001, state=_state(),
+        )
+        # 4 candidates from opportunity_map
+        assert len(ctx.candidates) == 4
+
+
 class TestImmutability:
     def test_book_actions_are_frozen(self):
         signal = _mock_signal(action="TRADE")
