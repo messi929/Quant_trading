@@ -38,10 +38,19 @@ from unittest.mock import MagicMock
 import pandas as pd
 from loguru import logger
 
-from v3.config.schema import FeatureFlagsConfig
-from v3.research.ablation_runner import AblationRunner, run_sweep
+from v3.config.schema import FeatureFlagsConfig, V3Config, load_config
+from v3.research.ablation_runner import (
+    AblationMetrics,
+    AblationRunner,
+    ActionDistribution,
+    run_sweep,
+)
 from v3.research.ablation_report import save_comparison_report
-from v3.research.ablation_specs import ABLATION_SPECS
+from v3.research.ablation_specs import (
+    ABLATION_SPECS,
+    AblationSpec,
+    apply_features_to_config,
+)
 from v3.research.promotion_decision import (
     build_promotion_plan,
     save_promotion_plan,
@@ -118,6 +127,110 @@ def _synthetic_inputs(n_dates: int = 20) -> Iterable[dict]:
 
 
 # ──────────────────────────────────────────────────────────────
+# Production mode — BacktestEngine wiring
+# ──────────────────────────────────────────────────────────────
+def _backtest_to_ablation_metrics(
+    bt_result, spec: AblationSpec
+) -> AblationMetrics:
+    """Convert BacktestResult → AblationMetrics.
+
+    BacktestEngine populates Sharpe / MDD / Return / WinRate / PF.
+    Action distribution는 trade count 기반 근사 (BookAction 직접 trace는
+    BookOptimizer.decide_with_context 호출 시점에서 가능 — 별도 PR).
+    """
+    return AblationMetrics(
+        ablation_name=spec.name,
+        family=spec.family,
+        n_dates=len(bt_result.equity_curve) if hasattr(bt_result, "equity_curve") else 0,
+        n_actions=int(bt_result.total_trades),
+        action_distribution=ActionDistribution(
+            add_new=int(bt_result.total_trades),
+        ),
+        total_target_weight=0.0,    # not tracked by current BacktestEngine
+        avg_deployed=0.0,           # not tracked
+        max_single_weight=0.0,
+        leverage_violations=0,      # backtest engine clamps to ≤1.00
+        pyramid_count=0,
+        rotation_count=0,
+        risk_exit_count=sum(
+            1 for t in bt_result.trades
+            if any(k in t.exit_reason.lower() for k in
+                   ("stop", "circuit", "vol_contraction"))
+        ),
+        # Backtest-specific metrics
+        sharpe=float(bt_result.sharpe),
+        max_drawdown=float(bt_result.max_drawdown),
+        total_return=float(bt_result.total_return),
+        win_rate=float(bt_result.win_rate),
+        profit_factor=float(bt_result.profit_factor),
+        n_trades=int(bt_result.total_trades),
+    )
+
+
+def _run_production_sweep(args) -> list[AblationMetrics]:
+    """Run ablation sweep using BacktestEngine for each spec.
+
+    Each ablation gets its own BacktestEngine instance with apply_features_to_config
+    applied. BookOptimizer routing inside BacktestEngine activates the spec features.
+
+    Limitations:
+      - Phase 3+4 effects (exit_thesis, pyramid, rotation) require
+        BacktestEngine to pass `positions=...` into BookOptimizer (PR-2.7).
+      - Until then, Phase 2 Edge layer effects (calibrator/engine/tier) are
+        the primary measurable differential.
+    """
+    from v3.backtest.engine import BacktestEngine
+
+    base_cfg = load_config()
+
+    logger.info(f"Loading panel from {args.panel}")
+    df = pd.read_parquet(args.panel)
+
+    # vol_predictions: assumed to be a separate parquet or derived; here we
+    # require a paired file or skip the ablation if missing
+    vol_pred_path = args.panel.parent / f"{args.panel.stem}_vol_predictions.parquet"
+    if not vol_pred_path.exists():
+        logger.error(
+            f"vol_predictions parquet not found at {vol_pred_path}. "
+            "Generate via VolInference batch and place alongside panel."
+        )
+        return []
+    vol_predictions = pd.read_parquet(vol_pred_path)
+
+    results: list[AblationMetrics] = []
+    for spec in ABLATION_SPECS:
+        logger.info(f"Running ablation: {spec.name}")
+        try:
+            cfg_for_spec = apply_features_to_config(base_cfg, spec)
+            engine = BacktestEngine(cfg_for_spec)
+            bt_result = engine.run(df, vol_predictions)
+            metrics = _backtest_to_ablation_metrics(bt_result, spec)
+            results.append(metrics)
+            logger.info(
+                f"  {spec.name}: Sharpe={metrics.sharpe:.2f}, "
+                f"Return={metrics.total_return:.3f}, "
+                f"MDD={metrics.max_drawdown:.3f}, "
+                f"trades={metrics.n_trades}"
+            )
+        except Exception as exc:
+            logger.error(f"  {spec.name} FAILED: {exc!r}")
+            # Append placeholder so report still shows the failed ablation
+            results.append(AblationMetrics(
+                ablation_name=spec.name,
+                family=spec.family,
+                n_dates=0, n_actions=0,
+                action_distribution=ActionDistribution(),
+                total_target_weight=0.0, avg_deployed=0.0,
+                max_single_weight=0.0,
+                leverage_violations=0,
+                pyramid_count=0, rotation_count=0, risk_exit_count=0,
+                error_messages=(str(exc),),
+            ))
+
+    return results
+
+
+# ──────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -162,23 +275,25 @@ def main(argv: list[str] | None = None) -> int:
         )
         factory = _synthetic_factory()
         inputs_factory = lambda: _synthetic_inputs(n_dates=args.n_dates)
-    else:
-        logger.error(
-            "Production mode not yet wired. Required:\n"
-            "  - calibration_table.json (--calibration)\n"
-            "  - panel parquet (--panel)\n"
-            "  - VolTransformer + alpha_weights\n"
-            "  - SignalGenerator with all dependencies\n"
-            "Run with --synthetic for sanity check."
+        runner = AblationRunner(book_optimizer_factory=factory)
+        results = run_sweep(
+            ABLATION_SPECS,
+            runner=runner,
+            inputs_factory=inputs_factory,
         )
-        return 1
+    else:
+        # Production mode — BacktestEngine for each ablation
+        if args.panel is None:
+            logger.error(
+                "--panel <path/to/edge_dataset.parquet> required in "
+                "production mode. Use --synthetic for sanity check."
+            )
+            return 1
+        results = _run_production_sweep(args)
 
-    runner = AblationRunner(book_optimizer_factory=factory)
-    results = run_sweep(
-        ABLATION_SPECS,
-        runner=runner,
-        inputs_factory=inputs_factory,
-    )
+    if not results:
+        logger.error("No results — sweep aborted")
+        return 1
 
     # Comparison report
     comparison_path = args.output_dir / f"ablation_{args.tag}_comparison.md"

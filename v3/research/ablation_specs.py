@@ -382,6 +382,17 @@ def load_features_from_yaml(path: str | Path) -> FeatureFlagsConfig:
 # ──────────────────────────────────────────────────────────────
 # Summary
 # ──────────────────────────────────────────────────────────────
+def apply_features_to_config(cfg, spec: AblationSpec):
+    """Override cfg.features with spec.features. Returns new V3Config.
+
+    Used by production ablation runners to swap features per spec while
+    preserving all other config fields.
+    """
+    cfg_dict = cfg.model_dump()
+    cfg_dict["features"] = spec.features.model_dump()
+    return cfg.__class__(**cfg_dict)
+
+
 def specs_summary() -> dict[str, dict]:
     """Return summary dict {name: {family, description, active_features}}."""
     out: dict[str, dict] = {}

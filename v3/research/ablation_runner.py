@@ -55,7 +55,12 @@ class ActionDistribution:
 
 @dataclass(frozen=True)
 class AblationMetrics:
-    """Aggregate metrics for a single ablation run."""
+    """Aggregate metrics for a single ablation run.
+
+    Two source modes:
+      Synthetic (BookOptimizer.decide stream): action_distribution + leverage
+      Backtest (BacktestEngine.run): sharpe / max_drawdown / total_return etc.
+    """
     ablation_name: str
     family: str
     n_dates: int
@@ -69,6 +74,13 @@ class AblationMetrics:
     rotation_count: int
     risk_exit_count: int
     error_messages: tuple[str, ...] = field(default_factory=tuple)
+    # PR-2.6: Backtest-specific (None for synthetic mode)
+    sharpe: Optional[float] = None
+    max_drawdown: Optional[float] = None
+    total_return: Optional[float] = None
+    win_rate: Optional[float] = None
+    profit_factor: Optional[float] = None
+    n_trades: Optional[int] = None
 
 
 # ──────────────────────────────────────────────────────────────

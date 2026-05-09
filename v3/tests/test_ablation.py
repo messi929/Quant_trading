@@ -34,6 +34,7 @@ from v3.research.ablation_report import (
 from v3.research.ablation_specs import (
     ABLATION_SPECS,
     AblationSpec,
+    apply_features_to_config,
     get_spec,
     list_ablations,
     load_features_from_yaml,
@@ -152,6 +153,37 @@ class TestYAMLPersistence:
 # ──────────────────────────────────────────────────────────────
 # specs_summary
 # ──────────────────────────────────────────────────────────────
+class TestApplyFeaturesToConfig:
+    """PR-2.6 — apply_features_to_config helper for production sweep."""
+
+    def test_overrides_features_section(self):
+        from v3.config.schema import load_config
+        cfg = load_config()
+        original_no_trade = cfg.features.no_trade_logger
+        spec = get_spec("full")
+        new_cfg = apply_features_to_config(cfg, spec)
+        # full has all features ON
+        assert new_cfg.features.no_trade_logger is True
+        assert new_cfg.features.allocation is True
+        assert new_cfg.features.pyramid is True
+
+    def test_other_fields_preserved(self):
+        from v3.config.schema import load_config
+        cfg = load_config()
+        spec = get_spec("baseline")
+        new_cfg = apply_features_to_config(cfg, spec)
+        # Trading config preserved
+        assert new_cfg.trading.max_positions == cfg.trading.max_positions
+        assert new_cfg.trading.target_annual_vol == cfg.trading.target_annual_vol
+
+    def test_returns_new_instance(self):
+        from v3.config.schema import load_config
+        cfg = load_config()
+        spec = get_spec("full")
+        new_cfg = apply_features_to_config(cfg, spec)
+        assert new_cfg is not cfg
+
+
 class TestSpecsSummary:
     def test_baseline_zero_active(self):
         s = specs_summary()

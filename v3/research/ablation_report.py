@@ -146,6 +146,24 @@ def render_comparison_markdown(
         )
     lines.append("")
 
+    # Backtest metrics table (only if any backtest fields populated)
+    has_backtest = any(m.sharpe is not None for m in results)
+    if has_backtest:
+        lines.append("## Backtest Metrics (production mode)")
+        lines.append("")
+        lines.append("| Ablation | Sharpe | MDD | Return | Win Rate | PF | Trades |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|")
+        for m in results:
+            if m.sharpe is None:
+                continue
+            lines.append(
+                f"| {m.ablation_name} | {m.sharpe:.2f} | "
+                f"{m.max_drawdown:.3f} | {m.total_return:+.3f} | "
+                f"{m.win_rate:.2%} | {m.profit_factor:.2f} | "
+                f"{m.n_trades} |"
+            )
+        lines.append("")
+
     # Pass/fail summary
     lines.append("## Pass/Fail Summary (V3.3_AB_PLAN §6)")
     lines.append("")

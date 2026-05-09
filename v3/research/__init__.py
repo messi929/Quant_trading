@@ -37,6 +37,7 @@ from v3.research.validate_edge import (
 from v3.research.ablation_specs import (
     ABLATION_SPECS,
     AblationSpec,
+    apply_features_to_config,
     get_spec,
     list_ablations,
     load_features_from_yaml,
@@ -91,6 +92,7 @@ __all__ = [
     # ablation_specs
     "ABLATION_SPECS",
     "AblationSpec",
+    "apply_features_to_config",
     "get_spec",
     "list_ablations",
     "load_features_from_yaml",
