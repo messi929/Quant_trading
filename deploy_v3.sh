@@ -181,6 +181,46 @@ DRTEOF
     echo '  Daily report timer installed; runs daily at 16:00 KST'
 "
 
+# 9. (V3.3 P7) Install rollback check timer
+echo "[9/9] Installing V3.3 rollback check timer..."
+ssh $USER@$SERVER "
+    cat > /etc/systemd/system/v33-rollback-check.service << 'RBSEOF'
+[Unit]
+Description=V3.3 daily rollback check (1w PnL -2% → feature OFF)
+After=network.target v33-daily-report.service
+Wants=v33-daily-report.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/quant
+Environment=PYTHONPATH=/opt/quant
+ExecStart=/opt/quant/venv/bin/python -u v3/scripts/run_rollback_check.py \\
+    --window-days 7 \\
+    --threshold -0.02
+StandardOutput=append:/var/log/v33-rollback.log
+StandardError=append:/var/log/v33-rollback-error.log
+RBSEOF
+
+    cat > /etc/systemd/system/v33-rollback-check.timer << 'RBTEOF'
+[Unit]
+Description=V3.3 rollback check (16:30 KST after daily report)
+
+[Timer]
+OnCalendar=*-*-* 16:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+RBTEOF
+
+    systemctl daemon-reload
+    systemctl enable v33-rollback-check.timer 2>/dev/null || true
+    systemctl start v33-rollback-check.timer 2>/dev/null || true
+    echo '  Rollback timer installed; runs daily at 16:30 KST'
+    echo '  NOTE: rollback yaml mutation requires service restart (manual)'
+"
+
 echo ""
 echo "=== V3 Deployment Complete ==="
 echo "  Server:  $SERVER"
@@ -194,5 +234,7 @@ echo "V3.3 timers (manual check):"
 echo "  alpha-retrain:        ssh $USER@$SERVER systemctl status alpha-retrain.timer"
 echo "  calibration-retrain:  ssh $USER@$SERVER systemctl status calibration-retrain.timer"
 echo "  v33-daily-report:     ssh $USER@$SERVER systemctl status v33-daily-report.timer"
+echo "  v33-rollback-check:   ssh $USER@$SERVER systemctl status v33-rollback-check.timer"
 echo ""
 echo "Daily reports: ssh $USER@$SERVER ls research/reports/daily/"
+echo "Rollback log:  ssh $USER@$SERVER tail -20 v3/saved_models/rollback_history.jsonl"
