@@ -55,6 +55,15 @@ from v3.research.ablation_report import (
     render_comparison_markdown,
     save_comparison_report,
 )
+from v3.research.promotion_decision import (
+    CUMULATIVE_FEATURE_GROUPS,
+    DIAGNOSTIC_FEATURES,
+    PromotionPlan,
+    PromotionStep,
+    build_promotion_plan,
+    render_promotion_markdown,
+    save_promotion_plan,
+)
 
 __all__ = [
     # build_edge_dataset
@@ -97,4 +106,12 @@ __all__ = [
     "evaluate_ablation_pass",
     "render_comparison_markdown",
     "save_comparison_report",
+    # promotion_decision
+    "CUMULATIVE_FEATURE_GROUPS",
+    "DIAGNOSTIC_FEATURES",
+    "PromotionPlan",
+    "PromotionStep",
+    "build_promotion_plan",
+    "render_promotion_markdown",
+    "save_promotion_plan",
 ]
