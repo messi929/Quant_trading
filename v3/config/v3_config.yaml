@@ -188,7 +188,8 @@ features:
   edge_tier: false
   allocation: false
   # Phase 3 (exit policies)
-  conditional_veto: false
+  # NOTE: V3.2.1 conditional veto는 executor.py inline 항상 ON.
+  # exit_thesis 활성화 시 V3.3 staleness fix (16h + refresh) 적용.
   exit_thesis: false
   partial_exit: false
   signal_decay: false

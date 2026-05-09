@@ -60,12 +60,11 @@ CUMULATIVE_FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
     "A1_calibrator": ("edge_calibrator",),
     "A2_edge_engine": ("edge_engine",),
     "A3_tier": ("edge_tier",),
-    "A4_conditional_veto": ("conditional_veto",),
-    "A5_exit_thesis": ("exit_thesis",),
-    "A6_decay_partial": ("signal_decay", "partial_exit"),
-    "A7_allocation": ("allocation",),
-    "A8_pyramid": ("pyramid",),
-    "A9_rotation": ("rotation",),
+    "A4_exit_thesis": ("exit_thesis",),  # wraps Conditional Veto refresh
+    "A5_decay_partial": ("signal_decay", "partial_exit"),
+    "A6_allocation": ("allocation",),
+    "A7_pyramid": ("pyramid",),
+    "A8_rotation": ("rotation",),
 }
 
 # Diagnostics — always promotable immediately (read-only)

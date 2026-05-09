@@ -79,11 +79,12 @@ class TestFrozen:
 # Constants
 # ──────────────────────────────────────────────────────────────
 class TestConstants:
-    def test_cumulative_groups_match_a1_a9(self):
-        # A1 ~ A9 = 9 keys
-        assert len(CUMULATIVE_FEATURE_GROUPS) == 9
+    def test_cumulative_groups_match_a1_a8(self):
+        # F1 fix: A1 ~ A8 = 8 keys (conditional_veto+exit_thesis merged)
+        assert len(CUMULATIVE_FEATURE_GROUPS) == 8
         assert "A1_calibrator" in CUMULATIVE_FEATURE_GROUPS
-        assert "A9_rotation" in CUMULATIVE_FEATURE_GROUPS
+        assert "A8_rotation" in CUMULATIVE_FEATURE_GROUPS
+        assert "A4_exit_thesis" in CUMULATIVE_FEATURE_GROUPS
 
     def test_diagnostic_features_3(self):
         assert set(DIAGNOSTIC_FEATURES) == {
@@ -154,8 +155,8 @@ class TestBuildPromotionPlan:
         for name in CUMULATIVE_FEATURE_GROUPS:
             results.append(_clean_metrics(name, "cumulative"))
         plan = build_promotion_plan(results)
-        # 9 cumulative + 1 diagnostics = 10 steps
-        assert len(plan.steps) == 10
+        # F1 fix: 8 cumulative + 1 diagnostics = 9 steps (was 10)
+        assert len(plan.steps) == 9
         assert len(plan.rejected_features) == 0
 
 

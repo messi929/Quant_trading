@@ -189,7 +189,9 @@ class FeatureFlagsConfig(BaseModel):
     edge_tier: bool = False
     allocation: bool = False
     # Phase 3 (exit policies)
-    conditional_veto: bool = False
+    # NOTE: conditional_veto was removed in F1 fix — V3.2.1 inline veto in
+    # executor.py is always-on. ExitThesisEngine (exit_thesis flag) wraps
+    # the V3.3 staleness fix (16h threshold + refresh_at_session_start).
     exit_thesis: bool = False
     partial_exit: bool = False
     signal_decay: bool = False

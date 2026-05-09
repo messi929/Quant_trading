@@ -100,7 +100,7 @@ class AblationRunner:
             book_optimizer_factory=lambda flags: BookOptimizer(...),
         )
         metrics = runner.run(
-            spec=get_spec("A4_conditional_veto"),
+            spec=get_spec("A4_exit_thesis"),
             inputs_iter=...,  # iterable of (date, ohlcv, vol_scores, ...) per date
         )
     """

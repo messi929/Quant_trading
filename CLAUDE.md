@@ -442,12 +442,11 @@ features:
 | 1 | `edge_calibrator` |
 | 2 | `edge_engine` |
 | 3 | `edge_tier` |
-| 4 | `conditional_veto` (FOLLOW_UPS 1순위 해결) |
-| 5 | `exit_thesis` |
-| 6 | `signal_decay` + `partial_exit` |
-| 7 | `allocation` (net_edge / risk sizing) |
-| 8 | `pyramid` (winner-only add-on) |
-| 9 | `rotation` (capital efficiency) |
+| 4 | `exit_thesis` (Conditional Veto 정상화 + HOLD/REDUCE/ROTATE/EXIT, FOLLOW_UPS 1순위 해결) |
+| 5 | `signal_decay` + `partial_exit` |
+| 6 | `allocation` (net_edge / risk sizing) |
+| 7 | `pyramid` (winner-only add-on) |
+| 8 | `rotation` (capital efficiency) |
 
 각 week 후 1주 paper 관찰. PnL 악화 -2% 시 즉시 flag OFF (rollback).
 

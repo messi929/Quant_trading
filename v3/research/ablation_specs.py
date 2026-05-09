@@ -111,44 +111,37 @@ def _A3_tier() -> AblationSpec:
     )
 
 
-def _A4_conditional_veto() -> AblationSpec:
+def _A4_exit_thesis() -> AblationSpec:
+    """ExitThesisEngine includes Conditional Veto refresh + 4-way decision.
+
+    V3.2.1 inline veto in executor.py is always-on; activating exit_thesis
+    here adds the V3.3 staleness fix (16h threshold + refresh_at_session_start)
+    and HOLD/REDUCE/ROTATE/EXIT decision tree.
+    """
     return AblationSpec(
-        name="A4_conditional_veto",
-        description="A3 + Conditional Veto (FOLLOW_UPS 1순위, winner 보호)",
+        name="A4_exit_thesis",
+        description=(
+            "A3 + ExitThesisEngine (Conditional Veto 정상화 + "
+            "HOLD/REDUCE/ROTATE/EXIT, FOLLOW_UPS 1순위 해결)"
+        ),
         features=FeatureFlagsConfig(**_diagnostics_on(
             edge_calibrator=True,
             edge_engine=True,
             edge_tier=True,
-            conditional_veto=True,
-        )),
-        family="cumulative",
-    )
-
-
-def _A5_exit_thesis() -> AblationSpec:
-    return AblationSpec(
-        name="A5_exit_thesis",
-        description="A4 + ExitThesisEngine (HOLD/REDUCE/ROTATE/EXIT)",
-        features=FeatureFlagsConfig(**_diagnostics_on(
-            edge_calibrator=True,
-            edge_engine=True,
-            edge_tier=True,
-            conditional_veto=True,
             exit_thesis=True,
         )),
         family="cumulative",
     )
 
 
-def _A6_decay_partial() -> AblationSpec:
+def _A5_decay_partial() -> AblationSpec:
     return AblationSpec(
-        name="A6_decay_partial",
-        description="A5 + SignalDecay + PartialExit (정교한 exit)",
+        name="A5_decay_partial",
+        description="A4 + SignalDecay + PartialExit (정교한 exit)",
         features=FeatureFlagsConfig(**_diagnostics_on(
             edge_calibrator=True,
             edge_engine=True,
             edge_tier=True,
-            conditional_veto=True,
             exit_thesis=True,
             signal_decay=True,
             partial_exit=True,
@@ -157,15 +150,14 @@ def _A6_decay_partial() -> AblationSpec:
     )
 
 
-def _A7_allocation() -> AblationSpec:
+def _A6_allocation() -> AblationSpec:
     return AblationSpec(
-        name="A7_allocation",
-        description="A6 + AllocationEngine (net_edge / risk sizing)",
+        name="A6_allocation",
+        description="A5 + AllocationEngine (net_edge / risk sizing)",
         features=FeatureFlagsConfig(**_diagnostics_on(
             edge_calibrator=True,
             edge_engine=True,
             edge_tier=True,
-            conditional_veto=True,
             exit_thesis=True,
             signal_decay=True,
             partial_exit=True,
@@ -175,15 +167,14 @@ def _A7_allocation() -> AblationSpec:
     )
 
 
-def _A8_pyramid() -> AblationSpec:
+def _A7_pyramid() -> AblationSpec:
     return AblationSpec(
-        name="A8_pyramid",
-        description="A7 + Pyramid (winner add-on)",
+        name="A7_pyramid",
+        description="A6 + Pyramid (winner add-on)",
         features=FeatureFlagsConfig(**_diagnostics_on(
             edge_calibrator=True,
             edge_engine=True,
             edge_tier=True,
-            conditional_veto=True,
             exit_thesis=True,
             signal_decay=True,
             partial_exit=True,
@@ -194,15 +185,14 @@ def _A8_pyramid() -> AblationSpec:
     )
 
 
-def _A9_rotation() -> AblationSpec:
+def _A8_rotation() -> AblationSpec:
     return AblationSpec(
-        name="A9_rotation",
-        description="A8 + CapitalRotation (capital efficiency)",
+        name="A8_rotation",
+        description="A7 + CapitalRotation (capital efficiency)",
         features=FeatureFlagsConfig(**_diagnostics_on(
             edge_calibrator=True,
             edge_engine=True,
             edge_tier=True,
-            conditional_veto=True,
             exit_thesis=True,
             signal_decay=True,
             partial_exit=True,
@@ -217,12 +207,11 @@ def _A9_rotation() -> AblationSpec:
 def _full() -> AblationSpec:
     return AblationSpec(
         name="full",
-        description="모든 V3.3 features ON (= A9)",
+        description="모든 V3.3 features ON (= A8)",
         features=FeatureFlagsConfig(**_diagnostics_on(
             edge_calibrator=True,
             edge_engine=True,
             edge_tier=True,
-            conditional_veto=True,
             exit_thesis=True,
             signal_decay=True,
             partial_exit=True,
@@ -242,7 +231,6 @@ def _full_nodiag() -> AblationSpec:
             edge_calibrator=True,
             edge_engine=True,
             edge_tier=True,
-            conditional_veto=True,
             exit_thesis=True,
             signal_decay=True,
             partial_exit=True,
@@ -257,12 +245,16 @@ def _full_nodiag() -> AblationSpec:
 # ──────────────────────────────────────────────────────────────
 # Isolated ablations
 # ──────────────────────────────────────────────────────────────
-def _I_CV_only() -> AblationSpec:
+def _I_ET_only() -> AblationSpec:
+    """ExitThesisEngine 단독 효과 (Conditional Veto 정상화 포함)."""
     return AblationSpec(
-        name="I_CV_only",
-        description="Baseline + Conditional Veto only (단독 효과)",
+        name="I_ET_only",
+        description=(
+            "Baseline + ExitThesisEngine only (단독 효과 — "
+            "wraps Conditional Veto refresh)"
+        ),
         features=FeatureFlagsConfig(**_diagnostics_on(
-            conditional_veto=True,
+            exit_thesis=True,
         )),
         family="isolated",
     )
@@ -315,15 +307,14 @@ ABLATION_SPECS: list[AblationSpec] = [
     _A1_calibrator(),
     _A2_edge_engine(),
     _A3_tier(),
-    _A4_conditional_veto(),
-    _A5_exit_thesis(),
-    _A6_decay_partial(),
-    _A7_allocation(),
-    _A8_pyramid(),
-    _A9_rotation(),
+    _A4_exit_thesis(),
+    _A5_decay_partial(),
+    _A6_allocation(),
+    _A7_pyramid(),
+    _A8_rotation(),
     _full(),
     _full_nodiag(),
-    _I_CV_only(),
+    _I_ET_only(),
     _I_PY_only(),
     _I_RT_only(),
     _I_SD_only(),

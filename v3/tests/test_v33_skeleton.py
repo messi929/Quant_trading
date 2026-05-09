@@ -185,15 +185,15 @@ class TestCalibrationBucket:
 class TestFeatureFlagsConfig:
     def test_all_off_default(self):
         f = FeatureFlagsConfig.all_off()
-        # All 13 flags False
+        # All 12 flags False (conditional_veto removed in F1 fix)
         flags = [
             f.no_trade_logger, f.tc_monitor, f.execution_quality,
             f.edge_calibrator, f.edge_engine, f.edge_tier, f.allocation,
-            f.conditional_veto, f.exit_thesis, f.partial_exit, f.signal_decay,
+            f.exit_thesis, f.partial_exit, f.signal_decay,
             f.pyramid, f.rotation,
         ]
         assert not any(flags)
-        assert len(flags) == 13
+        assert len(flags) == 12
 
     def test_default_constructor_is_all_off(self):
         # Default constructor must equal all_off()

@@ -51,8 +51,10 @@ from v3.strategy.signal import TradeSignal
 # AblationSpec registry
 # ──────────────────────────────────────────────────────────────
 class TestAblationSpecs:
-    def test_16_specs_total(self):
-        assert len(ABLATION_SPECS) == 16
+    def test_15_specs_total(self):
+        # F1 fix: A4_conditional_veto + A5_exit_thesis merged → A4_exit_thesis,
+        # I_CV_only → I_ET_only. 16 → 15 specs.
+        assert len(ABLATION_SPECS) == 15
 
     def test_unique_names(self):
         names = [s.name for s in ABLATION_SPECS]
@@ -83,8 +85,8 @@ class TestAblationSpecs:
 
     def test_list_ablations_filters_by_family(self):
         cumulative = list_ablations(family="cumulative")
-        # A1~A9 = 9 cumulative
-        assert len(cumulative) == 9
+        # F1 fix: A1~A8 = 8 cumulative (was 9, A4_conditional_veto+A5_exit_thesis merged)
+        assert len(cumulative) == 8
 
         isolated = list_ablations(family="isolated")
         assert len(isolated) == 4
@@ -104,9 +106,9 @@ class TestCumulativeMonotonicity:
 
     def test_each_step_adds_features(self):
         cumulative = ["A1_calibrator", "A2_edge_engine", "A3_tier",
-                      "A4_conditional_veto", "A5_exit_thesis",
-                      "A6_decay_partial", "A7_allocation",
-                      "A8_pyramid", "A9_rotation"]
+                      "A4_exit_thesis",
+                      "A5_decay_partial", "A6_allocation",
+                      "A7_pyramid", "A8_rotation"]
         prev_active: set[str] = set()
         for name in cumulative:
             spec = get_spec(name)
@@ -120,14 +122,14 @@ class TestCumulativeMonotonicity:
             )
             prev_active = current_active
 
-    def test_full_equals_a9(self):
+    def test_full_equals_a8(self):
         full_active = {
             k for k, v in get_spec("full").features.model_dump().items() if v
         }
-        a9_active = {
-            k for k, v in get_spec("A9_rotation").features.model_dump().items() if v
+        a8_active = {
+            k for k, v in get_spec("A8_rotation").features.model_dump().items() if v
         }
-        assert full_active == a9_active
+        assert full_active == a8_active
 
 
 # ──────────────────────────────────────────────────────────────
@@ -136,7 +138,7 @@ class TestCumulativeMonotonicity:
 class TestYAMLPersistence:
     def test_save_and_reload_round_trip(self, tmp_path):
         paths = save_specs_as_yaml(tmp_path)
-        assert len(paths) == 16
+        assert len(paths) == 15  # F1: 16 → 15 (conditional_veto removed)
 
         # Reload baseline
         baseline_path = tmp_path / "baseline.yaml"
@@ -189,9 +191,10 @@ class TestSpecsSummary:
         s = specs_summary()
         assert s["baseline"]["n_active"] == 0
 
-    def test_full_all_13_active(self):
+    def test_full_all_12_active(self):
+        # F1: 13 → 12 (conditional_veto removed)
         s = specs_summary()
-        assert s["full"]["n_active"] == 13
+        assert s["full"]["n_active"] == 12
 
     def test_a1_has_4_active(self):
         # diagnostics 3 + edge_calibrator 1

@@ -107,8 +107,7 @@ features:
   edge_calibrator: true
   edge_engine: true
   edge_tier: true
-  conditional_veto: true
-  exit_thesis: true
+  exit_thesis: true   # wraps Conditional Veto refresh (V3.3 staleness fix)
   signal_decay: true
   partial_exit: true
   allocation: true
