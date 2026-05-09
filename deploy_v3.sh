@@ -96,6 +96,53 @@ ssh $USER@$SERVER "
     tail -5 /var/log/quant-v3.log 2>/dev/null || echo '  (no logs yet)'
 "
 
+# 7. (V3.3 P5) Install calibration auto-retrain timer
+echo "[7/7] Installing V3.3 calibration auto-retrain timer..."
+ssh $USER@$SERVER "
+    cat > /etc/systemd/system/calibration-retrain.service << 'CSVEOF'
+[Unit]
+Description=V3.3 monthly calibration pipeline (build->calibrate->validate)
+After=network.target alpha-retrain.service
+Wants=alpha-retrain.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/quant
+Environment=PYTHONPATH=/opt/quant
+EnvironmentFile=/opt/quant/.env
+ExecStart=/opt/quant/venv/bin/python -u v3/scripts/run_calibration_pipeline.py \\
+    --ohlcv-path data/research/ohlcv_panel.parquet \\
+    --macro-path data/research/macro_pctl.parquet \\
+    --vol-pred-path data/research/vol_predictions.parquet \\
+    --years-back 5 \\
+    --oos-days 180 \\
+    --output-dir data/research \\
+    --report-dir research/reports \\
+    --latest-calibration-path v3/config/edge_calibration.json
+StandardOutput=append:/var/log/calibration-retrain.log
+StandardError=append:/var/log/calibration-retrain-error.log
+CSVEOF
+
+    cat > /etc/systemd/system/calibration-retrain.timer << 'CTMEOF'
+[Unit]
+Description=Monthly V3.3 calibration auto-retrain (1st @ 07:00 KST)
+
+[Timer]
+OnCalendar=*-*-01 07:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+CTMEOF
+
+    systemctl daemon-reload
+    systemctl enable calibration-retrain.timer 2>/dev/null || true
+    systemctl start calibration-retrain.timer 2>/dev/null || true
+    echo '  Calibration timer installed; first run on next 1st @ 07:00 KST'
+    echo '  NOTE: requires data/research/ohlcv_panel.parquet etc. (manual prep)'
+"
+
 echo ""
 echo "=== V3 Deployment Complete ==="
 echo "  Server:  $SERVER"
@@ -104,3 +151,7 @@ echo "  Logs:    ssh $USER@$SERVER tail -f /var/log/quant-v3.log"
 echo "  Status:  ssh $USER@$SERVER systemctl status $SERVICE_NAME"
 echo "  Stop:    ssh $USER@$SERVER systemctl stop $SERVICE_NAME"
 echo "  V2 restore: ssh $USER@$SERVER 'rm -rf /opt/quant && mv /opt/quant_v2_backup /opt/quant'"
+echo ""
+echo "V3.3 timers (manual check):"
+echo "  alpha-retrain:        ssh $USER@$SERVER systemctl status alpha-retrain.timer"
+echo "  calibration-retrain:  ssh $USER@$SERVER systemctl status calibration-retrain.timer"
