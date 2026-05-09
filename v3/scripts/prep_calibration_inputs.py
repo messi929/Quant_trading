@@ -161,7 +161,7 @@ def main():
 
     # 3. Vol predictions — feature compute + per-date batched inference
     logger.info("Computing features...")
-    fe = VolFeatureEngineer(cfg)
+    fe = VolFeatureEngineer()
     df_feats = fe.compute_all(ohlcv)
     logger.info(f"Features: {df_feats.shape}")
 
