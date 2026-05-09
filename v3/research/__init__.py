@@ -4,6 +4,9 @@ Modules:
   - build_edge_dataset (PR-1.4): N-year backtest replay → calibration panel
   - calibrate_edge (PR-2.1): panel → calibration_table.json
   - validate_edge (PR-2.1): OOS validation (decile monotonicity)
+  - ablation_specs (PR-5.1): 16 ablation configurations
+  - ablation_runner (PR-5.1): per-ablation execution + metrics
+  - ablation_report (PR-5.1): comparison matrix + pass/fail markdown
 """
 
 from v3.research.build_edge_dataset import (
@@ -31,6 +34,27 @@ from v3.research.validate_edge import (
     render_markdown_report,
     validate_oos,
 )
+from v3.research.ablation_specs import (
+    ABLATION_SPECS,
+    AblationSpec,
+    get_spec,
+    list_ablations,
+    load_features_from_yaml,
+    save_specs_as_yaml,
+    specs_summary,
+)
+from v3.research.ablation_runner import (
+    AblationMetrics,
+    AblationRunner,
+    ActionDistribution,
+    run_sweep,
+)
+from v3.research.ablation_report import (
+    build_comparison_matrix,
+    evaluate_ablation_pass,
+    render_comparison_markdown,
+    save_comparison_report,
+)
 
 __all__ = [
     # build_edge_dataset
@@ -55,4 +79,22 @@ __all__ = [
     "compute_decile_stats",
     "render_markdown_report",
     "validate_oos",
+    # ablation_specs
+    "ABLATION_SPECS",
+    "AblationSpec",
+    "get_spec",
+    "list_ablations",
+    "load_features_from_yaml",
+    "save_specs_as_yaml",
+    "specs_summary",
+    # ablation_runner
+    "AblationMetrics",
+    "AblationRunner",
+    "ActionDistribution",
+    "run_sweep",
+    # ablation_report
+    "build_comparison_matrix",
+    "evaluate_ablation_pass",
+    "render_comparison_markdown",
+    "save_comparison_report",
 ]
