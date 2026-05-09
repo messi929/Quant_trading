@@ -77,17 +77,20 @@ def build_vol_predictions(
 
     seq_len = cfg.data.sequence_length
     df_norm = df_norm.sort_values(["ticker", "date"]).reset_index(drop=True)
+    df_norm["date"] = pd.to_datetime(df_norm["date"])
 
-    # Pre-build per-ticker arrays for fast slicing
+    # Pre-build per-ticker arrays for fast slicing.
+    # dates as int64 nanoseconds → numpy searchsorted works regardless of
+    # whether `t` is np.datetime64 or pd.Timestamp.
     ticker_arrays: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     for ticker, group in df_norm.groupby("ticker"):
-        dates = group["date"].to_numpy()
+        dates_ns = group["date"].astype("int64").to_numpy()
         feats = np.nan_to_num(
             group[feature_cols].to_numpy(), nan=0.0,
         ).astype(np.float32)
-        ticker_arrays[ticker] = (dates, feats)
+        ticker_arrays[ticker] = (dates_ns, feats)
 
-    all_dates = sorted(df_norm["date"].unique())
+    all_dates = sorted(pd.to_datetime(df_norm["date"]).unique())
     logger.info(
         f"Inference: {len(all_dates)} dates × {len(ticker_arrays)} tickers"
     )
@@ -95,14 +98,15 @@ def build_vol_predictions(
     predictions: list[dict] = []
     with torch.no_grad():
         for i, t in enumerate(all_dates):
+            t_ns = pd.Timestamp(t).value  # int64 ns
             if i % 100 == 0:
-                logger.info(f"  date {i}/{len(all_dates)} ({t})")
+                logger.info(f"  date {i}/{len(all_dates)} ({pd.Timestamp(t).date()})")
 
             batch_tickers: list[str] = []
             batch_seqs: list[np.ndarray] = []
             for ticker, (dates_arr, feats_arr) in ticker_arrays.items():
                 # Anchor index: last position with date <= t
-                idx = np.searchsorted(dates_arr, t, side="right") - 1
+                idx = int(np.searchsorted(dates_arr, t_ns, side="right")) - 1
                 if idx < seq_len - 1:
                     continue
                 start = idx - seq_len + 1
@@ -124,9 +128,10 @@ def build_vol_predictions(
                 if conf_tensor is not None
                 else np.full_like(preds, 0.5)
             )
+            t_stamp = pd.Timestamp(t)
             for tk, pr, cf in zip(batch_tickers, preds, confs):
                 predictions.append({
-                    "date": t, "ticker": tk,
+                    "date": t_stamp, "ticker": tk,
                     "vol_score": float(pr), "confidence": float(cf),
                 })
 
