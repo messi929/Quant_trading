@@ -61,6 +61,17 @@ fi
 # Existing alpha-retrain config (Phase 25.2 적용된 거 보존)
 [ -d $REMOTE_DIR/v3/config/alpha_weights_history ] && cp -r $REMOTE_DIR/v3/config/alpha_weights_history /tmp/quant_new/v3/config/ && echo '  alpha_weights_history preserved' || true
 
+# V3.3 edge calibration (수동 publish 또는 calibration-retrain.timer 산출물)
+[ -f $REMOTE_DIR/v3/config/edge_calibration.json ] && cp $REMOTE_DIR/v3/config/edge_calibration.json /tmp/quant_new/v3/config/edge_calibration.json && echo '  edge_calibration.json preserved' || true
+[ -d $REMOTE_DIR/v3/config/edge_calibration_history ] && cp -r $REMOTE_DIR/v3/config/edge_calibration_history /tmp/quant_new/v3/config/ && echo '  edge_calibration_history preserved' || true
+
+# V3.3 calibration data panels (next monthly retrain reuses)
+if [ -d $REMOTE_DIR/data/research ]; then
+    mkdir -p /tmp/quant_new/data
+    cp -r $REMOTE_DIR/data/research /tmp/quant_new/data/research && echo '  data/research preserved' || true
+fi
+[ -d $REMOTE_DIR/research/reports ] && mkdir -p /tmp/quant_new/research && cp -r $REMOTE_DIR/research/reports /tmp/quant_new/research/ && echo '  research/reports preserved' || true
+
 echo '[4/7] Replacing /opt/quant...'
 mv $REMOTE_DIR ${REMOTE_DIR}_old_${TS}
 mv /tmp/quant_new $REMOTE_DIR
