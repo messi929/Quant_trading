@@ -220,6 +220,58 @@ churn하는 패턴이 등장할 때) 검토. 현재 우선순위 낮음.
 
 ---
 
+## V3.3 F3 — BookOptimizer ctx.actions consumption (Week 4 전 필수)
+
+V3.3 evaluator (2026-05-09) 발견 critical issue. F1+F2는 즉시 fix됐으나
+F3은 backtest engine 깊이 통합이 필요해 별도 PR로 deferred.
+
+### 문제
+
+BacktestEngine + LivePipeline은 `BookOptimizer.decide_with_context()`
+호출 후 `ctx.signal`만 사용 (`ctx.actions`는 무시). features OFF 시
+parity 100%이지만 features.exit_thesis / partial_exit / pyramid /
+rotation 활성화 시 BookOptimizer가 emit한 EXIT/TRIM/ROTATE/ADD_TO_WINNER
+가 무시 → backtest 결과가 baseline과 동일. ablation 데이터 무효.
+
+### 영향 범위
+
+- Paper Week 0 (진단 3개): 무영향. read-only.
+- Paper Week 1~3 (edge_calibrator/engine/tier): 무영향. enrichment-only.
+- **Paper Week 4 (exit_thesis): 영향 발생** — Conditional Veto 정상화
+  효과가 backtest에서 측정 안 됨. ablation A4_exit_thesis 결과가
+  A3_tier와 동일 → promotion 결정 잘못될 수 있음.
+- Week 5~8 (decay/partial/allocation/pyramid/rotation): 동일 영향.
+
+### Fix 작업 추정
+
+1. BacktestEngine.run() loop 순서 재배치:
+   - SignalGenerator + BookOptimizer 먼저 호출
+   - ctx.signal로 entry 처리 (parity 유지)
+   - features.exit_thesis ON 시 ctx.actions의 EXIT/TRIM/ROTATE를
+     trade로 변환 (기존 _check_exits ExitRules 결과와 통합)
+2. Position state ↔ PositionState 변환 helper
+3. Trade unwind / cash 재배분 / daily_pnl 보정 로직
+4. parity 회귀 테스트 (features OFF → V3.2.1 결과 100% 동일)
+5. Conditional Veto 통합 회귀 (4/21 ADI scenario backtest 결과 KEEP)
+
+추정 분량: ~400 line + ~250 line test. 별도 PR.
+
+### Deadline
+
+**Paper Week 4 (대략 6/12) 활성화 전 완료 필수**. Week 0 paper 활성화는
+F3 없이 안전. Week 1~3까지도 무영향. Week 4 활성화 직전 별도 세션에서
+처리.
+
+### 현재 상태
+
+- 코드: V3.3 전체 main 머지됨 (a69ea68 + 4f5834b 포함 526 tests pass)
+- F1: conditional_veto dead key 제거 완료
+- F2: feature_activations.jsonl 자동 기록 완료
+- F3: deferred to "before Week 4 activation"
+- Deploy: features OFF default라 즉시 가능 (parity 보장)
+
+---
+
 ## 보류 5: 5/2~5/3 monitor의 weekend stale warning (cosmetic)
 
 `monitor` 루프에 `weekday() < 5` 가드 없음 → 주말에도 매 15분 깨고 cache
