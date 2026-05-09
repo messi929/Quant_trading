@@ -9,7 +9,7 @@ Single canonical path:
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -436,6 +436,16 @@ class LivePipeline:
 
     def monitor(self) -> list[dict]:
         today = datetime.now().strftime("%Y-%m-%d")
+        # V3.3 path: features.exit_thesis ON + DecisionContext available.
+        # ExitThesisEngine uses its own staleness threshold (16h) to decide
+        # whether to refresh — V3.2.1 8h cache drop is unnecessary here.
+        if (
+            self.cfg.features.exit_thesis
+            and self._last_ctx is not None
+            and self.book_optimizer.exit_thesis is not None
+        ):
+            return self._monitor_v33(today)
+        # V3.2.1 path (legacy ExitRules + inline conditional veto).
         # Stale-cache safeguard: if opportunity snapshot is >8h old
         # (spans a session gap), drop it to avoid vetoing with outdated alpha.
         if self._opportunity_at is not None:
@@ -454,6 +464,126 @@ class LivePipeline:
             today,
             opportunity_map=opp_map,
             opportunity_gate=opp_gate,
+        )
+
+    def _monitor_v33(self, today: str) -> list[dict]:
+        """V3.3 monitor — ExitThesis re-evaluation per held position.
+
+        For each held position:
+          1. Fetch real-time price via executor._get_price (paper or KIS).
+          2. Compute ExitRules trigger (same as V3.2.1).
+          3. If trigger fires, build PositionState + call ExitThesisEngine.decide().
+             Otherwise skip (KEEP).
+          4. Aggregate emitted BookActions and route through execute_actions().
+
+        Replacement candidates come from `self._last_ctx.candidates` (last
+        session). signal_age_hours uses _opportunity_at — ExitThesisEngine's
+        16h staleness threshold + signal_refresh_fn callback decides what to do.
+        """
+        from v3.strategy.types import BookAction  # local import (deferred)
+
+        positions = list(self.executor.positions.positions)
+        if not positions:
+            return []
+
+        ctx = self._last_ctx
+        candidates_by_ticker = {c.ticker: c for c in ctx.candidates}
+        held = {p["ticker"] for p in positions}
+        replacement_pool = [
+            c for c in ctx.candidates
+            if c.ticker not in held and c.net_edge_5d is not None
+        ]
+        signal_age_h = self._signal_age_hours()
+        engine = self.book_optimizer.exit_thesis
+        actions: list[BookAction] = []
+
+        for pos in positions:
+            ticker = pos["ticker"]
+            price_info = self.executor._get_price(ticker)
+            if not price_info:
+                continue
+            current_price = price_info.get("price", 0)
+            if current_price <= 0:
+                continue
+            current_vol = price_info.get("vol", pos.get("entry_vol", 0.2))
+            low_price = price_info.get("low", current_price)
+            entry_date_str = str(pos.get("entry_date", today))[:10]
+            try:
+                entry_d = date.fromisoformat(entry_date_str)
+                today_d = date.fromisoformat(today)
+                hold_days = max(0, (today_d - entry_d).days)
+            except ValueError:
+                hold_days = int(pos.get("hold_days", 0) or 0)
+
+            decision = self.executor.exit_rules.check(
+                entry_price=pos["entry_price"],
+                current_price=current_price,
+                hold_days=hold_days,
+                entry_vol=pos.get("entry_vol", 0.2),
+                current_vol=current_vol,
+                confidence=pos.get("confidence", 0.5),
+                low_price=low_price,
+            )
+            if not decision.should_exit:
+                continue
+
+            state = self._convert_one_position_state(pos, current_price)
+            current_edge = candidates_by_ticker.get(ticker)
+            action = engine.decide(
+                position=state,
+                exit_trigger=decision.reason,
+                current_edge=current_edge,
+                replacement_candidates=replacement_pool,
+                signal_age_hours=signal_age_h,
+            )
+            actions.append(action)
+            logger.info(
+                f"V3.3 monitor {ticker}: trigger={decision.reason} "
+                f"→ {action.action_type} ({action.reason})"
+            )
+
+        if not actions:
+            return []
+        result = self.executor.execute_actions(actions, today)
+        # Update cross-session counters for any rotations triggered here
+        for ro in result.get("rotated", []):
+            self._initial_weights[ro["ticker_in"]] = ro["weight"]
+            self._initial_weights.pop(ro["ticker_out"], None)
+            self._adds_per_position.pop(ro["ticker_out"], None)
+            self._rotations_this_month += 1
+        for ex in result.get("exited", []):
+            self._initial_weights.pop(ex["ticker"], None)
+            self._adds_per_position.pop(ex["ticker"], None)
+        return (
+            result.get("exited", [])
+            + result.get("trimmed", [])
+            + result.get("rotated", [])
+        )
+
+    def _convert_one_position_state(
+        self, pos: dict, current_price: float,
+    ):
+        """Build a single PositionState from V3.2.1 dict + live current_price."""
+        from v3.strategy.types import PositionState
+        entry_price = float(pos.get("entry_price", 0) or 0)
+        pnl = (current_price / entry_price - 1.0) if entry_price > 0 else 0.0
+        return PositionState(
+            ticker=pos["ticker"],
+            entry_date=pd.Timestamp(str(pos.get("entry_date", ""))[:10] or "1970-01-01"),
+            entry_price=entry_price,
+            current_price=current_price,
+            current_weight=float(pos.get("weight", 0)),
+            entry_edge=float(pos.get("opportunity", 0.0)),
+            residual_edge=0.0,
+            entry_tier="A",
+            current_tier="A",
+            pnl_pct=pnl,
+            max_unrealized_pnl_pct=max(pnl, 0.0),
+            drawdown_from_peak_pct=min(pnl, 0.0),
+            holding_days=int(pos.get("hold_days", 0)) + 1,
+            dominant_alpha="trend",
+            expected_holding_days=10,
+            thesis_alive=pnl > 0,
         )
 
     def run_session(self) -> dict:
