@@ -399,9 +399,97 @@ Evaluator 리포트가 3섹션(regression / invariant / silent-failure) 모두 c
 
 ---
 
+## V3.3 Profitability Engine — 코드 완성, paper 활성화 대기 (2026-05-09)
+
+V3.3은 V3.2.1 위에 13개 신규 모듈 + `BookOptimizer` orchestrator를 추가해
+"Vol Expansion Trader"를 "기대수익 기반 자본 재배분 엔진"으로 진화시킨다.
+
+**현재 상태**: 코드 100% 완성 (28+ commits, 450 tests pass).
+**`features.*` OFF default → V3.2.1 동작 100% 보존.**
+실제 활성화는 5/14 Phase 25.2 검증 종료 + main 머지 후 주차별 paper promotion.
+
+### 신규 모듈
+
+| 영역 | 모듈 |
+|------|------|
+| Edge layer | `edge_calibrator`, `edge_engine`, `edge_tier` |
+| Exit policies | `exit_thesis` (+ Conditional Veto), `signal_decay`, `partial_exit` |
+| Capital | `allocation` (leverage 영구 거부), `pyramid` (winner-only), `rotation` |
+| Diagnostics | `diagnostics` (NoTradeReason + TC), `execution_quality` |
+| Orchestrator | `book_optimizer` (BacktestEngine + LivePipeline 모두 wiring) |
+| Research | `build_edge_dataset`, `calibrate_edge`, `validate_edge` |
+| Ablation | `ablation_specs/runner/report`, `promotion_decision` |
+| CLI | `scripts/run_ablation_sweep.py` |
+
+### V3.3 활성화 방법
+
+`v3/config/v3_config.yaml` `features:` 섹션에서 flag를 true로 변경:
+
+```yaml
+features:
+  no_trade_logger: true   # week 0 read-only
+  edge_calibrator: true   # week 1
+  # ...
+```
+
+`deploy_v3.sh 77.42.78.9`로 server 반영. systemd `quant-trading-v3` 자동 재시작.
+
+### Paper Promotion 일정 (week index)
+
+| Week | 활성화 group |
+|---:|---|
+| 0 | 진단 3개 (read-only): `no_trade_logger`, `tc_monitor`, `execution_quality` |
+| 1 | `edge_calibrator` |
+| 2 | `edge_engine` |
+| 3 | `edge_tier` |
+| 4 | `conditional_veto` (FOLLOW_UPS 1순위 해결) |
+| 5 | `exit_thesis` |
+| 6 | `signal_decay` + `partial_exit` |
+| 7 | `allocation` (net_edge / risk sizing) |
+| 8 | `pyramid` (winner-only add-on) |
+| 9 | `rotation` (capital efficiency) |
+
+각 week 후 1주 paper 관찰. PnL 악화 -2% 시 즉시 flag OFF (rollback).
+
+### V3.3 신규 운영 명령
+
+```bash
+# Calibration pipeline (server, 매월)
+$PYTHON v3/research/build_edge_dataset.py --start ... --end ... --output ...
+$PYTHON v3/research/calibrate_edge.py --panel ... --train-end ... --output ...
+$PYTHON v3/research/validate_edge.py --panel ... --calibration ... --output ...
+
+# Ablation sweep
+$PYTHON v3/scripts/run_ablation_sweep.py --synthetic           # sanity
+$PYTHON v3/scripts/run_ablation_sweep.py --panel <parquet>     # production
+
+# Feature 활성화 후 paper 검증
+ssh root@77.42.78.9 "tail -f /opt/quant/v3/saved_models/no_trade_logs/no_trade_*.jsonl"
+ssh root@77.42.78.9 "tail -f /opt/quant/v3/saved_models/tc_history.jsonl"
+```
+
+### 페르소나 영향
+
+| 원칙 | V3.2.1 | V3.3 처방 |
+|------|--------|----------|
+| 1. 확신 있을 때만 | 5/10 | EdgeCalibrator → 진짜 expected_return 측정. EdgeTier → S/A/B/C 등급화. |
+| 2. 크게 | 3/10 (가장 심각) | AllocationEngine net_edge / risk sizing + Pyramid winner add-on. Phase 25.2 sizer floor 0.15와 시너지. |
+| 3. 빠르게 | 8/10 | Conditional Veto 정상화 (FOLLOW_UPS 1순위) + ExitThesis 4-way (HOLD/REDUCE/ROTATE/EXIT). |
+
+### 참고 — V3.3 docs
+
+- `docs/V3.3_DESIGN.md` — 13 모듈 책임·데이터 흐름
+- `docs/V3.3_ROADMAP.md` — 5단계 일정·합격 기준
+- `docs/V3.3_INTERFACES.md` — 함수 시그니처·protocol·CLI
+- `docs/V3.3_AB_PLAN.md` — A1~A9+Full ablation 실험
+- `docs/V3.3_CHECKLIST.md` — PR별 작업 체크리스트
+
+---
+
 ## 참고 문서
 
-- **이력**: `docs/CHANGELOG.md` — Phase 22~25.1 전체 변경 narrative
+- **이력**: `docs/CHANGELOG.md` — Phase 22~26 (V3.3) 전체 변경 narrative
 - **후속 과제**: `docs/FOLLOW_UPS.md` — 페르소나 정합성 점검 + active 보류 항목
 - **V3 아키텍처**: `memory/v3_architecture.md`
 - **Phase 2 재설계 상세**: `memory/phase2_plan_detailed.md`
+- **V3.3 코어 thesis**: `docs/CORE.md` — 토론용 self-contained reference
