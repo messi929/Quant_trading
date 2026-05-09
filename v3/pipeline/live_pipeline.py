@@ -27,13 +27,25 @@ from v3.execution.executor import TradingExecutor
 from v3.model.inference import VolInference
 from v3.model.vol_transformer import VolTransformer
 from v3.rules.entry import EntryFilter, OperationalState
+from v3.execution.execution_quality import ExecutionQualityMonitor
+from v3.strategy.allocation import AllocationEngine
 from v3.strategy.alpha_sources import DEFAULT_CONVICTION, DEFAULT_DIRECTIONAL
 from v3.strategy.book_optimizer import BookOptimizer
+from v3.strategy.diagnostics import NoTradeReasonLogger, TransferCoefficientMonitor
+from v3.strategy.edge_calibrator import CalibrationConfig, EdgeCalibrator
+from v3.strategy.edge_engine import EdgeEngine
+from v3.strategy.edge_tier import EdgeTierSystem, TierThresholds
+from v3.strategy.exit_thesis import ExitPolicy, ExitThesisEngine
 from v3.strategy.feature_tracker import record_features_on_startup
 from v3.strategy.opportunity import OpportunityScorer
+from v3.strategy.partial_exit import PartialExitEngine, PartialExitPolicy
+from v3.strategy.pyramid import PyramidPolicy, PyramidPolicyEngine
 from v3.strategy.regime_v2 import RegimeDetectorV2
+from v3.strategy.rotation import CapitalRotationEngine, RotationPolicy
 from v3.strategy.signal import SignalGenerator
+from v3.strategy.signal_decay import SignalDecayEngine, SignalDecayPolicy
 from v3.strategy.sizing import VolTargetSizer
+from v3.strategy.types import PositionState
 from v3.utils.device import DeviceManager
 from v3.utils.storage import StorageManager
 
@@ -107,16 +119,86 @@ class LivePipeline:
         )
         logger.info("Regime engine: cross-asset (Phase 2 unified)")
 
-        # V3.3 BookOptimizer (PR-2.5 integration).
-        # features.* OFF default → V3.2.1 100% parity.
-        # Phase 2/3/4 dependencies wired conditionally as features activate.
+        # V3.3 dependencies — graceful init (calibration table missing → Edge layer None)
+        models_dir = Path(self.cfg.paths.models)
+
+        # Diagnostics
+        no_trade_logger = NoTradeReasonLogger(
+            log_dir=models_dir / "no_trade_logs",
+        )
+        tc_monitor = TransferCoefficientMonitor(
+            log_path=models_dir / "tc_history.jsonl",
+        )
+        execution_quality = ExecutionQualityMonitor(
+            log_path=models_dir / "execution_quality.jsonl",
+        )
+
+        # Edge layer (calibration_table.json 있을 때만 활성)
+        edge_calibrator = None
+        edge_engine = None
+        edge_tier = None
+        calibration_path = Path("v3/config/edge_calibration.json")
+        if calibration_path.exists():
+            try:
+                edge_calibrator = EdgeCalibrator.from_file(
+                    calibration_path,
+                    config=CalibrationConfig(insufficient_action="global"),
+                )
+                edge_engine = EdgeEngine()
+                # tier_thresholds: 별도 파일 또는 기본값
+                tier_thresholds_path = Path("v3/config/edge_thresholds.json")
+                if tier_thresholds_path.exists():
+                    edge_tier = EdgeTierSystem.from_file(tier_thresholds_path)
+                else:
+                    edge_tier = EdgeTierSystem(thresholds=TierThresholds())
+                logger.info("V3.3 Edge layer loaded from calibration_table.json")
+            except Exception as exc:
+                logger.warning(
+                    f"V3.3 Edge layer init failed: {exc!r} — features.edge_* will be no-op"
+                )
+                edge_calibrator = edge_engine = edge_tier = None
+        else:
+            logger.warning(
+                "calibration_table.json not found — V3.3 Edge layer features inactive. "
+                "Run v3/scripts/run_calibration_pipeline.py to enable."
+            )
+
+        # Phase 3 (exit policies) — calibration 없어도 동작
+        exit_thesis = ExitThesisEngine(
+            policy=ExitPolicy(
+                hold_min_residual_edge=0.0,
+                max_signal_staleness_hours=16.0,  # V3.3 stale fix
+                refresh_at_session_start=True,
+            ),
+            signal_refresh_fn=None,  # TODO: production refresh hook
+        )
+        partial_exit = PartialExitEngine(policy=PartialExitPolicy())
+        signal_decay = SignalDecayEngine(policy=SignalDecayPolicy())
+
+        # Phase 4 (capital expansion)
+        allocation = AllocationEngine()
+        pyramid = PyramidPolicyEngine(policy=PyramidPolicy())
+        rotation = CapitalRotationEngine(policy=RotationPolicy())
+
+        # BookOptimizer with all V3.3 deps wired
         self.book_optimizer = BookOptimizer(
             signal_gen=self.signal_gen,
             features=self.cfg.features,
+            edge_calibrator=edge_calibrator,
+            edge_engine=edge_engine,
+            edge_tier=edge_tier,
+            exit_thesis=exit_thesis,
+            partial_exit=partial_exit,
+            signal_decay=signal_decay,
+            allocation=allocation,
+            pyramid=pyramid,
+            rotation=rotation,
+            no_trade_logger=no_trade_logger,
+            tc_monitor=tc_monitor,
+            execution_quality=execution_quality,
         )
 
         # F2 fix — record feature activations for rollback safety net
-        models_dir = Path(self.cfg.paths.models)
         record_features_on_startup(
             current=self.cfg.features,
             history_path=models_dir / "feature_activations.jsonl",
@@ -132,6 +214,12 @@ class LivePipeline:
         self._opportunity_gate: float = 0.0
         self._opportunity_at: datetime | None = None  # when the snapshot was taken
         self._last_signal = None
+        self._last_ctx = None  # V3.3 DecisionContext (when features.* ON)
+        # V3.3 pyramid/rotation tracking (cross-session)
+        self._adds_per_position: dict[str, int] = {}
+        self._initial_weights: dict[str, float] = {}
+        self._rotations_this_month: int = 0
+        self._rotations_month_key: str = ""
 
     # ──────────────────────────────────────────────────────────
     def collect_data(self) -> pd.DataFrame:
@@ -170,6 +258,16 @@ class LivePipeline:
         # Ticker volume map (liquidity check)
         ticker_volume_map = self._build_volume_map(df)
 
+        # V3.3 inputs (only relevant when features.* ON; harmless overhead OFF)
+        position_states = self._convert_to_position_states(
+            self.executor.positions.positions, df,
+        )
+        exit_triggers = self._check_triggers_v33(
+            self.executor.positions.positions, df,
+        )
+        signal_age_h = self._signal_age_hours()
+        rotations_this_month = self._refresh_rotations_counter(today)
+
         # V3.3 BookOptimizer routing (features.* OFF → V3.2.1 parity)
         ctx = self.book_optimizer.decide_with_context(
             ohlcv=df,
@@ -179,8 +277,15 @@ class LivePipeline:
             state=state,
             as_of=pd.Timestamp(today),
             ticker_volume_map=ticker_volume_map,
+            positions=position_states,
+            exit_triggers=exit_triggers,
+            signal_age_hours=signal_age_h,
+            rotations_this_month=rotations_this_month,
+            adds_per_position=dict(self._adds_per_position),
+            initial_weights=dict(self._initial_weights),
         )
         signal = ctx.signal  # parity: 기존 signal 처리 코드와 호환
+        self._last_ctx = ctx
 
         logger.info(
             f"Signal: {signal.action} — {len(signal.positions)} positions, "
@@ -204,7 +309,130 @@ class LivePipeline:
 
     def execute(self, signal: dict) -> list[dict]:
         today = datetime.now().strftime("%Y-%m-%d")
+        if self._use_v33_routing() and self._last_ctx is not None:
+            r = self.executor.execute_actions(self._last_ctx.actions, today)
+            # Track pyramid + rotation for next session
+            for entry in r["entered"]:
+                self._initial_weights.setdefault(entry["ticker"], entry["weight"])
+            for ro in r["rotated"]:
+                self._initial_weights[ro["ticker_in"]] = ro["weight"]
+                self._initial_weights.pop(ro["ticker_out"], None)
+                self._adds_per_position.pop(ro["ticker_out"], None)
+                self._rotations_this_month += 1
+            for add in r["added"]:
+                self._adds_per_position[add["ticker"]] = (
+                    self._adds_per_position.get(add["ticker"], 0) + 1
+                )
+            for ex in r["exited"]:
+                self._initial_weights.pop(ex["ticker"], None)
+                self._adds_per_position.pop(ex["ticker"], None)
+            # Aggregate "entries-equivalent" for downstream counters
+            return r["entered"] + r["rotated"] + r["added"]
         return self.executor.execute_entry(signal, today)
+
+    # ──────────────────────────────────────────────────────────
+    # V3.3 helpers
+    # ──────────────────────────────────────────────────────────
+    def _use_v33_routing(self) -> bool:
+        """V3.3 ctx.actions consumption active when any decision-changing flag ON.
+
+        Diagnostic-only flags (no_trade_logger/tc_monitor/execution_quality)
+        do NOT trigger V3.3 routing — they record passively under V3.2.1 path.
+        """
+        f = self.cfg.features
+        return bool(
+            f.exit_thesis or f.partial_exit or f.signal_decay
+            or f.allocation or f.pyramid or f.rotation
+        )
+
+    def _convert_to_position_states(
+        self, positions: list[dict], ohlcv: pd.DataFrame,
+    ) -> list[PositionState]:
+        """V3.2.1 position dicts → V3.3 PositionState (uses latest close per ticker)."""
+        if not positions:
+            return []
+        # Build latest-row map per ticker
+        if ohlcv is None or ohlcv.empty:
+            latest = {}
+        else:
+            sorted_df = ohlcv.sort_values("date") if "date" in ohlcv.columns else ohlcv
+            latest = (
+                sorted_df.groupby("ticker").tail(1).set_index("ticker").to_dict("index")
+            )
+        states: list[PositionState] = []
+        for pos in positions:
+            ticker = pos["ticker"]
+            row = latest.get(ticker)
+            entry_price = float(pos.get("entry_price", 0) or 0)
+            current_price = (
+                float(row["close"]) if row is not None and row.get("close") else entry_price
+            )
+            pnl = (current_price / entry_price - 1.0) if entry_price > 0 else 0.0
+            states.append(PositionState(
+                ticker=ticker,
+                entry_date=pd.Timestamp(str(pos.get("entry_date", ""))[:10] or "1970-01-01"),
+                entry_price=entry_price,
+                current_price=current_price,
+                current_weight=float(pos.get("weight", 0)),
+                entry_edge=float(pos.get("opportunity", 0.0)),
+                residual_edge=0.0,
+                entry_tier="A",
+                current_tier="A",
+                pnl_pct=pnl,
+                max_unrealized_pnl_pct=max(pnl, 0.0),
+                drawdown_from_peak_pct=min(pnl, 0.0),
+                holding_days=int(pos.get("hold_days", 0)) + 1,
+                dominant_alpha="trend",
+                expected_holding_days=10,
+                thesis_alive=pnl > 0,
+            ))
+        return states
+
+    def _check_triggers_v33(
+        self, positions: list[dict], ohlcv: pd.DataFrame,
+    ) -> dict[str, str]:
+        """ExitRules → {ticker: trigger_name} for BookOptimizer exit_triggers."""
+        if not positions or ohlcv is None or ohlcv.empty:
+            return {}
+        sorted_df = ohlcv.sort_values("date") if "date" in ohlcv.columns else ohlcv
+        latest = (
+            sorted_df.groupby("ticker").tail(1).set_index("ticker").to_dict("index")
+        )
+        triggers: dict[str, str] = {}
+        for pos in positions:
+            row = latest.get(pos["ticker"])
+            if row is None:
+                continue
+            current_price = float(row.get("close", 0) or 0)
+            current_vol = float(row.get("vol_cc_5d", pos.get("entry_vol", 0.3)) or 0.3)
+            hold_days = int(pos.get("hold_days", 0)) + 1
+            decision = self.executor.exit_rules.check(
+                entry_price=float(pos["entry_price"]),
+                current_price=current_price,
+                hold_days=hold_days,
+                entry_vol=float(pos.get("entry_vol", 0.3)),
+                current_vol=current_vol,
+                confidence=float(pos.get("confidence", 0.5)),
+                low_price=float(row.get("low", current_price)),
+            )
+            triggers[pos["ticker"]] = (
+                decision.reason if decision.should_exit else "max_hold"
+            )
+        return triggers
+
+    def _signal_age_hours(self) -> float:
+        """Hours since last opportunity snapshot (0 if first run)."""
+        if self._opportunity_at is None:
+            return 0.0
+        return (datetime.now() - self._opportunity_at).total_seconds() / 3600.0
+
+    def _refresh_rotations_counter(self, today: str) -> int:
+        """Reset rotations_this_month counter on calendar-month boundary."""
+        month_key = today[:7]
+        if month_key != self._rotations_month_key:
+            self._rotations_month_key = month_key
+            self._rotations_this_month = 0
+        return self._rotations_this_month
 
     def monitor(self) -> list[dict]:
         today = datetime.now().strftime("%Y-%m-%d")

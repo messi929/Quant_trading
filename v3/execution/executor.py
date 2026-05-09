@@ -16,6 +16,7 @@ from v3.execution.paper_broker import PaperBroker
 from v3.execution.position_manager import PositionManager
 from v3.rules.exit import ExitRules
 from v3.strategy.risk import RiskManager
+from v3.strategy.types import BookAction
 from v3.utils.ticker_utils import kis_code, is_domestic, round_to_tick
 
 
@@ -234,6 +235,237 @@ class TradingExecutor:
 
         self.positions.save()
         return closed
+
+    def execute_actions(
+        self,
+        actions: list[BookAction],
+        current_date: str,
+    ) -> dict[str, list]:
+        """V3.3 ctx.actions consumption — single executor for all action types.
+
+        Handles: EXIT, TRIM, ROTATE, ADD_TO_WINNER, ADD_NEW.
+        Skips: KEEP, NO_ACTION, BLOCKED.
+
+        Action stream is pre-sorted by BookOptimizer (EXIT/BLOCKED first,
+        ADD_NEW last). Risk gating (circuit breaker) applied before processing.
+        """
+        result: dict[str, list] = {
+            "entered": [], "exited": [], "trimmed": [],
+            "rotated": [], "added": [],
+        }
+
+        balance = self._get_portfolio_value()
+        cb_scale = self.risk.circuit_breaker_scale(balance)
+        if cb_scale <= 0:
+            logger.warning("Circuit breaker CRISIS — V3.3 actions halted, force_close_all")
+            self.force_close_all("circuit_breaker_crisis")
+            return result
+
+        for action in actions:
+            atype = action.action_type
+            ticker = action.ticker
+
+            if atype in ("KEEP", "NO_ACTION", "BLOCKED"):
+                continue
+
+            if atype == "EXIT":
+                self._execute_action_exit(ticker, action, current_date, result)
+
+            elif atype == "TRIM":
+                self._execute_action_trim(ticker, action, result)
+
+            elif atype == "ROTATE":
+                self._execute_action_rotate(
+                    ticker, action, current_date, balance, cb_scale, result,
+                )
+
+            elif atype == "ADD_TO_WINNER":
+                self._execute_action_add_winner(
+                    ticker, action, balance, cb_scale, result,
+                )
+
+            elif atype == "ADD_NEW":
+                self._execute_action_add_new(
+                    ticker, action, current_date, balance, cb_scale, result,
+                )
+
+        self.positions.save()
+        return result
+
+    # ── V3.3 action handlers ─────────────────────────────────────
+    def _execute_action_exit(
+        self, ticker: str, action: BookAction,
+        current_date: str, result: dict,
+    ) -> None:
+        pos = self.positions.get_position(ticker)
+        if not pos:
+            return
+        order = self._place_sell_order(ticker, pos)
+        if order:
+            ret = order["price"] / pos["entry_price"] - 1.0
+            if ret < 0:
+                self.positions.record_loss(ticker, current_date)
+            self.positions.remove_position(ticker)
+            result["exited"].append({
+                "ticker": ticker, "reason": action.reason,
+                "return": ret, "source": action.source_policy,
+            })
+            logger.info(f"V3.3 EXIT {ticker}: {action.reason} ret={ret:+.2%}")
+        else:
+            self.positions.record_sell_failure(ticker)
+
+    def _execute_action_trim(
+        self, ticker: str, action: BookAction, result: dict,
+    ) -> None:
+        pos = self.positions.get_position(ticker)
+        if not pos or pos.get("weight", 0) <= 0:
+            return
+        cur_weight = pos["weight"]
+        tgt_weight = action.target_weight
+        if tgt_weight >= cur_weight:
+            return
+        trim_frac = 1.0 - tgt_weight / cur_weight
+        cur_qty = int(pos.get("qty", 0))
+        sell_qty = max(1, int(cur_qty * trim_frac))
+        if not self._use_paper(ticker):
+            logger.warning(f"V3.3 TRIM {ticker} skipped: KIS partial sell not implemented")
+            return
+        trade = self.paper.sell(ticker, sell_qty)
+        if not trade:
+            return
+        new_qty = cur_qty - trade["qty"]
+        pos["qty"] = new_qty
+        pos["weight"] = tgt_weight
+        pos["capital_allocated"] = pos.get("capital_allocated", 0) * (1.0 - trim_frac)
+        result["trimmed"].append({
+            "ticker": ticker, "reason": action.reason,
+            "from_weight": cur_weight, "to_weight": tgt_weight,
+        })
+        logger.info(
+            f"V3.3 TRIM {ticker}: {cur_weight:.1%} → {tgt_weight:.1%} "
+            f"({action.reason})"
+        )
+
+    def _execute_action_rotate(
+        self, ticker: str, action: BookAction, current_date: str,
+        balance: float, cb_scale: float, result: dict,
+    ) -> None:
+        pos = self.positions.get_position(ticker)
+        if not pos:
+            return
+        order = self._place_sell_order(ticker, pos)
+        if not order:
+            self.positions.record_sell_failure(ticker)
+            return
+        ret = order["price"] / pos["entry_price"] - 1.0
+        if ret < 0:
+            self.positions.record_loss(ticker, current_date)
+        self.positions.remove_position(ticker)
+
+        new_ticker = action.replacement_ticker
+        if not new_ticker:
+            logger.warning(f"V3.3 ROTATE {ticker}: missing replacement_ticker")
+            return
+        order_amount = balance * action.target_weight * cb_scale
+        if order_amount < self.cfg.trading.min_order_amount_krw:
+            logger.info(
+                f"V3.3 ROTATE skip new {new_ticker}: amount "
+                f"{order_amount:,.0f} < min"
+            )
+            return
+        buy = self._place_buy_order(new_ticker, order_amount)
+        if not buy:
+            return
+        self.positions.add_position({
+            "ticker": new_ticker, "entry_date": current_date,
+            "entry_price": buy["price"], "qty": buy.get("qty", 0),
+            "weight": action.target_weight, "hold_days": 0,
+            "vol_score": 0.0, "confidence": 0.5, "entry_vol": 0.2,
+            "capital_allocated": order_amount,
+        })
+        result["rotated"].append({
+            "ticker_out": ticker, "ticker_in": new_ticker,
+            "weight": action.target_weight, "reason": action.reason,
+        })
+        logger.info(
+            f"V3.3 ROTATE {ticker} → {new_ticker} @ "
+            f"{action.target_weight:.1%} ({action.reason})"
+        )
+
+    def _execute_action_add_winner(
+        self, ticker: str, action: BookAction,
+        balance: float, cb_scale: float, result: dict,
+    ) -> None:
+        pos = self.positions.get_position(ticker)
+        if not pos:
+            return
+        cur_weight = pos.get("weight", 0)
+        tgt_weight = action.target_weight
+        if tgt_weight <= cur_weight:
+            return
+        add_weight = tgt_weight - cur_weight
+        add_amount = balance * add_weight * cb_scale
+        if add_amount < self.cfg.trading.min_order_amount_krw:
+            return
+        buy = self._place_buy_order(ticker, add_amount)
+        if not buy:
+            return
+        old_qty = int(pos.get("qty", 0))
+        new_qty = buy.get("qty", 0)
+        total_qty = old_qty + new_qty
+        if total_qty > 0:
+            pos["entry_price"] = (
+                pos["entry_price"] * old_qty + buy["price"] * new_qty
+            ) / total_qty
+        pos["qty"] = total_qty
+        pos["weight"] = tgt_weight
+        pos["capital_allocated"] = pos.get("capital_allocated", 0) + add_amount
+        result["added"].append({
+            "ticker": ticker, "from_weight": cur_weight,
+            "to_weight": tgt_weight, "reason": action.reason,
+        })
+        logger.info(
+            f"V3.3 ADD_TO_WINNER {ticker}: {cur_weight:.1%} → "
+            f"{tgt_weight:.1%} ({action.reason})"
+        )
+
+    def _execute_action_add_new(
+        self, ticker: str, action: BookAction, current_date: str,
+        balance: float, cb_scale: float, result: dict,
+    ) -> None:
+        if self.positions.is_cooled_down(ticker, current_date):
+            return
+        if self.positions.is_consecutive_entry(ticker, current_date):
+            return
+        if self.positions.get_position(ticker):
+            return
+        monthly = self.positions.monthly_trade_count(current_date)
+        if monthly >= self.cfg.trading.max_trades_per_month:
+            logger.info(f"V3.3 ADD_NEW {ticker}: monthly cap hit")
+            return
+        if self.positions.count() >= self.cfg.trading.max_positions:
+            logger.info(f"V3.3 ADD_NEW {ticker}: position cap hit")
+            return
+        order_amount = balance * action.target_weight * cb_scale
+        if order_amount < self.cfg.trading.min_order_amount_krw:
+            return
+        buy = self._place_buy_order(ticker, order_amount)
+        if not buy:
+            return
+        self.positions.add_position({
+            "ticker": ticker, "entry_date": current_date,
+            "entry_price": buy["price"], "qty": buy.get("qty", 0),
+            "weight": action.target_weight, "hold_days": 0,
+            "vol_score": 0.0, "confidence": 0.5, "entry_vol": 0.2,
+            "capital_allocated": order_amount,
+        })
+        result["entered"].append({
+            "ticker": ticker, "weight": action.target_weight,
+            "reason": action.reason, "source": action.source_policy,
+        })
+        logger.info(
+            f"V3.3 ADD_NEW {ticker} @ {action.target_weight:.1%} ({action.reason})"
+        )
 
     def force_close_all(self, reason: str = "force_close") -> list[dict]:
         """Close all positions immediately."""

@@ -173,26 +173,27 @@ backtest:
   walk_forward_step_days: 63
 
 # ------------------------------------------------------------------
-# V3.3 Feature Flags (default all OFF — V3.2.1 동작 보존)
+# V3.3 Feature Flags — 2026-05-10 전체 활성화 (페르소나 무시)
 # ------------------------------------------------------------------
-# 모든 신규 정책은 feature flag로 격리. 활성화 순서는 docs/V3.3_ROADMAP.md 참조.
-# Phase 1 진단 3개는 read-only이라 활성화 시에도 거래 결정 무영향.
+# 사용자 명시 결정: "일단 이번에는 페르소나 무시하고 즉시 활성화하자"
+# Edge layer (calibrator/engine/tier)는 v3/config/edge_calibration.json
+# 없으면 graceful no-op (LivePipeline init 분기). server에서 calibration
+# 빌드 후 자동 작동. Phase 3/4는 즉시 작동.
+# 롤백: 아래 12개 줄 모두 false 전환 후 재배포. F2 hook이 활성 이력 기록.
 features:
-  # Phase 1 (read-only diagnostics)
-  no_trade_logger: false
-  tc_monitor: false
-  execution_quality: false
-  # Phase 2 (decision-affecting — calibration 후 활성화)
-  edge_calibrator: false
-  edge_engine: false
-  edge_tier: false
-  allocation: false
-  # Phase 3 (exit policies)
-  # NOTE: V3.2.1 conditional veto는 executor.py inline 항상 ON.
-  # exit_thesis 활성화 시 V3.3 staleness fix (16h + refresh) 적용.
-  exit_thesis: false
-  partial_exit: false
-  signal_decay: false
-  # Phase 4 (capital expansion)
-  pyramid: false
-  rotation: false
+  # Phase 1 (read-only diagnostics — 거래 결정 무영향)
+  no_trade_logger: true
+  tc_monitor: true
+  execution_quality: true
+  # Phase 2 (Edge layer — calibration_table.json 없으면 graceful no-op)
+  edge_calibrator: true
+  edge_engine: true
+  edge_tier: true
+  allocation: true
+  # Phase 3 (exit policies — V3.3 ctx.actions path 활성)
+  exit_thesis: true
+  partial_exit: true
+  signal_decay: true
+  # Phase 4 (capital expansion — pyramid winner-only invariant)
+  pyramid: true
+  rotation: true

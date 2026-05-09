@@ -26,12 +26,23 @@ from v3.data.macro_features import MacroFeatureEngineer
 from v3.data.feature_engineer import VolFeatureEngineer
 from v3.rules.entry import EntryFilter, OperationalState
 from v3.rules.exit import ExitRules
+from v3.execution.execution_quality import ExecutionQualityMonitor
+from v3.strategy.allocation import AllocationEngine
 from v3.strategy.alpha_sources import DEFAULT_CONVICTION, DEFAULT_DIRECTIONAL
 from v3.strategy.book_optimizer import BookOptimizer
+from v3.strategy.diagnostics import NoTradeReasonLogger, TransferCoefficientMonitor
+from v3.strategy.edge_calibrator import CalibrationConfig, EdgeCalibrator
+from v3.strategy.edge_engine import EdgeEngine
+from v3.strategy.edge_tier import EdgeTierSystem, TierThresholds
+from v3.strategy.exit_thesis import ExitPolicy, ExitThesisEngine
 from v3.strategy.opportunity import OpportunityScorer
+from v3.strategy.partial_exit import PartialExitEngine, PartialExitPolicy
+from v3.strategy.pyramid import PyramidPolicy, PyramidPolicyEngine
 from v3.strategy.regime_v2 import RegimeDetectorV2
 from v3.strategy.risk import RiskManager
+from v3.strategy.rotation import CapitalRotationEngine, RotationPolicy
 from v3.strategy.signal import SignalGenerator
+from v3.strategy.signal_decay import SignalDecayEngine, SignalDecayPolicy
 from v3.strategy.sizing import VolTargetSizer
 from v3.strategy.types import BookAction, DecisionContext, PositionState
 
@@ -118,13 +129,72 @@ class BacktestEngine:
             max_single_weight=cfg.trading.max_single_weight,
         )
 
-        # V3.3 BookOptimizer (PR-2.5 integration).
-        # All Phase 2/3/4 dependencies default None — features.* OFF는 V3.2.1
-        # 동작 100% 보존. features 활성화 시 Edge layer / exit policies /
-        # capital expansion engine을 BookOptimizer가 wiring.
+        # V3.3 dependencies — graceful init (calibration table missing → Edge layer None)
+        from pathlib import Path
+
+        # Diagnostics
+        models_dir = Path(cfg.paths.models)
+        no_trade_logger = NoTradeReasonLogger(
+            log_dir=models_dir / "no_trade_logs",
+        )
+        tc_monitor = TransferCoefficientMonitor(
+            log_path=models_dir / "tc_history.jsonl",
+        )
+        execution_quality = ExecutionQualityMonitor(
+            log_path=models_dir / "execution_quality.jsonl",
+        )
+
+        # Edge layer (optional — calibration table 있을 때만)
+        edge_calibrator = None
+        edge_engine = None
+        edge_tier = None
+        calibration_path = Path("v3/config/edge_calibration.json")
+        if calibration_path.exists():
+            try:
+                edge_calibrator = EdgeCalibrator.from_file(
+                    calibration_path,
+                    config=CalibrationConfig(insufficient_action="global"),
+                )
+                edge_engine = EdgeEngine()
+                tier_thresholds_path = Path("v3/config/edge_thresholds.json")
+                if tier_thresholds_path.exists():
+                    edge_tier = EdgeTierSystem.from_file(tier_thresholds_path)
+                else:
+                    edge_tier = EdgeTierSystem(thresholds=TierThresholds())
+            except Exception as exc:
+                logger.warning(
+                    f"Backtest Edge layer init failed: {exc!r} — features.edge_* no-op"
+                )
+                edge_calibrator = edge_engine = edge_tier = None
+
+        # Phase 3 + 4 (always available)
+        exit_thesis = ExitThesisEngine(
+            policy=ExitPolicy(
+                hold_min_residual_edge=0.0,
+                max_signal_staleness_hours=16.0,
+            ),
+        )
+        partial_exit = PartialExitEngine(policy=PartialExitPolicy())
+        signal_decay = SignalDecayEngine(policy=SignalDecayPolicy())
+        allocation = AllocationEngine()
+        pyramid = PyramidPolicyEngine(policy=PyramidPolicy())
+        rotation = CapitalRotationEngine(policy=RotationPolicy())
+
         self.book_optimizer = BookOptimizer(
             signal_gen=self.signal_gen,
             features=cfg.features,
+            edge_calibrator=edge_calibrator,
+            edge_engine=edge_engine,
+            edge_tier=edge_tier,
+            exit_thesis=exit_thesis,
+            partial_exit=partial_exit,
+            signal_decay=signal_decay,
+            allocation=allocation,
+            pyramid=pyramid,
+            rotation=rotation,
+            no_trade_logger=no_trade_logger,
+            tc_monitor=tc_monitor,
+            execution_quality=execution_quality,
         )
 
     def run(

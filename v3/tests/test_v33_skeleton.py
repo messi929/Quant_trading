@@ -205,13 +205,9 @@ class TestFeatureFlagsConfig:
         cfg = load_config()
         assert hasattr(cfg, "features")
         assert isinstance(cfg.features, FeatureFlagsConfig)
-        # Production config must have all flags OFF currently
-        # (V3.3 features 활성화는 ROADMAP §5 paper promotion phase에서)
-        for flag_name in cfg.features.model_dump():
-            assert cfg.features.model_dump()[flag_name] is False, (
-                f"Feature {flag_name} must be OFF in v3_config.yaml until "
-                f"paper promotion phase (see docs/V3.3_ROADMAP.md §5)"
-            )
+        # Production config used to assert all flags OFF — relaxed 2026-05-10
+        # ("페르소나 무시하고 즉시 활성화" decision). Schema integrity only.
+        assert len(cfg.features.model_dump()) == 12
 
 
 # ──────────────────────────────────────────────────────────────
