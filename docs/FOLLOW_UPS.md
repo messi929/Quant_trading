@@ -351,3 +351,87 @@ monitor에 weekday 가드 추가 또는 stale 경고를 주말에만 INFO로 dem
 
 **절대 금지**: 관찰 기간 중 임의 튜닝. "그냥 느낌으로 올려보자" 금지.
 데이터 없이 정책 건드리면 백테스트-라이브 parity 깨짐.
+
+---
+
+## V3.3 전체 활성화 추적 (2026-05-10 ~)
+
+> CHANGELOG.md "V3.3 전체 활성화" 참조. 사용자 "페르소나 무시, 즉시 활성"
+> 결정으로 12개 features 동시 ON. 동시 다발 수정 금지 원칙 위배 — 효과
+> 측정 분리 불가능. 자동 rollback (`v33-rollback-check.timer`)이 안전망.
+
+### Active 추적 항목
+
+| # | 항목 | 위치 | 빈도 |
+|---|------|------|------|
+| 1 | Validation FAIL 재현 | `research/reports/validation_YYYY-MM.md` | 매월 1일 07:00 |
+| 2 | Edge layer ctx.actions 발생 빈도 | `/var/log/quant-v3-error.log` grep `EdgeTier\|net_edge` | 매 세션 |
+| 3 | V3.3 action 발생 (EXIT/TRIM/ROTATE/ADD) | 위 로그 grep `V3.3 (EXIT\|TRIM\|ROTATE\|ADD)` | 매 세션 |
+| 4 | Feature 활성 이력 | `feature_activations.jsonl` | startup |
+| 5 | 1주 PnL -2% 자동 OFF 트리거 | `/var/log/v33-rollback.log` | 매일 16:30 |
+| 6 | Daily diagnostic report | `research/reports/daily/` | 매일 16:00 |
+
+### 1순위 — Calibration validation FAIL 추적
+
+**현재 (2026-05-10)**: top-bottom -0.0001 → publish 차단됐으나 수동 publish.
+- Decile 0 anomaly: 가장 음의 opportunity인데 fwd_5d mean +0.72%
+- 원인 가설:
+  - V3.2.1 `trend`/`reversion` alphas의 OOS 6개월 cross-sectional 약화
+  - NASDAQ 99종목 표본 한계 (10K OOS rows)
+  - sector="unknown" 단일 분류 — sector_map 미주입
+
+**6/1 재실행 시 확인**:
+- OOS 윈도우 자동 갱신 (5/10 → 11/10 → 5/11)
+- 자연 해소 (OOS 다른 6개월 → top-bottom 차이 발생)?
+- 같은 패턴 반복 시 → 알파 자체 재설계 필요 (V3.4 후보)
+
+**조치 후보** (validation 계속 FAIL 시):
+1. `validate_edge.py` 기준 완화 (top-bottom ≥ -0.002 허용) — 보수적 신호
+   품질 저하
+2. Sector map 주입 (build_edge_dataset에 sector_map 인자 활용) — 분류 개선
+3. Alpha 재설계 (`reversion` 5d window 조정, `trend` shorter momentum) —
+   V3.4 scope
+
+**우선순위**: 6/1 데이터 보고 결정. 그 전 임의 튜닝 금지.
+
+### 2순위 — LivePipeline ↔ Monitor exit 통합
+
+**현 한계** (CHANGELOG §V3.3 활성화 G.5):
+- generate_signal 시점 (KR 09:30 / US 23:40): V3.3 ctx.actions path
+- 15분 monitor 루프: V3.2.1 ExitRules + executor.py inline veto
+
+**증상**: ExitThesis "HOLD" 결정이 보유 중 monitor에서 무효. 예) HOLD
+target이지만 monitor가 profit_take TP 발동 시 V3.2.1 inline veto만 체크
+(8h stale guard).
+
+**조치 시나리오**:
+- A. monitor에서 ExitThesisEngine 직접 호출 (positions snapshot + last
+  candidates)
+- B. ctx.actions에 시간 만료 만들어서 next session generate_signal 때만
+  의사결정 (현재 동작) — 단순하지만 reactive 늦음
+- C. 통합 안 함 (monitor V3.2.1 유지) — 안정성 우선, 정책 효과 부분적
+
+**우선순위**: live data 1~2주 누적 후 결정. ExitThesis trigger와
+ExitRules trigger 충돌 케이스 발생하면 A로 진행.
+
+### 3순위 — V3.3 features 효과 측정
+
+**의사결정 게이트** (5/24 즈음 평가 가능):
+
+| 측정 | V3.2.1 baseline | 1주 V3.3 paper 결과 | 판정 |
+|------|----------------|---------------------|------|
+| Avg deployed | ~60% | ? | ≥ 75% (allocation 효과) |
+| 종목당 weight | floor 0.15 | ? | 큰 종목 증가 (sizer ↔ allocation) |
+| Pyramid 발생 | 0 | ? | winner-only invariant 위배 0 |
+| Rotation 발생 | 0 | ? | 월 cap 내 |
+| TP 잘리기 (4/21 ADI 케이스) | 발생 | ? | conditional veto 16h fix 효과 |
+
+데이터 부족 시 측정 보류. 주간 paper 결과 vs V3.2.1 동기간 baseline 비교.
+
+### 절대 금지
+
+- features 12개 ON 상태에서 한 개씩 OFF로 효과 분리 시도 (rollback timer
+  triggered = 자연 OFF만)
+- Calibration FAIL 무시 후 게이트 완화 — V2.2 교훈 (게이트 완화 → -6.91%)
+- monitor 루프에 ExitThesis 통합 + 타 변경 동시 — 한 번에 하나
+- "어차피 paper니까" 안전장치 비활성

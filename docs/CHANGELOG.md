@@ -17,6 +17,7 @@ CLAUDE.md에서 분리된 Phase별 이력. 운영 지침 자체는 CLAUDE.md, �
 - [Phase 25.1 — Monthly Cap 옵션 C (2026-05-03)](#phase-251--monthly-cap-옵션-c-2026-05-03)
 - [Phase 25.2 — Sizer floor 0.05→0.15 (2026-05-07)](#phase-252--sizer-floor-005015-2026-05-07)
 - [Phase 26 (V3.3) — Profitability Engine (2026-05-09)](#phase-26-v33--profitability-engine-2026-05-09)
+- [V3.3 전체 활성화 (2026-05-10)](#v33-전체-활성화-2026-05-10)
 
 ---
 
@@ -1125,3 +1126,221 @@ V3.3 fix:
 5/15+: Paper Week 0 — 진단 3개 활성화
 6월~7월: 주차별 정책 활성화 (rollback 자동)
 ```
+
+> **NOTE**: 위 일정은 페르소나 정합성 일정. 사용자가 5/10 "페르소나 무시,
+> 즉시 활성" 결정으로 12개 features 한 번에 ON 됨. 다음 섹션 참조.
+
+---
+
+## V3.3 전체 활성화 (2026-05-10)
+
+> 사용자 결정 — *"일단 이번에는 페르소나 무시하고 즉시 활성화하자"* (옵션:
+> "전체 (Edge layer 포함, 가장 느림)"). Phase 26 ROADMAP §5의 주차별
+> promotion (Week 0~8) 건너뛰고 12개 features 동시 ON. 동시 다발 수정
+> 금지 원칙 위배 — paper trading에서 효과 측정 분리 불가능. 자동 rollback
+> (`v33-rollback-check.timer`, 1주 PnL -2% 시 OFF) 안전망 유지.
+
+### A. LivePipeline F3 풀 통합 (commit 09cc8f2)
+
+V3.3 도입 시 BookOptimizer는 `BacktestEngine`만 wiring 됐었음 (5ee271f F3
+backtest 통합). Live pipeline은 `ctx.signal`만 사용 → V3.2.1 path. Live에서
+도 ctx.actions 소비 가능하게 통합.
+
+**TradingExecutor.execute_actions(actions, current_date)** — 단일 신규
+entrypoint. 5종 핸들러:
+
+| ActionType | 처리 | 신규 vs 재사용 |
+|------------|------|----------------|
+| EXIT | `_place_sell_order` + `record_loss` | 재사용 |
+| TRIM | paper.sell(qty × trim_frac) + weight 갱신 | 신규 (paper 한정) |
+| ROTATE | sell(old) + buy(new at target_weight) | 신규 |
+| ADD_TO_WINNER | buy(add_amount) + 가중평균 entry 갱신 | 신규 |
+| ADD_NEW | execute_entry 동일 gating + place_buy | 재사용 |
+| KEEP/NO_ACTION/BLOCKED | skip | — |
+
+KIS API + PaperBroker 동시 지원. Circuit breaker / monthly cap / position cap
+/ cooldown 모두 V3.2.1 동등 적용. TRIM은 paper 한정 (KIS partial sell 미구현).
+
+**LivePipeline 통합** (`v3/pipeline/live_pipeline.py`):
+
+- `_use_v33_routing()` — 6개 decision-affecting flag (`exit_thesis` /
+  `partial_exit` / `signal_decay` / `allocation` / `pyramid` / `rotation`)
+  중 하나라도 ON → V3.3 path. Diagnostic-only 3개는 routing 미영향.
+- `_convert_to_position_states(positions, ohlcv)` — V3.2.1 dict positions →
+  V3.3 PositionState (latest close per ticker, pnl 계산).
+- `_check_triggers_v33(positions, ohlcv)` — ExitRules.check 결과를
+  `{ticker: trigger_name}` 매핑. BookOptimizer.exit_triggers 인자.
+- `_signal_age_hours()` — `_opportunity_at` 기준 시간 차.
+- `_refresh_rotations_counter(today)` — 캘린더 월 경계마다 0 리셋.
+- `generate_signal()` — BookOptimizer.decide_with_context()에 positions /
+  exit_triggers / signal_age_hours / rotations_this_month / adds_per_position
+  / initial_weights 전달. `self._last_ctx` 저장.
+- `execute()` — `_use_v33_routing()` True면 `executor.execute_actions(
+  ctx.actions)` 호출. 결과에서 entered/rotated/added 집계 + pyramid/rotation
+  cross-session state 갱신. False면 V3.2.1 signal path (parity).
+
+**Monitor 루프 한계**: V3.2.1 `ExitRules` + executor.py inline conditional
+veto 그대로 유지. `features.exit_thesis` 효과는 generate_signal 시점
+(KR 09:30 / US 23:40)에만 적용. 15분 monitor 루프에서는 V3.2.1 동작.
+ExitThesis V3.3 staleness fix (16h)는 ctx.actions 시점에만. 향후 별도 PR
+에서 monitor 통합 가능.
+
+### B. v3_config.yaml features 12개 모두 ON
+
+```yaml
+features:
+  # Phase 1 (read-only diagnostics)
+  no_trade_logger: true        # → no_trade_logs/
+  tc_monitor: true             # → tc_history.jsonl
+  execution_quality: true      # → execution_quality.jsonl
+  # Phase 2 (Edge layer — calibration_table.json 없으면 graceful no-op)
+  edge_calibrator: true
+  edge_engine: true
+  edge_tier: true
+  allocation: true
+  # Phase 3 (exit policies)
+  exit_thesis: true
+  partial_exit: true
+  signal_decay: true
+  # Phase 4 (capital expansion)
+  pyramid: true
+  rotation: true
+```
+
+`test_load_config_has_features` 의 all-OFF 단정 제거 (schema integrity 만
+검증). 547/547 통과.
+
+### C. Edge layer 활성용 데이터 빌드
+
+`prep_calibration_inputs.py` 신규 (b1135d9 + d818be7 + 98308d4):
+
+- 입력: `v3/data/raw/ohlcv_raw.parquet` + `v3/data/raw/macro.parquet` +
+  `vol_transformer_epoch019.pt` + `feature_config.json`
+- 출력: `data/research/{ohlcv_panel,macro_pctl,vol_predictions}.parquet`
+- per-date 배칭으로 1274 dates × 99 tickers VolTransformer 추론.
+  서버 CPU ~11분 (배칭 없으면 ~100분).
+- searchsorted dtype 충돌 fix (int64 ns 변환).
+
+서버 실행:
+```
+PYTHONPATH=/opt/quant /opt/quant/venv/bin/python \
+    v3/scripts/prep_calibration_inputs.py
+```
+
+### D. Calibration pipeline 실행 (2026-05-10 01:35~01:52)
+
+```
+prep_calibration_inputs        # ~11min  → 3 parquets
+run_calibration_pipeline       # ~17min  → 211 buckets
+  build_edge_dataset           # 118,079 rows × 1205 dates × 99 tickers
+  calibrate_panel              # train 107K / OOS 10.8K, 211 buckets
+  validate_oos                 # FAIL (아래)
+  archive                      # data/research/history/
+  publish_latest               # 차단 (validation FAIL)
+```
+
+**Validation FAIL** (research/reports/validation_2026-05.md):
+
+| 기준 | 값 | 통과 |
+|------|----|------|
+| Decile monotonicity (Spearman) > 0.5 | 0.515 | ✓ |
+| Top decile mean > 0 | +0.0072 | ✓ |
+| Top - Bottom decile > 0 | -0.0001 | **✗** |
+
+원인: Decile 0 (가장 음의 opportunity) fwd_5d mean +0.0072 = top decile과
+동일. → V3.2.1 alphas의 cross-sectional discrimination이 OOS 6개월에서
+약함. NASDAQ 99종목 표본 한계 + 알파 자체 weakness.
+
+**수동 publish 결정** — 사용자 "전체 활성화" 의도 + Edge layer 는
+enrichment-only (BookOptimizer doc §SignalGenerator entry decision remains
+canonical). FAIL은 net_edge 정확도 신호 약함이지 시스템 결함 아님.
+
+```
+ssh root@77.42.78.9 \
+    "cp /opt/quant/data/research/edge_calibration_2026-05.json \
+        /opt/quant/v3/config/edge_calibration.json && \
+     systemctl restart quant-trading-v3"
+```
+
+확인 로그:
+```
+2026-05-10 07:07:49 INFO V3.3 Edge layer loaded from calibration_table.json
+2026-05-10 07:07:49 INFO feature_tracker: 12 new activation(s) recorded
+```
+
+### E. F2 hook 활성 이력 기록
+
+`feature_activations.jsonl` 12 entries (2026-05-10 00:31:56 deploy 시점).
+`feature_state_snapshot.json` 갱신. Rollback 시 reverse delta 추적 가능.
+
+### F. 자동 갱신
+
+기존 timer 그대로 유지:
+- `calibration-retrain.timer` — 매월 1일 07:00 KST. 6/1 첫 자동 실행.
+- `v33-daily-report.timer` — 매일 16:00 KST.
+- `v33-rollback-check.timer` — 매일 16:30 KST. 1주 PnL -2% 자동 OFF.
+- `alpha-retrain.timer` — 매월 1일 06:00 KST.
+
+### G. 위험 + 관찰 사항
+
+**전체 활성 시 잠재 위험**:
+
+1. **사이즈 정책 충돌** — V3.2.1 sizer (Phase 25.2 floor 0.15) + V3.3
+   AllocationEngine 둘 다 활성. BookOptimizer가 SignalGenerator positions
+   ADD_NEW로 변환할 때 어느 weight가 canonical인지 코드 경로 검증 필요.
+2. **Pyramid 재현 빈도** — `pyramid_winner_only` invariant는 단위 테스트
+   통과했으나 live 운용에서 winner 정의 (residual_edge > threshold)가 V3.2.1
+   alpha와 정렬되는지 미검증.
+3. **Rotation 월 cap** — `_rotations_this_month` 캘린더 리셋 외 별도 cap
+   없음. RotationPolicy 기본값 의존.
+4. **Calibration FAIL 영향** — Decile 0 anomaly가 EdgeTier 분류 왜곡 →
+   Tier S/A를 잘못 부여 가능. 6/1 재실행에서 OOS 윈도우 갱신 시 자연 해소
+   기대.
+5. **LivePipeline ↔ monitor exit 정책 분리** — 위 §A 한계. Live trading
+   에서 ExitThesis HOLD 신호가 generate_signal 시점에만 영향. 보유 중
+   ExitRules trigger는 V3.2.1 inline veto가 처리.
+
+**관찰 항목**:
+
+```bash
+# Edge layer + V3.3 ctx.actions 작동 확인
+ssh root@77.42.78.9 "tail -f /var/log/quant-v3-error.log | \
+    grep -E 'V3.3 (EXIT|TRIM|ROTATE|ADD)|EdgeTier|net_edge'"
+
+# 일별 진단 리포트
+ssh root@77.42.78.9 "ls -la /opt/quant/research/reports/daily/"
+
+# 활성 이력
+ssh root@77.42.78.9 "cat /opt/quant/v3/saved_models/feature_activations.jsonl"
+
+# Rollback 트리거 여부
+ssh root@77.42.78.9 "tail /var/log/v33-rollback.log"
+```
+
+### H. Rollback 절차
+
+```bash
+# 수동: 12 flags 모두 false 후 redeploy
+sed -i 's/: true/: false/g' v3/config/v3_config.yaml  # 검토 필요 (다른 true도 영향)
+# 또는 features 섹션만 수동 편집
+
+git commit -am "rollback(V3.3): features OFF — V3.2.1 동작 복원"
+git push
+bash deploy_v3_git.sh 77.42.78.9
+
+# Edge layer만 비활성 (Phase 1+3+4 유지)
+ssh root@77.42.78.9 "rm /opt/quant/v3/config/edge_calibration.json && \
+    systemctl restart quant-trading-v3"
+# → graceful no-op 분기 활성, EdgeCalibrator None
+```
+
+### 페르소나 점수 (활성 직후 측정 불가, 1~2주 paper 데이터 필요)
+
+| 원칙 | V3.2.1 | V3.3 design 목표 | 현재 |
+|------|--------|------------------|------|
+| 1. 확신 | 5/10 | 7~8/10 (calibration) | **미측정** (calibration FAIL) |
+| 2. 크게 | 3/10 | 6~7/10 (allocation+pyramid) | **미측정** |
+| 3. 빠르게 | 8/10 | 9/10 (ExitThesis 16h) | **부분 적용** (monitor 잔존) |
+
+측정은 `recommendation_log.jsonl` + `paper_account.json` + daily report
+1~2주 누적 후. FOLLOW_UPS §V3.3 활성화 추적 참조.

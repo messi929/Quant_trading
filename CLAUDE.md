@@ -1,7 +1,14 @@
 # Quant Trading System — CLAUDE.md
 
-현재 운영 정책(V3.2.1 active) + 개발 워크플로우만 다룬다. Phase별 이력은
-`docs/CHANGELOG.md`, 후속 과제 추적은 `docs/FOLLOW_UPS.md` 참조.
+현재 운영 정책(V3.3 active, 12 features ON since 2026-05-10) + 개발 워크플로우만
+다룬다. Phase별 이력은 `docs/CHANGELOG.md`, 후속 과제 추적은
+`docs/FOLLOW_UPS.md` 참조.
+
+> ⚠️ 2026-05-10 사용자 결정 — V3.3 12개 features 한 번에 ON (페르소나 무시,
+> ROADMAP §5 주차별 promotion 건너뜀). LivePipeline ctx.actions 통합 +
+> Edge layer 활성 (calibration validation FAIL 상태로 수동 publish).
+> 자세한 내용 + 위험 + 관찰 + rollback 절차는 CHANGELOG "V3.3 전체 활성화"
+> 섹션 참조. 페르소나 점수 측정은 1~2주 paper 데이터 누적 후.
 
 ## 투자 철학 (Trading Philosophy)
 
@@ -399,14 +406,16 @@ Evaluator 리포트가 3섹션(regression / invariant / silent-failure) 모두 c
 
 ---
 
-## V3.3 Profitability Engine — 코드 완성, paper 활성화 대기 (2026-05-09)
+## V3.3 Profitability Engine — 12 features ON (2026-05-10 활성)
 
 V3.3은 V3.2.1 위에 13개 신규 모듈 + `BookOptimizer` orchestrator를 추가해
 "Vol Expansion Trader"를 "기대수익 기반 자본 재배분 엔진"으로 진화시킨다.
 
-**현재 상태**: 코드 100% 완성 (28+ commits, 450 tests pass).
-**`features.*` OFF default → V3.2.1 동작 100% 보존.**
-실제 활성화는 5/14 Phase 25.2 검증 종료 + main 머지 후 주차별 paper promotion.
+**현재 상태**: 12개 features 모두 ON (2026-05-10), 547 tests pass.
+서버 deploy 완료, F2 hook이 12개 신규 활성 기록 (`feature_activations.jsonl`).
+LivePipeline `ctx.actions` 소비 통합 (`TradingExecutor.execute_actions()` 5종
+핸들러). Edge layer는 `v3/config/edge_calibration.json` 수동 publish로 활성
+(validation FAIL 상태 — top-bottom -0.0001).
 
 ### 신규 모듈
 
@@ -421,34 +430,20 @@ V3.3은 V3.2.1 위에 13개 신규 모듈 + `BookOptimizer` orchestrator를 추�
 | Ablation | `ablation_specs/runner/report`, `promotion_decision` |
 | CLI | `scripts/run_ablation_sweep.py` |
 
-### V3.3 활성화 방법
+### V3.3 활성/비활성 제어 (현재 모두 ON)
 
-`v3/config/v3_config.yaml` `features:` 섹션에서 flag를 true로 변경:
+`v3/config/v3_config.yaml` `features:` 섹션. ROADMAP §5의 주차별 promotion
+일정은 2026-05-10 사용자 결정으로 우회 — 12개 모두 ON 됨. 롤백:
 
 ```yaml
 features:
-  no_trade_logger: true   # week 0 read-only
-  edge_calibrator: true   # week 1
-  # ...
+  # 한 줄씩 false 전환 후 deploy_v3_git.sh 77.42.78.9
+  # Edge layer만 비활성: rm v3/config/edge_calibration.json + service restart
 ```
 
-`deploy_v3.sh 77.42.78.9`로 server 반영. systemd `quant-trading-v3` 자동 재시작.
-
-### Paper Promotion 일정 (week index)
-
-| Week | 활성화 group |
-|---:|---|
-| 0 | 진단 3개 (read-only): `no_trade_logger`, `tc_monitor`, `execution_quality` |
-| 1 | `edge_calibrator` |
-| 2 | `edge_engine` |
-| 3 | `edge_tier` |
-| 4 | `exit_thesis` (Conditional Veto 정상화 + HOLD/REDUCE/ROTATE/EXIT, FOLLOW_UPS 1순위 해결) |
-| 5 | `signal_decay` + `partial_exit` |
-| 6 | `allocation` (net_edge / risk sizing) |
-| 7 | `pyramid` (winner-only add-on) |
-| 8 | `rotation` (capital efficiency) |
-
-각 week 후 1주 paper 관찰. PnL 악화 -2% 시 즉시 flag OFF (rollback).
+자동 rollback (`v33-rollback-check.timer`)은 매일 16:30 KST 1주 PnL -2% 시
+flag OFF — 안전망. 자세한 rollback 절차 + 위험 분석은 CHANGELOG "V3.3 전체
+활성화" 섹션 H 참조.
 
 ### V3.3 신규 운영 명령
 
