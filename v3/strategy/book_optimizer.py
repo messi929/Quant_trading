@@ -18,19 +18,21 @@ Parity guarantee (V3.3_DESIGN §11):
   features.all_off() → SignalGenerator positions become ADD_NEW BookActions
   1:1, no decisions changed, no Edge fields populated. Diagnostics also OFF.
 
-Edge feature flags in PR-2.4 are enrichment-only:
-  - net_edge_5d / edge_tier populated for observability
-  - SignalGenerator's entry decisions remain canonical
-  - AllocationEngine sizing override deferred to PR-4.1
+Edge layer enrichment (when calibration_table.json publish됨):
+  - net_edge_5d / edge_tier 채워짐
+  - SignalGenerator 의 entry 결정은 여전히 canonical
+  - AllocationEngine 은 net_edge 기반 sizing override 활성
 
-Wiring extensions (later PRs):
-  - PR-3.x exit policies → modify position-level actions
-  - PR-4.1 AllocationEngine → override sizing based on net_edge
-  - PR-4.2 Pyramid → ADD_TO_WINNER actions
-  - PR-4.3 Rotation → ROTATE actions
+활성 wiring (2026-05-10 V3.3 전체 활성화 commit 09cc8f2 / ee3ed4c):
+  - Phase 3 exit policies (exit_thesis / partial_exit / signal_decay)
+    → position-level BookActions
+  - Phase 4 capital expansion (allocation / pyramid / rotation)
+    → ADD_TO_WINNER / ROTATE / weight override
 
-Backtest engine + live pipeline integration deferred (PR-2.5 or later).
-This module is standalone-tested via injected SignalGenerator.
+BacktestEngine + LivePipeline 모두 BookOptimizer wiring 완료
+(commit 5ee271f / 09cc8f2 / 4ced695). 단위 테스트는
+test_book_optimizer.py 에 standalone, 통합은 test_backtest_v33_integration.py
++ test_live_monitor_v33.py 참조.
 """
 
 from __future__ import annotations
