@@ -162,15 +162,29 @@ class LivePipeline:
                 "calibration_table.json not found — V3.3 Edge layer features inactive. "
                 "Run v3/scripts/run_calibration_pipeline.py to enable."
             )
+            # Issue 3 fix — escalate when downstream features depend on Edge
+            f = self.cfg.features
+            edge_dependent_active = bool(
+                f.pyramid or f.rotation or f.allocation or f.edge_engine
+            )
+            if edge_dependent_active:
+                logger.warning(
+                    "⚠️ FEATURE GAP — calibration_table.json missing but "
+                    "features.{pyramid|rotation|allocation|edge_engine} are ON. "
+                    "These engines will silently no-op until calibration is "
+                    "published. Build via v3/scripts/run_calibration_pipeline.py."
+                )
 
         # Phase 3 (exit policies) — calibration 없어도 동작
+        # Critical 1 fix — signal_refresh_fn lambda binds to self at call time.
+        # _last_ctx 가 generate_signal 후 채워지므로 monitor 시점엔 사용 가능.
         exit_thesis = ExitThesisEngine(
             policy=ExitPolicy(
                 hold_min_residual_edge=0.0,
                 max_signal_staleness_hours=16.0,  # V3.3 stale fix
                 refresh_at_session_start=True,
             ),
-            signal_refresh_fn=None,  # TODO: production refresh hook
+            signal_refresh_fn=lambda ticker: self._refresh_edge_candidate(ticker),
         )
         partial_exit = PartialExitEngine(policy=PartialExitPolicy())
         signal_decay = SignalDecayEngine(policy=SignalDecayPolicy())
@@ -215,11 +229,15 @@ class LivePipeline:
         self._opportunity_at: datetime | None = None  # when the snapshot was taken
         self._last_signal = None
         self._last_ctx = None  # V3.3 DecisionContext (when features.* ON)
-        # V3.3 pyramid/rotation tracking (cross-session)
+        # V3.3 pyramid/rotation tracking (cross-session, persisted)
+        self._v33_state_path = (
+            Path(self.cfg.paths.models) / "v33_session_state.json"
+        )
         self._adds_per_position: dict[str, int] = {}
         self._initial_weights: dict[str, float] = {}
         self._rotations_this_month: int = 0
         self._rotations_month_key: str = ""
+        self._load_v33_state()
 
     # ──────────────────────────────────────────────────────────
     def collect_data(self) -> pd.DataFrame:
@@ -259,8 +277,14 @@ class LivePipeline:
         ticker_volume_map = self._build_volume_map(df)
 
         # V3.3 inputs (only relevant when features.* ON; harmless overhead OFF)
+        # Pass last ctx candidates so position residual_edge metadata is accurate
+        last_candidates_map = (
+            {c.ticker: c for c in self._last_ctx.candidates}
+            if self._last_ctx is not None else {}
+        )
         position_states = self._convert_to_position_states(
             self.executor.positions.positions, df,
+            candidates_by_ticker=last_candidates_map,
         )
         exit_triggers = self._check_triggers_v33(
             self.executor.positions.positions, df,
@@ -311,22 +335,27 @@ class LivePipeline:
         today = datetime.now().strftime("%Y-%m-%d")
         if self._use_v33_routing() and self._last_ctx is not None:
             r = self.executor.execute_actions(self._last_ctx.actions, today)
-            # Track pyramid + rotation for next session
+            mutated = False
             for entry in r["entered"]:
                 self._initial_weights.setdefault(entry["ticker"], entry["weight"])
+                mutated = True
             for ro in r["rotated"]:
                 self._initial_weights[ro["ticker_in"]] = ro["weight"]
                 self._initial_weights.pop(ro["ticker_out"], None)
                 self._adds_per_position.pop(ro["ticker_out"], None)
                 self._rotations_this_month += 1
+                mutated = True
             for add in r["added"]:
                 self._adds_per_position[add["ticker"]] = (
                     self._adds_per_position.get(add["ticker"], 0) + 1
                 )
+                mutated = True
             for ex in r["exited"]:
                 self._initial_weights.pop(ex["ticker"], None)
                 self._adds_per_position.pop(ex["ticker"], None)
-            # Aggregate "entries-equivalent" for downstream counters
+                mutated = True
+            if mutated:
+                self._save_v33_state()  # Critical 2 fix
             return r["entered"] + r["rotated"] + r["added"]
         return self.executor.execute_entry(signal, today)
 
@@ -346,9 +375,17 @@ class LivePipeline:
         )
 
     def _convert_to_position_states(
-        self, positions: list[dict], ohlcv: pd.DataFrame,
+        self,
+        positions: list[dict],
+        ohlcv: pd.DataFrame,
+        candidates_by_ticker: dict | None = None,
     ) -> list[PositionState]:
-        """V3.2.1 position dicts → V3.3 PositionState (uses latest close per ticker)."""
+        """V3.2.1 position dicts → V3.3 PositionState (uses latest close per ticker).
+
+        Issue 4 fix — populate residual_edge from candidates_by_ticker[ticker]
+        .net_edge_5d when available. Falls back to 0.0 if Edge layer inactive
+        or ticker not in candidates.
+        """
         if not positions:
             return []
         # Build latest-row map per ticker
@@ -359,6 +396,7 @@ class LivePipeline:
             latest = (
                 sorted_df.groupby("ticker").tail(1).set_index("ticker").to_dict("index")
             )
+        candidates_by_ticker = candidates_by_ticker or {}
         states: list[PositionState] = []
         for pos in positions:
             ticker = pos["ticker"]
@@ -368,6 +406,15 @@ class LivePipeline:
                 float(row["close"]) if row is not None and row.get("close") else entry_price
             )
             pnl = (current_price / entry_price - 1.0) if entry_price > 0 else 0.0
+            cand = candidates_by_ticker.get(ticker)
+            residual = (
+                float(cand.net_edge_5d) if cand is not None
+                and getattr(cand, "net_edge_5d", None) is not None
+                else 0.0
+            )
+            tier = (
+                getattr(cand, "edge_tier", None) or "A"
+            ) if cand is not None else "A"
             states.append(PositionState(
                 ticker=ticker,
                 entry_date=pd.Timestamp(str(pos.get("entry_date", ""))[:10] or "1970-01-01"),
@@ -375,9 +422,9 @@ class LivePipeline:
                 current_price=current_price,
                 current_weight=float(pos.get("weight", 0)),
                 entry_edge=float(pos.get("opportunity", 0.0)),
-                residual_edge=0.0,
+                residual_edge=residual,
                 entry_tier="A",
-                current_tier="A",
+                current_tier=tier,
                 pnl_pct=pnl,
                 max_unrealized_pnl_pct=max(pnl, 0.0),
                 drawdown_from_peak_pct=min(pnl, 0.0),
@@ -432,7 +479,62 @@ class LivePipeline:
         if month_key != self._rotations_month_key:
             self._rotations_month_key = month_key
             self._rotations_this_month = 0
+            self._save_v33_state()
         return self._rotations_this_month
+
+    # ──────────────────────────────────────────────────────────
+    # V3.3 cross-session state persistence (Critical 2 fix)
+    # ──────────────────────────────────────────────────────────
+    def _load_v33_state(self) -> None:
+        """Load pyramid/rotation tracking state from JSON (if exists)."""
+        if not self._v33_state_path.exists():
+            return
+        try:
+            data = json.loads(self._v33_state_path.read_text(encoding="utf-8"))
+            self._adds_per_position = dict(data.get("adds_per_position", {}))
+            self._initial_weights = dict(data.get("initial_weights", {}))
+            self._rotations_this_month = int(data.get("rotations_this_month", 0))
+            self._rotations_month_key = str(data.get("rotations_month_key", ""))
+            logger.info(
+                f"V3.3 session state loaded: {len(self._adds_per_position)} adds, "
+                f"{len(self._initial_weights)} weights, "
+                f"{self._rotations_this_month} rotations in {self._rotations_month_key}"
+            )
+        except (OSError, ValueError, KeyError) as exc:
+            logger.warning(f"V3.3 state load failed ({exc!r}) — starting fresh")
+
+    def _save_v33_state(self) -> None:
+        """Persist pyramid/rotation tracking state."""
+        try:
+            self._v33_state_path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "adds_per_position": self._adds_per_position,
+                "initial_weights": self._initial_weights,
+                "rotations_this_month": self._rotations_this_month,
+                "rotations_month_key": self._rotations_month_key,
+                "saved_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            self._v33_state_path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.error(f"V3.3 state save failed: {exc!r}")
+
+    def _refresh_edge_candidate(self, ticker: str):
+        """Critical 1 fix — ExitThesisEngine.signal_refresh_fn callback.
+
+        Returns latest EdgeCandidate for ticker from current ctx, or None.
+        ExitThesis treats None as 'no fresh signal' → conservative EXIT.
+        Lambda in __init__ binds to self at call time; safe even though
+        _last_ctx is initialized after this method is referenced.
+        """
+        if self._last_ctx is None:
+            return None
+        for c in self._last_ctx.candidates:
+            if c.ticker == ticker:
+                return c
+        return None
 
     def monitor(self) -> list[dict]:
         today = datetime.now().strftime("%Y-%m-%d")
@@ -527,8 +629,10 @@ class LivePipeline:
             if not decision.should_exit:
                 continue
 
-            state = self._convert_one_position_state(pos, current_price)
             current_edge = candidates_by_ticker.get(ticker)
+            state = self._convert_one_position_state(
+                pos, current_price, current_edge=current_edge,
+            )
             action = engine.decide(
                 position=state,
                 exit_trigger=decision.reason,
@@ -546,14 +650,19 @@ class LivePipeline:
             return []
         result = self.executor.execute_actions(actions, today)
         # Update cross-session counters for any rotations triggered here
+        mutated = False
         for ro in result.get("rotated", []):
             self._initial_weights[ro["ticker_in"]] = ro["weight"]
             self._initial_weights.pop(ro["ticker_out"], None)
             self._adds_per_position.pop(ro["ticker_out"], None)
             self._rotations_this_month += 1
+            mutated = True
         for ex in result.get("exited", []):
             self._initial_weights.pop(ex["ticker"], None)
             self._adds_per_position.pop(ex["ticker"], None)
+            mutated = True
+        if mutated:
+            self._save_v33_state()  # Critical 2 fix
         return (
             result.get("exited", [])
             + result.get("trimmed", [])
@@ -562,11 +671,24 @@ class LivePipeline:
 
     def _convert_one_position_state(
         self, pos: dict, current_price: float,
+        current_edge=None,
     ):
-        """Build a single PositionState from V3.2.1 dict + live current_price."""
+        """Build a single PositionState from V3.2.1 dict + live current_price.
+
+        Issue 4 fix — accept current_edge to populate residual_edge from
+        net_edge_5d when Edge layer active.
+        """
         from v3.strategy.types import PositionState
         entry_price = float(pos.get("entry_price", 0) or 0)
         pnl = (current_price / entry_price - 1.0) if entry_price > 0 else 0.0
+        residual = (
+            float(current_edge.net_edge_5d) if current_edge is not None
+            and getattr(current_edge, "net_edge_5d", None) is not None
+            else 0.0
+        )
+        tier = (
+            getattr(current_edge, "edge_tier", None) or "A"
+        ) if current_edge is not None else "A"
         return PositionState(
             ticker=pos["ticker"],
             entry_date=pd.Timestamp(str(pos.get("entry_date", ""))[:10] or "1970-01-01"),
@@ -574,9 +696,9 @@ class LivePipeline:
             current_price=current_price,
             current_weight=float(pos.get("weight", 0)),
             entry_edge=float(pos.get("opportunity", 0.0)),
-            residual_edge=0.0,
+            residual_edge=residual,
             entry_tier="A",
-            current_tier="A",
+            current_tier=tier,
             pnl_pct=pnl,
             max_unrealized_pnl_pct=max(pnl, 0.0),
             drawdown_from_peak_pct=min(pnl, 0.0),
