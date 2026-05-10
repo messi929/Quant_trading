@@ -482,6 +482,8 @@ ssh root@77.42.78.9 "tail -f /opt/quant/v3/saved_models/tc_history.jsonl"
 
 ## 참고 문서
 
+- **운영 가이드 (V3.3 활성 후 단일 reference)**: `docs/V3.3_OPERATIONS.md` —
+  변경된 정책 / 변경 의사결정 트리거 / 모니터링 루틴 / rollback 절차
 - **이력**: `docs/CHANGELOG.md` — Phase 22~26 (V3.3) 전체 변경 narrative
 - **후속 과제**: `docs/FOLLOW_UPS.md` — 페르소나 정합성 점검 + active 보류 항목
 - **V3 아키텍처**: `memory/v3_architecture.md`
