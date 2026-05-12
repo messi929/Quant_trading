@@ -694,3 +694,81 @@ class TestPositionScaleAsExposure:
             f"vol_score를 vol로 매핑하는 버그 잔존 의심 (예상: vol=0.20에서 "
             f"weight > floor)"
         )
+
+
+# ── Bug 12: BookOptimizer diagnostic buffers must be flushed each session ──
+#
+# 2026-05-10~12 V3.3 활성 중 no_trade_logger=true 였으나 saved_models/no_trade_logs/
+# 디렉터리는 매일 비어있었음. 원인: BookOptimizer.flush_diagnostics()가 LivePipeline /
+# BacktestEngine 어디에서도 호출되지 않아 buffer가 메모리에서만 살다가 process 종료
+# 시 사라짐. 결과: 5/11~12 4 거래일 entries=0 silent failure 동안 reject reason
+# 디스크 기록 없어 운영자가 인지하지 못함.
+
+class TestBookOptimizerFlushed:
+    """run_session() / BacktestEngine.run()은 종료 전 flush_diagnostics 호출해야
+    한다. 호출 누락은 no_trade_logger / tc_monitor / execution_quality 셋 모두를
+    silent하게 무력화한다."""
+
+    @staticmethod
+    def _flush_in_finally(func) -> bool:
+        """AST 검사: 함수의 try/finally 블록 안에 flush_diagnostics 호출이
+        있는지. exception 흐름에서도 호출되어야 silent failure 방지."""
+        import ast
+        import inspect
+        import textwrap
+        src = textwrap.dedent(inspect.getsource(func))
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            for stmt in node.finalbody:
+                for inner in ast.walk(stmt):
+                    if (
+                        isinstance(inner, ast.Call)
+                        and isinstance(inner.func, ast.Attribute)
+                        and inner.func.attr == "flush_diagnostics"
+                    ):
+                        return True
+        return False
+
+    def test_live_pipeline_run_session_flushes_in_finally(self):
+        """run_session()의 finally에 flush_diagnostics가 있어야 함.
+        try 밖이면 collect_data/generate_signal/execute/monitor 예외 시 buffer
+        손실 — 5/11~12 silent failure 패턴 그대로 재발."""
+        from v3.pipeline.live_pipeline import LivePipeline
+        assert self._flush_in_finally(LivePipeline.run_session), (
+            "LivePipeline.run_session() must call flush_diagnostics() inside "
+            "a try/finally finally-block, not after return — 예외 경로 누락."
+        )
+
+    def test_backtest_engine_run_flushes_in_finally(self):
+        """BacktestEngine.run()의 finally에 flush_diagnostics가 있어야 함."""
+        from v3.backtest.engine import BacktestEngine
+        assert self._flush_in_finally(BacktestEngine.run), (
+            "BacktestEngine.run() must call flush_diagnostics() inside a "
+            "try/finally finally-block — _run_impl 예외 시 디스크 persist 보장."
+        )
+
+    def test_flush_persists_to_disk(self, tmp_path):
+        """End-to-end: record() → flush() → file 존재 + 내용 검증."""
+        import json
+        import pandas as pd
+        from v3.strategy.diagnostics import NoTradeReasonLogger, RejectReason
+
+        logger_ = NoTradeReasonLogger(log_dir=tmp_path)
+        logger_.record({
+            "date": pd.Timestamp("2026-05-12"),
+            "ticker": "MELI",
+            "stage": "edge",
+            "reject_reason": RejectReason.NET_EDGE_TOO_LOW.value,
+            "raw_opportunity": 0.0213,
+            "regime": "caution",
+        })
+        assert logger_.buffer_size() == 1
+        logger_.flush()
+        assert logger_.buffer_size() == 0
+        log_file = tmp_path / "no_trade_2026-05-12.jsonl"
+        assert log_file.exists(), f"flush did not create {log_file}"
+        rec = json.loads(log_file.read_text(encoding="utf-8").splitlines()[0])
+        assert rec["ticker"] == "MELI"
+        assert rec["reject_reason"] == "net_edge_low"

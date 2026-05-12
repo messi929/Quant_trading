@@ -205,12 +205,21 @@ class BacktestEngine:
     ) -> BacktestResult:
         """Run backtest simulation.
 
-        Args:
-            df: OHLCV + features. Must include all dates in vol_predictions.
-            vol_predictions: DataFrame with [date, ticker, vol_score, confidence]
-                pre-computed by VolInference for each backtest date.
-            initial_capital: Starting capital (default from config).
+        Thin wrapper around _run_impl that guarantees flush_diagnostics()
+        runs even if simulation raises. test_regression Bug 12 invariant.
         """
+        try:
+            return self._run_impl(df, vol_predictions, initial_capital)
+        finally:
+            self.book_optimizer.flush_diagnostics()
+
+    def _run_impl(
+        self,
+        df: pd.DataFrame,
+        vol_predictions: pd.DataFrame,
+        initial_capital: float | None = None,
+    ) -> BacktestResult:
+        """Backtest simulation core (no flush — done by caller's finally)."""
         capital = initial_capital or self.cfg.backtest.initial_capital
         portfolio_value = capital
         cash = capital

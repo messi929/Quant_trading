@@ -713,24 +713,30 @@ class LivePipeline:
         logger.info(f"V3 Trading Session — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
         logger.info("=" * 60)
 
-        df = self.collect_data()
-        signal = self.generate_signal(df)
-        entries = self.execute(signal)
-        logger.info(f"Entries: {len(entries)}")
-        exits = self.monitor()
-        logger.info(f"Exits: {len(exits)}")
+        # try/finally — collect_data / generate_signal / execute / monitor 중
+        # 어디서 예외가 터져도 진단 buffer는 반드시 디스크에 persist 되어야 함.
+        # 호출 누락 / 예외 path 누락 둘 다 5/11~12 silent failure 패턴.
+        try:
+            df = self.collect_data()
+            signal = self.generate_signal(df)
+            entries = self.execute(signal)
+            logger.info(f"Entries: {len(entries)}")
+            exits = self.monitor()
+            logger.info(f"Exits: {len(exits)}")
 
-        summary = {
-            "date": datetime.now().strftime("%Y-%m-%d"),
-            "signal": signal["action"],
-            "regime": signal["regime"],
-            "entries": len(entries),
-            "exits": len(exits),
-            "open_positions": self.executor.positions.count(),
-        }
-        logger.info(f"Session complete: {summary}")
-        self._log_recommendation_snapshot(summary, entries, exits)
-        return summary
+            summary = {
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "signal": signal["action"],
+                "regime": signal["regime"],
+                "entries": len(entries),
+                "exits": len(exits),
+                "open_positions": self.executor.positions.count(),
+            }
+            logger.info(f"Session complete: {summary}")
+            self._log_recommendation_snapshot(summary, entries, exits)
+            return summary
+        finally:
+            self.book_optimizer.flush_diagnostics()
 
     def _log_recommendation_snapshot(
         self, summary: dict, entries: list[dict], exits: list[dict]
