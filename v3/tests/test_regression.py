@@ -541,3 +541,156 @@ class TestSizerFloorPassesMinOrder:
         assert port_vol < 2 * sizer.target_vol, (
             f"port_vol={port_vol:.3f} > 2× target={sizer.target_vol}"
         )
+
+
+# ── Bug 11: position_scale must be portfolio exposure, not per-position multiplier ──
+#
+# 2026-05-10 V3.3 12 features 활성 후 5/11~5/12 entries=0 (4 거래일).
+# Root cause: signal._size()가 raw_weight × position_scale 곱셈 적용.
+# caution scale 0.42 × floor 0.15 = 0.063 → 종목당 6.3% → 페르소나 "1종목에
+# 의미있게" 위반. min_position_weight floor가 sizer 내부에서만 작동하고 곧바로
+# 곱셈으로 무력화됨.
+#
+# 추가로 발견: signal._size()가 vol_scores['vol_score']를 predicted_vol로 매핑.
+# vol_score는 VolTransformer raw output (cross-sectional ranking signal)이지
+# annualized volatility가 아님. 진짜 vol은 ohlcv['vol_cc_20d'] (annualized,
+# feature_engineer.py:99에서 std * sqrt(252)).
+#
+# Fix:
+#   1. position_scale을 max_gross_exposure로 해석 (V3.3 RegimeBudget과 정합)
+#   2. 종목당 floor는 절대값 유지, 총합 초과 시 약한 종목 drop
+#   3. predicted_vol을 ohlcv['vol_cc_20d']에서 가져옴 (vol_score 사용 중지)
+
+class TestPositionScaleAsExposure:
+    """position_scale은 종목당 곱셈이 아니라 portfolio max_gross_exposure.
+
+    페르소나 원칙 ②"크게 (1~3종목 집중)" 보장. caution regime이라도 들어가는
+    종목은 floor 이상 사이즈로 들어가야 한다. 들어갈지 말지가 신중해지는 것이지
+    들어가는 사이즈가 작아지는 것이 아니다.
+    """
+
+    def _build_signal_gen(self):
+        from v3.rules.entry import EntryFilter
+        from v3.strategy.opportunity import OpportunityScorer
+        from v3.strategy.signal import SignalGenerator
+        from v3.strategy.sizing import VolTargetSizer
+        sizer = VolTargetSizer()
+        return SignalGenerator(
+            opportunity_scorer=OpportunityScorer(),
+            entry_filter=EntryFilter(),
+            sizer=sizer,
+        )
+
+    def _build_ohlcv(self, ticker_vols: dict[str, float]):
+        import pandas as pd
+        rows = [
+            {"date": "2026-05-11", "ticker": t, "close": 100.0, "vol_cc_20d": v}
+            for t, v in ticker_vols.items()
+        ]
+        return pd.DataFrame(rows)
+
+    def test_caution_single_candidate_meets_floor(self):
+        """5/11 MELI 재현: caution scale 0.4679, single candidate, conv 0.97.
+
+        Before: 0.15 × 0.4679 = 0.0702 (관찰된 production 값과 일치).
+        After: position_scale = exposure 한도이므로 single candidate는 floor
+               그대로. total(0.15) < scale(0.4679) → normalize 안 함.
+        """
+        from v3.rules.entry import EntryCandidate
+        sg = self._build_signal_gen()
+        selected = [EntryCandidate(
+            ticker="MELI", opportunity=0.0213, direction=0.022, conviction=0.97,
+            ticker_volume_krw=1e9, sector="ConsumerCyclical",
+        )]
+        ohlcv = self._build_ohlcv({"MELI": 0.30})
+        positions = sg._size(selected, 0.4679, ohlcv, vol_scores=None)
+        assert len(positions) == 1
+        assert positions[0]["weight"] >= sg.sizer.min_weight, (
+            f"5/11 regression: weight={positions[0]['weight']} < "
+            f"floor={sg.sizer.min_weight}. position_scale은 곱셈이 아니라 "
+            f"exposure 한도여야 한다."
+        )
+
+    def test_total_weight_respects_scale_as_exposure(self):
+        """총합 weight ≤ position_scale 보장. caution scale 0.40, 3 candidates
+        각 floor 0.15 → 합 0.45 > 0.40 → 약한 종목 drop until total ≤ 0.40."""
+        from v3.rules.entry import EntryCandidate
+        sg = self._build_signal_gen()
+        selected = [
+            EntryCandidate(ticker="A", opportunity=0.030, direction=0.03, conviction=1.0),
+            EntryCandidate(ticker="B", opportunity=0.020, direction=0.02, conviction=1.0),
+            EntryCandidate(ticker="C", opportunity=0.010, direction=0.01, conviction=1.0),
+        ]
+        ohlcv = self._build_ohlcv({"A": 0.30, "B": 0.30, "C": 0.30})
+        positions = sg._size(selected, 0.40, ohlcv, vol_scores=None)
+        total = sum(p["weight"] for p in positions)
+        assert total <= 0.40 + 1e-6, (
+            f"total weight {total:.4f} exceeds position_scale=0.40 "
+            f"(exposure invariant violated)"
+        )
+
+    def test_underexposure_keeps_cash(self):
+        """total < scale일 때 normalize로 사이즈 부풀리지 않음 — cash 유지.
+        Conviction-or-cash 페르소나 원칙."""
+        from v3.rules.entry import EntryCandidate
+        sg = self._build_signal_gen()
+        selected = [EntryCandidate(
+            ticker="X", opportunity=0.020, direction=0.02, conviction=1.0,
+        )]
+        ohlcv = self._build_ohlcv({"X": 0.30})
+        positions = sg._size(selected, 0.80, ohlcv, vol_scores=None)
+        assert len(positions) == 1
+        assert positions[0]["weight"] <= sg.sizer.max_weight + 1e-6
+        # scale 0.80인데 1종목 weight가 거기까지 끌려가면 안 됨
+        assert positions[0]["weight"] < 0.80, (
+            f"weight {positions[0]['weight']} 가 scale 0.80까지 padded up — "
+            f"underexposure는 cash 유지여야 한다"
+        )
+
+    def test_weakest_dropped_first_when_overexposed(self):
+        """Total > scale일 때 opportunity 가장 낮은 종목 먼저 drop.
+        강한 신호는 항상 살아남는다."""
+        from v3.rules.entry import EntryCandidate
+        sg = self._build_signal_gen()
+        selected = [
+            EntryCandidate(ticker="STRONG", opportunity=0.05, direction=0.05, conviction=1.0),
+            EntryCandidate(ticker="WEAK",   opportunity=0.01, direction=0.01, conviction=1.0),
+        ]
+        ohlcv = self._build_ohlcv({"STRONG": 0.30, "WEAK": 0.30})
+        # 2 × floor 0.15 = 0.30. scale 0.20 → 1종목만 살아야 함
+        positions = sg._size(selected, 0.20, ohlcv, vol_scores=None)
+        tickers = [p["ticker"] for p in positions]
+        # WEAK만 단독으로 살아남는 것은 invariant 위반
+        if "WEAK" in tickers and "STRONG" not in tickers:
+            assert False, "strongest opportunity dropped before weakest"
+        # 정상 케이스: STRONG 살아남거나, scale 너무 작아 둘 다 drop
+        assert "WEAK" not in tickers or "STRONG" in tickers
+
+    def test_predicted_vol_from_ohlcv_not_vol_score(self):
+        """predicted_vol은 ohlcv['vol_cc_20d']에서 와야 함.
+
+        vol_score는 VolTransformer prediction signal (cross-sectional ranking)이며
+        annualized volatility가 아님. signal._size()가 이걸 vol로 매핑하면
+        high-conviction ticker(vol_score≈1.0)가 'high-vol(100%)'로 해석되어
+        오히려 사이즈가 작아지는 역설.
+        """
+        import pandas as pd
+        from v3.rules.entry import EntryCandidate
+        sg = self._build_signal_gen()
+        selected = [EntryCandidate(
+            ticker="T", opportunity=0.03, direction=0.03, conviction=0.97,
+        )]
+        # vol_cc_20d=0.20 (realistic NASDAQ), vol_score=0.97 (high conviction signal)
+        ohlcv = self._build_ohlcv({"T": 0.20})
+        vol_scores = pd.DataFrame({
+            "ticker": ["T"], "vol_score": [0.97], "confidence": [0.97],
+        })
+        positions = sg._size(selected, 0.80, ohlcv, vol_scores=vol_scores)
+        # vol_cc_20d=0.20 사용 시 base = target_vol/0.20 = 0.75 → sizing 충분.
+        # vol_score=0.97을 vol로 잘못 해석하면 base = 0.155 → floor 직격 0.15.
+        # 즉 weight > 0.15이면 ohlcv vol_cc_20d 경로가 동작 중이라는 증거.
+        assert positions[0]["weight"] > sg.sizer.min_weight + 1e-6, (
+            f"weight {positions[0]['weight']:.4f} 가 정확히 floor에 묶임 — "
+            f"vol_score를 vol로 매핑하는 버그 잔존 의심 (예상: vol=0.20에서 "
+            f"weight > floor)"
+        )

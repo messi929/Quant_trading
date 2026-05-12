@@ -202,6 +202,27 @@ class SignalGenerator:
 
         positions = self._size(selected, regime.position_scale, ohlcv, vol_scores)
 
+        # Sizer가 모든 candidate를 drop한 경우 (전체 floor 미달 또는
+        # position_scale < sizer.min_weight). 현재 config에서는 도달 불가
+        # (POSITION_SCALE_CURVE 최저 0.30 > floor 0.15)이나 구조적 가드.
+        if not positions:
+            rejections["sizer_dropped_all"] = rejections.get("sizer_dropped_all", 0) + len(selected)
+            logger.info(
+                f"Signal: CASH — sizer dropped all {len(selected)} selected "
+                f"(position_scale={regime.position_scale:.2f} vs "
+                f"sizer.min_weight={self.sizer.min_weight}), regime={regime.name}"
+            )
+            return TradeSignal(
+                action="CASH", positions=[], cash_weight=1.0,
+                regime_name=regime.name, regime_score=regime.score,
+                position_scale=regime.position_scale,
+                n_candidates=len(report.rows),
+                n_approved=len(opportunity_approved),
+                rejection_reasons=rejections,
+                opportunity_map=opp_map,
+                opportunity_gate=opp_gate,
+            )
+
         logger.info(
             f"Signal: TRADE — {len(positions)} positions, "
             f"regime={regime.name} (score={regime.score:.2f}, "
@@ -231,45 +252,84 @@ class SignalGenerator:
         selected: list[EntryCandidate],
         position_scale: float,
         ohlcv: pd.DataFrame,
-        vol_scores: pd.DataFrame | None,
+        vol_scores: pd.DataFrame | None,  # noqa: ARG002 — kept for signature stability
     ) -> list[dict]:
-        """Apply VolTargetSizer + regime position_scale + min/max clamps."""
-        # Build predicted vol & confidence maps for sizer
-        if vol_scores is None or vol_scores.empty:
-            # Default: equal vol
-            predicted_vols = {c.ticker: 0.20 for c in selected}
-            confidences = {c.ticker: c.conviction for c in selected}
-        else:
-            vs = vol_scores.set_index("ticker")
-            predicted_vols = {
-                c.ticker: max(float(vs.loc[c.ticker, "vol_score"])
-                              if c.ticker in vs.index else 0.20, 0.05)
-                for c in selected
-            }
-            confidences = {c.ticker: c.conviction for c in selected}
+        """Size approved candidates with portfolio-level exposure cap.
+
+        position_scale은 종목당 곱셈이 아니라 portfolio max_gross_exposure 한도
+        (V3.3 RegimeBudget과 정합). 종목당 floor(sizer.min_weight)는 절대값으로
+        유지. 총합이 한도 초과 시 opportunity 약한 종목부터 drop. 페르소나
+        ②"1~3종목 집중, 들어가면 의미있게" + ①"확신 없으면 현금" 보장.
+
+        predicted_vol은 ohlcv['vol_cc_20d'] (annualized, feature_engineer.py:99)
+        에서 가져옴. vol_scores['vol_score']는 VolTransformer prediction signal
+        이며 annualized volatility가 아니므로 sizing에 직접 쓰면 안 됨.
+        """
+        predicted_vols = self._extract_vols(selected, ohlcv)
+        confidences = {c.ticker: c.conviction for c in selected}
 
         raw_weights = self.sizer.size_portfolio(predicted_vols, confidences)
 
-        positions: list[dict] = []
+        # Stage 1: per-position cap + floor filter
+        candidate_map = {c.ticker: c for c in selected}
+        weights: dict[str, float] = {}
         for c in selected:
             w = raw_weights.get(c.ticker, 1.0 / max(len(selected), 1))
-            w = round(w * position_scale, 4)
             w = min(w, self.max_weight)
-            if w < self.min_weight:
+            if w < self.sizer.min_weight:
+                # 의미 있는 사이즈 안 나오면 진입 안 함
                 continue
-            positions.append({
-                "ticker": c.ticker,
-                "weight": w,
-                "direction": round(c.direction, 4),
-                "conviction": round(c.conviction, 4),
-                "opportunity": round(c.opportunity, 5),
-            })
+            weights[c.ticker] = round(w, 4)
 
-        # Normalize if overshooting 95%
-        total = sum(p["weight"] for p in positions)
-        if total > 0.95:
-            scale = 0.95 / total
-            for p in positions:
-                p["weight"] = round(p["weight"] * scale, 4)
+        # Stage 2: portfolio exposure cap — drop weakest until total ≤ scale
+        dropped_for_exposure: list[tuple[str, float]] = []
+        while weights and sum(weights.values()) > position_scale + 1e-6:
+            weakest = min(
+                weights.keys(),
+                key=lambda t: candidate_map[t].opportunity,
+            )
+            dropped_for_exposure.append((weakest, weights[weakest]))
+            del weights[weakest]
+        if dropped_for_exposure:
+            logger.info(
+                f"Sizer exposure cap: dropped {len(dropped_for_exposure)} weakest "
+                f"to fit position_scale={position_scale:.3f} — "
+                f"{[(t, round(w, 4)) for t, w in dropped_for_exposure]}"
+            )
 
-        return positions
+        return [
+            {
+                "ticker": t,
+                "weight": weights[t],
+                "direction": round(candidate_map[t].direction, 4),
+                "conviction": round(candidate_map[t].conviction, 4),
+                "opportunity": round(candidate_map[t].opportunity, 5),
+            }
+            for t in weights
+        ]
+
+    def _extract_vols(
+        self,
+        selected: list[EntryCandidate],
+        ohlcv: pd.DataFrame,
+    ) -> dict[str, float]:
+        """Per-ticker annualized vol from ohlcv['vol_cc_20d'] latest row."""
+        default_vol = 0.20  # NASDAQ baseline
+        if (
+            ohlcv is None
+            or ohlcv.empty
+            or "vol_cc_20d" not in ohlcv.columns
+        ):
+            return {c.ticker: default_vol for c in selected}
+        sorted_df = ohlcv.sort_values("date") if "date" in ohlcv.columns else ohlcv
+        latest = (
+            sorted_df.groupby("ticker").tail(1)
+            .set_index("ticker")["vol_cc_20d"]
+        )
+        result: dict[str, float] = {}
+        for c in selected:
+            vol = latest.get(c.ticker, None)
+            if vol is None or not pd.notna(vol) or vol <= 0:
+                vol = default_vol
+            result[c.ticker] = float(max(vol, 0.05))
+        return result
