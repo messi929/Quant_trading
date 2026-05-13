@@ -287,8 +287,10 @@ class AlphaWeightTrainer:
                 logger.warning(f"Inference failed at {t.date()}: {e}")
                 continue
 
-            # Directional alphas
-            directional = compute_directional(df_up_to_t, sources=self.directional)
+            # Directional alphas (vol_scores forwarded for vol_predicted-style alphas)
+            directional = compute_directional(
+                df_up_to_t, sources=self.directional, vol_scores=vol_scores,
+            )
             if directional.empty:
                 continue
 
@@ -552,21 +554,49 @@ class AlphaWeightTrainer:
     # ──────────────────────────────────────────────────────────────
     # Weights
     # ──────────────────────────────────────────────────────────────
-    def ic_to_weights(self, ic: dict[str, float]) -> dict[str, float]:
-        """IC → weights with shrinkage.
+    def ic_to_weights(
+        self,
+        ic: dict[str, float],
+        *,
+        min_weight: float = 0.10,
+    ) -> dict[str, float]:
+        """IC → weights with shrinkage, sqrt smoothing, min-weight floor.
 
-        Uses max(IC - MIN_VANILLA_IC, 0) to suppress noise-level edges
-        (|IC| < 0.02 treated as no edge). If all alphas fail the threshold,
-        falls back to uniform weights.
+        Conservative allocation (2026-05-13 follow-up #2):
+          1. shrunk = max(IC - MIN_VANILLA_IC, 0) — noise-level edges → 0
+          2. smoothed = sqrt(shrunk) — winners dampened, gaps narrowed
+          3. min_weight floor — every alpha gets ≥ min_weight share
+          4. remaining (1 - n×min_weight) distributed proportional to smoothed
+
+        모두 미달이면 uniform fallback. 단일 marginal alpha(예: vanilla IC
+        0.028)가 winner-take-most로 100% 가져가던 이전 동작 방지.
+
+        Args:
+            ic: {alpha_name: IC}.
+            min_weight: floor share per alpha (default 0.10).
         """
+        import math
         if not ic:
             return {}
-        shrunk = {a: max(v - MIN_VANILLA_IC, 0.0) for a, v in ic.items()}
-        total = sum(shrunk.values())
-        if total <= 1e-9:
-            n = len(ic)
+        n = len(ic)
+        if n * min_weight >= 1.0:
+            # Floor 합 >= 1 → uniform
             return {a: round(1.0 / n, 4) for a in ic}
-        return {a: round(v / total, 4) for a, v in shrunk.items()}
+
+        shrunk = {a: max(v - MIN_VANILLA_IC, 0.0) for a, v in ic.items()}
+        if sum(shrunk.values()) <= 1e-9:
+            return {a: round(1.0 / n, 4) for a in ic}
+
+        smoothed = {a: math.sqrt(s) for a, s in shrunk.items()}
+        total = sum(smoothed.values())
+        if total <= 1e-9:
+            return {a: round(1.0 / n, 4) for a in ic}
+
+        free_budget = 1.0 - n * min_weight
+        return {
+            a: round(min_weight + free_budget * smoothed[a] / total, 4)
+            for a in ic
+        }
 
     # ──────────────────────────────────────────────────────────────
     # Persistence

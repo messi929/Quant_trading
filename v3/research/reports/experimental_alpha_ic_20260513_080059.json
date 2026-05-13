@@ -1,0 +1,68 @@
+{
+  "generated_at": "2026-05-13T08:00:59",
+  "lookback_years": 3.0,
+  "forward_horizon": 5,
+  "step_days": 5,
+  "panel_size": 14403,
+  "min_vanilla_ic_threshold": 0.02,
+  "candidate_alphas": [
+    "volume_surprise",
+    "vol_term"
+  ],
+  "verdicts": {
+    "volume_surprise": "PROMOTE_VANILLA",
+    "vol_term": "REGIME_ONLY"
+  },
+  "vanilla_ic": {
+    "trend": 0.003,
+    "reversion": -0.0012,
+    "volume_surprise": 0.0281,
+    "vol_term": 0.0189
+  },
+  "conditional_ic": {
+    "strong_bull": {
+      "trend": 0.101,
+      "reversion": -0.145,
+      "volume_surprise": -0.1431,
+      "vol_term": 0.0302
+    },
+    "bull": {
+      "trend": -0.0546,
+      "reversion": 0.0396,
+      "volume_surprise": 0.0017,
+      "vol_term": -0.0138
+    },
+    "neutral": {
+      "trend": 0.0181,
+      "reversion": -0.0088,
+      "volume_surprise": 0.0279,
+      "vol_term": 0.0186
+    },
+    "caution": {
+      "trend": 0.0263,
+      "reversion": -0.0169,
+      "volume_surprise": 0.0587,
+      "vol_term": 0.0405
+    },
+    "bear": {
+      "trend": -0.0772,
+      "reversion": 0.0606,
+      "volume_surprise": -0.0459,
+      "vol_term": -0.0071
+    }
+  },
+  "regime_counts": {
+    "neutral": 6316,
+    "caution": 4725,
+    "bull": 2373,
+    "bear": 890,
+    "strong_bull": 99
+  },
+  "conviction_metrics": {
+    "vol": {
+      "expansion_ic": 0.1782,
+      "sample_size": 14403,
+      "level_ic": 0.0314
+    }
+  }
+}

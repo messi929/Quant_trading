@@ -164,6 +164,278 @@ class AlphaReversion(AlphaSource):
 
 
 # ──────────────────────────────────────────────────────────────
+# Experimental directional alphas (2026-05-13)
+# ──────────────────────────────────────────────────────────────
+# Two candidate alphas added during follow-up #2 (post 5/11~12 calibration
+# noise finding). Both leverage features already produced by VolFeatureEngineer,
+# so no new data plumbing required. Not in DEFAULT_DIRECTIONAL — IC must be
+# measured first via v3/research/test_new_alphas.py before promotion.
+
+class AlphaVolumeSurprise(AlphaSource):
+    """Volume-surprise alpha: today volume vs 20d MA, signed by recent return.
+
+    Hypothesis: 거래량 surge는 단기 의사표명 신호. positive return과 결합되면
+    추가 매수 압력으로 해석. Signed in [-ALPHA_SCALE, ALPHA_SCALE].
+
+    Construction:
+      surprise   = log(today_volume / SMA20(volume))
+      direction  = sign(close[-1] / close[-6] - 1)
+      raw        = surprise × direction
+      → cross-sectional z-score → tanh(z/2) × ALPHA_SCALE
+    """
+
+    @property
+    def name(self) -> str:
+        return "volume_surprise"
+
+    def compute(self, ohlcv: pd.DataFrame, **_: object) -> pd.Series:
+        if ohlcv.empty:
+            return pd.Series(dtype=float, name=self.name)
+        if "volume" not in ohlcv.columns:
+            return pd.Series(dtype=float, name=self.name)
+
+        df = ohlcv[["date", "ticker", "close", "volume"]].sort_values(["ticker", "date"])
+        raw: dict[str, float] = {}
+        for ticker, group in df.groupby("ticker", sort=False):
+            close = group["close"].to_numpy(dtype=float)
+            volume = group["volume"].to_numpy(dtype=float)
+            if len(close) < 22 or len(volume) < 22:
+                continue
+            v20_ma = float(volume[-21:-1].mean())
+            today_volume = float(volume[-1])
+            if v20_ma <= 0 or today_volume <= 0:
+                continue
+            surprise = float(np.log(today_volume / v20_ma))
+            base = float(close[-6])
+            if base <= 0:
+                continue
+            ret_5d = float(close[-1] / base - 1.0)
+            if abs(ret_5d) < 1e-6:
+                continue
+            sign = 1.0 if ret_5d > 0 else -1.0
+            raw[ticker] = surprise * sign
+
+        if not raw:
+            return pd.Series(dtype=float, name=self.name)
+        s = pd.Series(raw, dtype=float)
+        std = s.std(ddof=0)
+        if std < 1e-12:
+            return pd.Series(0.0, index=s.index, name=self.name)
+        z = (s - s.mean()) / std
+        return (np.tanh(z / 2.0) * ALPHA_SCALE).rename(self.name)
+
+
+class AlphaEarningsProximity(AlphaSource):
+    """Earnings-proximity alpha: days-to-next-earnings × recent return sign.
+
+    Hypothesis: earnings 발표 직전 (1~2주) 종목은 IV 팽창 + 수요 증가가 일어
+    나는 경향. 단기 매수 압력 가설이 통하려면 recent return의 방향이 시장
+    기대를 반영한다고 가정 (positive → bullish expectation 지속).
+
+    Construction:
+      proximity  = exp(-days_to_next_earnings / decay_days)   ∈ (0, 1]
+      direction  = sign(close[-1] / close[-6] - 1)
+      raw        = proximity × direction
+      → cross-sectional z-score → tanh(z/2) × ALPHA_SCALE
+
+    Requires external earnings_dates_by_ticker map. Use
+    `load_earnings_dates(json_path)` to build from earnings_collector output.
+    Tickers without data → 0.0 (neutral).
+    """
+
+    def __init__(
+        self,
+        earnings_dates_by_ticker: dict[str, list[pd.Timestamp]],
+        decay_days: float = 7.0,
+    ):
+        if decay_days <= 0:
+            raise ValueError(f"decay_days must be positive: {decay_days}")
+        # Normalize to sorted naive Timestamps
+        normalized: dict[str, list[pd.Timestamp]] = {}
+        for ticker, dates in (earnings_dates_by_ticker or {}).items():
+            seq: list[pd.Timestamp] = []
+            for d in dates:
+                ts = pd.Timestamp(d)
+                if getattr(ts, "tz", None) is not None:
+                    ts = ts.tz_convert(None) if ts.tz is not None else ts
+                seq.append(ts.normalize())
+            normalized[ticker] = sorted(seq)
+        self._earnings = normalized
+        self.decay_days = float(decay_days)
+
+    @property
+    def name(self) -> str:
+        return "earnings_proximity"
+
+    def compute(self, ohlcv: pd.DataFrame, **_: object) -> pd.Series:
+        if ohlcv.empty or "date" not in ohlcv.columns:
+            return pd.Series(dtype=float, name=self.name)
+
+        df = ohlcv[["date", "ticker", "close"]].sort_values(["ticker", "date"])
+        latest_per = df.groupby("ticker").tail(1).set_index("ticker")
+        if latest_per.empty:
+            return pd.Series(dtype=float, name=self.name)
+
+        # latest date is the as-of date used to compute days_to_next_earnings.
+        as_of = pd.Timestamp(latest_per["date"].max()).normalize()
+
+        raw: dict[str, float] = {}
+        for ticker, group in df.groupby("ticker", sort=False):
+            close = group["close"].to_numpy(dtype=float)
+            if len(close) < 6 or close[-6] <= 0:
+                continue
+            ret_5d = float(close[-1] / close[-6] - 1.0)
+            if abs(ret_5d) < 1e-6:
+                continue
+            sign = 1.0 if ret_5d > 0 else -1.0
+            future_dates = [d for d in self._earnings.get(ticker, []) if d > as_of]
+            if not future_dates:
+                continue
+            days_to_next = float((future_dates[0] - as_of).days)
+            if days_to_next < 0:
+                continue
+            proximity = float(np.exp(-days_to_next / self.decay_days))
+            raw[ticker] = proximity * sign
+
+        if not raw:
+            return pd.Series(dtype=float, name=self.name)
+        s = pd.Series(raw, dtype=float)
+        std = s.std(ddof=0)
+        if std < 1e-12:
+            return pd.Series(0.0, index=s.index, name=self.name)
+        z = (s - s.mean()) / std
+        return (np.tanh(z / 2.0) * ALPHA_SCALE).rename(self.name)
+
+
+def load_earnings_dates(path: str | "Path") -> dict[str, list[pd.Timestamp]]:
+    """Load earnings_dates.json (from earnings_collector) into ticker→dates map."""
+    import json
+    from pathlib import Path as _Path
+    p = _Path(path)
+    if not p.exists():
+        return {}
+    artifact = json.loads(p.read_text(encoding="utf-8"))
+    data = artifact.get("data", {})
+    return {t: [pd.Timestamp(d) for d in dates] for t, dates in data.items()}
+
+
+class AlphaVolTermStructure(AlphaSource):
+    """Vol term-structure alpha: short/long vol ratio, signed by recent return.
+
+    Hypothesis: vol_5d / vol_20d > 1.0 = 단기 vol 팽창 — V3 핵심 가설인 vol
+    expansion 신호. recent return의 부호와 결합하여 방향 부여.
+
+    Construction:
+      vts        = vol_cc_5d / vol_cc_20d - 1.0
+      direction  = sign(close[-1] / close[-6] - 1)
+      raw        = vts × direction
+      → cross-sectional z-score → tanh(z/2) × ALPHA_SCALE
+    """
+
+    @property
+    def name(self) -> str:
+        return "vol_term"
+
+    def compute(self, ohlcv: pd.DataFrame, **_: object) -> pd.Series:
+        if ohlcv.empty:
+            return pd.Series(dtype=float, name=self.name)
+        if "vol_cc_5d" not in ohlcv.columns or "vol_cc_20d" not in ohlcv.columns:
+            return pd.Series(dtype=float, name=self.name)
+
+        df = ohlcv[["date", "ticker", "close", "vol_cc_5d", "vol_cc_20d"]].sort_values(
+            ["ticker", "date"]
+        )
+        raw: dict[str, float] = {}
+        for ticker, group in df.groupby("ticker", sort=False):
+            close = group["close"].to_numpy(dtype=float)
+            if len(close) < 6 or close[-6] <= 0:
+                continue
+            row = group.iloc[-1]
+            v5 = float(row.get("vol_cc_5d", 0.0) or 0.0)
+            v20 = float(row.get("vol_cc_20d", 0.0) or 0.0)
+            if v20 <= 1e-6 or not np.isfinite(v5) or not np.isfinite(v20):
+                continue
+            vts = float(v5 / v20 - 1.0)
+            ret_5d = float(close[-1] / close[-6] - 1.0)
+            if abs(ret_5d) < 1e-6:
+                continue
+            sign = 1.0 if ret_5d > 0 else -1.0
+            raw[ticker] = vts * sign
+
+        if not raw:
+            return pd.Series(dtype=float, name=self.name)
+        s = pd.Series(raw, dtype=float)
+        std = s.std(ddof=0)
+        if std < 1e-12:
+            return pd.Series(0.0, index=s.index, name=self.name)
+        z = (s - s.mean()) / std
+        return (np.tanh(z / 2.0) * ALPHA_SCALE).rename(self.name)
+
+
+class AlphaVolPredicted(AlphaSource):
+    """VolTransformer prediction → signed directional alpha (follow-up #2-C).
+
+    Hypothesis: VolConviction(IC=0.178 against |return|)이 unsigned multiplier로
+    쓰이는 게 약하지 않은가? cross-sectional rank × sign(recent return)으로
+    signed directional alpha화하여 진짜 5d-return 예측력 측정.
+
+    Construction:
+      vol_rank   = cross-sectional percentile rank of vol_score   ∈ [0, 1]
+      direction  = sign(close[-1] / close[-6] - 1)
+      raw        = (vol_rank - 0.5) × 2 × direction                ∈ [-1, 1]
+      → cross-sectional z-score → tanh(z/2) × ALPHA_SCALE
+
+    Note: same vol_score 입력을 VolConviction(multiplier) 와 이중 활용. 의도된
+    설계 — conviction은 magnitude amplification, alpha는 direction prediction.
+    """
+
+    @property
+    def name(self) -> str:
+        return "vol_predicted"
+
+    def compute(
+        self,
+        ohlcv: pd.DataFrame,
+        vol_scores: pd.DataFrame | None = None,
+        **_: object,
+    ) -> pd.Series:
+        if ohlcv.empty:
+            return pd.Series(dtype=float, name=self.name)
+        if vol_scores is None or len(vol_scores) == 0:
+            return pd.Series(dtype=float, name=self.name)
+        if "ticker" not in vol_scores.columns or "vol_score" not in vol_scores.columns:
+            return pd.Series(dtype=float, name=self.name)
+
+        scores = vol_scores.set_index("ticker")["vol_score"].astype(float)
+        if scores.empty:
+            return pd.Series(dtype=float, name=self.name)
+        rank_pct = scores.rank(pct=True, method="average")  # [0, 1]
+
+        df = ohlcv[["date", "ticker", "close"]].sort_values(["ticker", "date"])
+        raw: dict[str, float] = {}
+        for ticker, group in df.groupby("ticker", sort=False):
+            close = group["close"].to_numpy(dtype=float)
+            if len(close) < 6 or close[-6] <= 0:
+                continue
+            if ticker not in rank_pct.index:
+                continue
+            ret_5d = float(close[-1] / close[-6] - 1.0)
+            if abs(ret_5d) < 1e-6:
+                continue
+            sign = 1.0 if ret_5d > 0 else -1.0
+            raw[ticker] = (float(rank_pct[ticker]) - 0.5) * 2.0 * sign
+
+        if not raw:
+            return pd.Series(dtype=float, name=self.name)
+        s = pd.Series(raw, dtype=float)
+        std = s.std(ddof=0)
+        if std < 1e-12:
+            return pd.Series(0.0, index=s.index, name=self.name)
+        z = (s - s.mean()) / std
+        return (np.tanh(z / 2.0) * ALPHA_SCALE).rename(self.name)
+
+
+# ──────────────────────────────────────────────────────────────
 # Conviction sources
 # ──────────────────────────────────────────────────────────────
 class VolConviction(ConvictionSource):
@@ -207,6 +479,18 @@ class VolConviction(ConvictionSource):
 DEFAULT_DIRECTIONAL: tuple[AlphaSource, ...] = (
     AlphaTrend(),
     AlphaReversion(),
+    AlphaVolumeSurprise(),  # 2026-05-13 promoted: vanilla IC +0.028, caution +0.059
+)
+
+# Experimental tuple — used only by v3/research/test_new_alphas.py for IC
+# measurement. Promotion requires vanilla IC clearing MIN_VANILLA_IC AND
+# robust regime IC profile. vol_term / earnings_proximity / vol_predicted
+# 모두 vanilla 미달 → 보류 상태.
+EXPERIMENTAL_DIRECTIONAL: tuple[AlphaSource, ...] = (
+    AlphaTrend(),
+    AlphaReversion(),
+    AlphaVolumeSurprise(),
+    AlphaVolTermStructure(),
 )
 
 DEFAULT_CONVICTION: tuple[ConvictionSource, ...] = (
@@ -217,9 +501,20 @@ DEFAULT_CONVICTION: tuple[ConvictionSource, ...] = (
 def compute_directional(
     ohlcv: pd.DataFrame,
     sources: tuple[AlphaSource, ...] = DEFAULT_DIRECTIONAL,
+    vol_scores: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Compute all directional alphas. Returns DataFrame indexed by ticker."""
-    cols: dict[str, pd.Series] = {src.name: src.compute(ohlcv) for src in sources}
+    """Compute all directional alphas. Returns DataFrame indexed by ticker.
+
+    vol_scores는 AlphaVolPredicted 같이 VolTransformer 출력이 필요한 알파에만
+    전달됨. 기본 알파(trend, reversion 등)는 무시. None이면 vol_scores 필요
+    알파는 빈 Series 반환.
+    """
+    cols: dict[str, pd.Series] = {}
+    for src in sources:
+        kwargs: dict[str, object] = {}
+        if src.name == "vol_predicted":
+            kwargs["vol_scores"] = vol_scores
+        cols[src.name] = src.compute(ohlcv, **kwargs)
     out = pd.DataFrame(cols)
     out.index.name = "ticker"
 

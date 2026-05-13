@@ -772,3 +772,243 @@ class TestBookOptimizerFlushed:
         rec = json.loads(log_file.read_text(encoding="utf-8").splitlines()[0])
         assert rec["ticker"] == "MELI"
         assert rec["reject_reason"] == "net_edge_low"
+
+
+# ── Bug 13: experimental alpha sources must respect range/empty contracts ──
+#
+# 2026-05-13 follow-up #2 — calibration validation FAIL (top-bottom -0.0001)이
+# OpportunityScorer = trend × reversion × vol_conviction이 5일 수익률 알파라는
+# 가정이 noise임을 폭로함. 후보 알파 두 개(volume_surprise, vol_term)를
+# alpha_sources.py에 추가했으나 IC 검증 전까지 DEFAULT_DIRECTIONAL 미포함.
+# AlphaSource 인터페이스 계약을 깨면 alpha_weight_trainer / compute_directional
+# 가 silent하게 NaN/over-range를 흘려보낼 수 있어 invariant 강제 필요.
+
+class TestExperimentalAlphasContract:
+    """v3/strategy/alpha_sources.py 의 신규 directional alphas는 AlphaSource
+    계약(이름 / 범위 [-ALPHA_SCALE, ALPHA_SCALE] / empty handling)을 따라야
+    한다."""
+
+    @staticmethod
+    def _synth_ohlcv(n_tickers: int = 30, n_days: int = 80, seed: int = 17):
+        """Synthetic OHLCV + vol_cc_*d features for alpha range tests."""
+        import numpy as np
+        import pandas as pd
+        rng = np.random.default_rng(seed)
+        tickers = [f"T{i:03d}" for i in range(n_tickers)]
+        dates = pd.date_range("2026-01-01", periods=n_days, freq="B")
+        rows = []
+        for t in tickers:
+            price = 100.0
+            vol = float(rng.uniform(0.01, 0.03))
+            for d in dates:
+                price *= float(1.0 + rng.normal(0.0005, vol))
+                rows.append({
+                    "date": d, "ticker": t,
+                    "open": price, "high": price * 1.01, "low": price * 0.99,
+                    "close": price, "volume": int(rng.integers(1_000_000, 5_000_000)),
+                })
+        df = pd.DataFrame(rows)
+        # synth vol_cc — annualized rolling std of log returns
+        df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
+        for w in (5, 20):
+            df[f"vol_cc_{w}d"] = (
+                df.groupby("ticker")["close"]
+                .transform(lambda x: np.log(x / x.shift(1))
+                           .rolling(w, min_periods=max(3, w // 2)).std() * np.sqrt(252))
+            )
+        return df
+
+    def test_volume_surprise_in_range(self):
+        from v3.strategy.alpha_sources import AlphaVolumeSurprise, ALPHA_SCALE
+        df = self._synth_ohlcv()
+        out = AlphaVolumeSurprise().compute(df)
+        assert not out.empty
+        assert out.name == "volume_surprise"
+        assert out.min() >= -ALPHA_SCALE - 1e-9
+        assert out.max() <= ALPHA_SCALE + 1e-9
+        import numpy as np
+        assert np.isfinite(out.to_numpy()).all()
+
+    def test_vol_term_in_range(self):
+        from v3.strategy.alpha_sources import AlphaVolTermStructure, ALPHA_SCALE
+        df = self._synth_ohlcv()
+        out = AlphaVolTermStructure().compute(df)
+        assert not out.empty
+        assert out.name == "vol_term"
+        assert out.min() >= -ALPHA_SCALE - 1e-9
+        assert out.max() <= ALPHA_SCALE + 1e-9
+        import numpy as np
+        assert np.isfinite(out.to_numpy()).all()
+
+    def test_alphas_handle_empty(self):
+        import pandas as pd
+        from v3.strategy.alpha_sources import AlphaVolumeSurprise, AlphaVolTermStructure
+        empty = pd.DataFrame()
+        assert AlphaVolumeSurprise().compute(empty).empty
+        assert AlphaVolTermStructure().compute(empty).empty
+
+    def test_vol_term_requires_vol_cc_columns(self):
+        """vol_cc_5d/20d 누락 시 빈 Series 반환 (KeyError 금지)."""
+        import pandas as pd
+        from v3.strategy.alpha_sources import AlphaVolTermStructure
+        df = pd.DataFrame({"date": [], "ticker": [], "close": []})
+        assert AlphaVolTermStructure().compute(df).empty
+
+    def test_experimental_tuple_includes_new_alphas(self):
+        """EXPERIMENTAL_DIRECTIONAL은 기존 trend/reversion + 신규 2개 포함."""
+        from v3.strategy.alpha_sources import EXPERIMENTAL_DIRECTIONAL
+        names = {s.name for s in EXPERIMENTAL_DIRECTIONAL}
+        assert names == {"trend", "reversion", "volume_surprise", "vol_term"}
+
+    def test_ic_to_weights_floor_and_dampening(self):
+        """ic_to_weights는 모든 알파에 min_weight floor 부여, winner도 cap.
+
+        Before (2026-05-13 이전): single marginal alpha(IC 0.028)가
+        winner-take-most로 100% 가져감.
+        After: floor 0.10 + sqrt smoothing → winner는 60~80%에서 cap.
+        """
+        from v3.backtest.alpha_weight_trainer import AlphaWeightTrainer
+        # __init__ 우회 — ic_to_weights는 self.cfg 등 안 씀
+        trainer = AlphaWeightTrainer.__new__(AlphaWeightTrainer)
+        # Single dominant alpha, two weak (winner-take-most 시나리오)
+        ic = {"trend": 0.001, "reversion": -0.005, "volume_surprise": 0.05}
+        weights = trainer.ic_to_weights(ic)
+        # min_weight 0.10 floor invariant
+        for alpha, w in weights.items():
+            assert w >= 0.10 - 1e-4, (
+                f"{alpha} weight {w} < min_weight 0.10 — floor invariant 위반"
+            )
+        # Winner도 0.90 미만 (floor 0.10 × 3 = 0.30, free 0.70 → 최대 0.80 정도)
+        assert max(weights.values()) <= 0.81 + 1e-4, (
+            f"winner weight {max(weights.values())} exceeds dampened cap — "
+            f"sqrt smoothing 또는 floor 적용 실패"
+        )
+        # 합 = 1.0
+        assert abs(sum(weights.values()) - 1.0) < 1e-3
+
+    def test_ic_to_weights_uniform_fallback_when_all_fail(self):
+        """모든 알파가 vanilla IC threshold 미달이면 uniform fallback."""
+        from v3.backtest.alpha_weight_trainer import AlphaWeightTrainer
+        trainer = AlphaWeightTrainer.__new__(AlphaWeightTrainer)
+        ic = {"trend": 0.005, "reversion": -0.003, "volume_surprise": 0.012}
+        weights = trainer.ic_to_weights(ic)
+        n = len(ic)
+        for w in weights.values():
+            assert abs(w - 1.0 / n) < 1e-3
+
+    def test_default_directional_promoted_set(self):
+        """production DEFAULT_DIRECTIONAL는 IC 검증 통과한 알파만 포함.
+
+        2026-05-13 follow-up #2: volume_surprise vanilla IC +0.028 통과로
+        promoted. vol_term / earnings_proximity / vol_predicted는 vanilla 미달.
+        DEFAULT_DIRECTIONAL이 임의 확장되지 않도록 정확한 멤버 enforce.
+        """
+        from v3.strategy.alpha_sources import DEFAULT_DIRECTIONAL
+        names = {s.name for s in DEFAULT_DIRECTIONAL}
+        assert names == {"trend", "reversion", "volume_surprise"}, (
+            f"DEFAULT_DIRECTIONAL changed unexpectedly: {names}. "
+            f"신규 알파 promotion은 v3/research/test_new_alphas.py IC 검증 후"
+            f" 본 invariant 갱신과 함께만 가능."
+        )
+
+    def test_earnings_proximity_in_range(self):
+        """AlphaEarningsProximity 출력 범위 + recent earnings에 큰 magnitude."""
+        import numpy as np
+        import pandas as pd
+        from v3.strategy.alpha_sources import AlphaEarningsProximity, ALPHA_SCALE
+        df = self._synth_ohlcv()
+        as_of = pd.Timestamp(df["date"].max()).normalize()
+        # half tickers have earnings in 3 days, half in 30 days
+        tickers = sorted(df["ticker"].unique())
+        earnings_map: dict[str, list[pd.Timestamp]] = {}
+        for i, t in enumerate(tickers):
+            days = 3 if i % 2 == 0 else 30
+            earnings_map[t] = [as_of + pd.Timedelta(days=days)]
+        out = AlphaEarningsProximity(earnings_map, decay_days=7.0).compute(df)
+        assert not out.empty
+        assert out.name == "earnings_proximity"
+        assert out.min() >= -ALPHA_SCALE - 1e-9
+        assert out.max() <= ALPHA_SCALE + 1e-9
+        assert np.isfinite(out.to_numpy()).all()
+
+    def test_earnings_proximity_empty_dates(self):
+        """earnings_dates 비었거나 모두 past이면 빈 Series 반환 (KeyError 금지)."""
+        import pandas as pd
+        from v3.strategy.alpha_sources import AlphaEarningsProximity
+        df = self._synth_ohlcv()
+        out = AlphaEarningsProximity({}).compute(df)
+        assert out.empty
+        # 모두 과거 dates → 미래 없음 → 빈 Series
+        past_only = {
+            t: [pd.Timestamp("2020-01-01")] for t in df["ticker"].unique()[:5]
+        }
+        out = AlphaEarningsProximity(past_only).compute(df)
+        assert out.empty
+
+    def test_vol_predicted_in_range_and_requires_vol_scores(self):
+        """AlphaVolPredicted: vol_scores 없으면 empty, 있으면 [-ALPHA_SCALE, ALPHA_SCALE]."""
+        import numpy as np
+        import pandas as pd
+        from v3.strategy.alpha_sources import AlphaVolPredicted, ALPHA_SCALE
+        df = self._synth_ohlcv()
+        # no vol_scores → empty
+        assert AlphaVolPredicted().compute(df).empty
+        # with vol_scores
+        tickers = sorted(df["ticker"].unique())
+        vs = pd.DataFrame({
+            "ticker": tickers,
+            "vol_score": np.linspace(0.1, 0.9, len(tickers)),
+        })
+        out = AlphaVolPredicted().compute(df, vol_scores=vs)
+        assert not out.empty
+        assert out.name == "vol_predicted"
+        assert out.min() >= -ALPHA_SCALE - 1e-9
+        assert out.max() <= ALPHA_SCALE + 1e-9
+        assert np.isfinite(out.to_numpy()).all()
+
+    def test_compute_directional_forwards_vol_scores(self):
+        """compute_directional이 vol_predicted alpha에는 vol_scores 전달.
+        다른 알파는 영향 없음 (kwargs default None)."""
+        import numpy as np
+        import pandas as pd
+        from v3.strategy.alpha_sources import (
+            AlphaTrend, AlphaVolPredicted, compute_directional,
+        )
+        df = self._synth_ohlcv()
+        tickers = sorted(df["ticker"].unique())
+        vs = pd.DataFrame({
+            "ticker": tickers,
+            "vol_score": np.linspace(0.1, 0.9, len(tickers)),
+        })
+        out = compute_directional(
+            df,
+            sources=(AlphaTrend(), AlphaVolPredicted()),
+            vol_scores=vs,
+        )
+        # trend, vol_predicted 둘 다 컬럼 존재. vol_predicted는 vs 받았으므로 비어있지 않아야.
+        assert "trend" in out.columns
+        assert "vol_predicted" in out.columns
+        assert out["vol_predicted"].notna().any()
+
+    def test_earnings_proximity_decay_invariant(self):
+        """가까운 earnings 종목이 먼 종목보다 |signal| 커야 한다 (decay 작동)."""
+        import pandas as pd
+        from v3.strategy.alpha_sources import AlphaEarningsProximity
+        df = self._synth_ohlcv()
+        as_of = pd.Timestamp(df["date"].max()).normalize()
+        tickers = sorted(df["ticker"].unique())
+        # First 5 tickers: 2 days away; next 5: 25 days away
+        near, far = tickers[:5], tickers[5:10]
+        earnings_map: dict[str, list[pd.Timestamp]] = {}
+        for t in near:
+            earnings_map[t] = [as_of + pd.Timedelta(days=2)]
+        for t in far:
+            earnings_map[t] = [as_of + pd.Timedelta(days=25)]
+        out = AlphaEarningsProximity(earnings_map, decay_days=7.0).compute(df)
+        if not out.empty:
+            near_abs = out.reindex(near).abs().mean()
+            far_abs = out.reindex(far).abs().mean()
+            assert near_abs > far_abs, (
+                f"decay invariant violated: near |alpha| {near_abs:.4f} "
+                f"<= far |alpha| {far_abs:.4f}"
+            )

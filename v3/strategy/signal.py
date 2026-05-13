@@ -119,7 +119,11 @@ class SignalGenerator:
             )
 
         # 1+2. Compute alphas + conviction
-        directional = compute_directional(ohlcv, sources=self.directional_sources)
+        # vol_scores forwarded so vol_scores-consuming alphas (e.g.
+        # AlphaVolPredicted future promotion) work without silent empty Series.
+        directional = compute_directional(
+            ohlcv, sources=self.directional_sources, vol_scores=vol_scores,
+        )
         conviction = compute_conviction(
             ohlcv, vol_scores=vol_scores, sources=self.conviction_sources,
         )
