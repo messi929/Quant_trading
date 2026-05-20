@@ -1,21 +1,26 @@
 # 후속 과제 (Follow-ups)
 
 CLAUDE.md 정책 본문에서 분리된 active tracking. 페르소나 정합성 점검(2026-04-21) +
-Phase 25.1 옵션 C 적용 후(2026-05-03) 잔존 항목.
+Phase 25.1 옵션 C 적용 후(2026-05-03) 잔존 항목 + V3.3 부분 활성 후 신규 항목
+(2026-05-13).
 
 **철칙**: 동시 다발 수정 금지. 한 번에 한 가지 변경, 1~2주 검증, 다음.
 
 ---
 
-## 페르소나 원칙 점수 (2026-04-21 기준)
+## 페르소나 원칙 점수 (2026-05-13 update)
 
 "확신 있을 때만, 크게, 빠르게" 3대 원칙 기준 시스템 정합성 평가.
 
-| 원칙 | 점수 | 상태 |
-|------|------|------|
-| 1. 확신 있을 때만 | 5/10 | 🔄 관찰 대상 |
-| 2. 크게 | 3/10 | 🔄 관찰 대상 (가장 심각) |
-| 3. 빠르게 | 8/10 | ✅ 현재 정책 적절 |
+| 원칙 | 4/21 baseline | 5/13 (V3.3 부분 활성 후) | 상태 |
+|------|:-------------:|:-----------------------:|------|
+| 1. 확신 있을 때만 | 5/10 | 5/10 (`volume_surprise` +0.028 marginal) | 🔄 추가 알파 후보 탐색 |
+| 2. 크게 | 3/10 | **7/10** (ABNB 자본 38% 실증, 5/13) | ✅ sizing 재해석 완료 |
+| 3. 빠르게 | 8/10 | 8/10 (ExitThesis 16h staleness 유지) | ✅ Phase 3 ON 유지 |
+
+**5/13 핵심 lever**: 원칙 ②"크게"가 3/10 → 7/10으로 4점 점프. Edge layer 재활성
+또는 추가 알파 없이도 `position_scale` 의미 재정의(곱셈 → 포트폴리오 노출 한도)
+만으로 6.5배 사이즈 확보. 페르소나 진단의 본질이 sizing 구조에 있었음.
 
 ### 원칙 3 "빠르게" 재해석 — 종결 (수정 없음)
 
@@ -435,3 +440,157 @@ ExitRules trigger 충돌 케이스 발생하면 A로 진행.
 - Calibration FAIL 무시 후 게이트 완화 — V2.2 교훈 (게이트 완화 → -6.91%)
 - monitor 루프에 ExitThesis 통합 + 타 변경 동시 — 한 번에 하나
 - "어차피 paper니까" 안전장치 비활성
+
+---
+
+## V3.3 부분 활성화 후 추적 (2026-05-13 ~)
+
+5/11~12 4 거래일 entries=0 silent failure 분석 + 5/13 4 commits 안정화 이후
+잔존 추적 항목. 자세한 narrative는 `docs/CHANGELOG.md` "V3.3 부분 활성화 +
+sizing 재해석".
+
+### ✅ 5/13 작업으로 closed된 항목
+
+| 항목 | 해결 방식 | 검증 |
+|------|----------|------|
+| Conditional Veto 16h staleness | Phase 3 `exit_thesis` ON 유지 → ExitThesisEngine 16h + signal_refresh 적용 | `test_exit_thesis.py` invariant |
+| Calibration validation FAIL 추적 | Phase 2 OFF → Edge layer 무력화 차단. 데이터 진단으로 **OpportunityScorer가 5d return alpha 아님 확정** (vol_predicted IC 0.007) | `experimental_alpha_ic_20260513_*.json` |
+| 사이저 floor 곱셈 무력화 | `position_scale` 의미 재정의 (5/13 commit `5ffcae6`) | `test_regression.py` Bug 11 |
+| `flush_diagnostics` 호출 누락 | `LivePipeline.run_session` + `BacktestEngine.run` try/finally (5/13 commit `fdb9eb0`) | `test_regression.py` Bug 12 (AST enforcement) |
+| 원칙 ②"크게" 3/10 | sizing 재해석으로 7/10 (ABNB 자본 38% 실증) | paper 5/13 09:30 KR 세션 |
+
+### 1순위 — Edge layer 재활성 조건 (현재 보류)
+
+Phase 2 (`edge_calibrator / edge_engine / edge_tier / allocation`) + Phase 4
+(`pyramid / rotation`) OFF 상태. 재활성 가능 조건:
+
+1. **Calibration top-bottom 의미값 확보** — 현재 −0.0001 (noise). 목표 > 0.01
+   (decile 9 평균 return − decile 0 평균 ≥ 1%).
+2. **`validate_edge.py` PASS** — out-of-sample window에서 in-sample IC 일관성
+   유지 확인.
+3. **paper 1~2주 검증** — 부분 활성 환경에서 5/13 sizing 효과 누적 (사이즈
+   확대가 sharpe / 손익비 유지하는지).
+
+위 3개 동시 만족 시 Phase 2/4 단계적 ON 검토. 단계 순서:
+- A. `edge_calibrator` + `edge_engine` ON (Edge tier 분류 활성, allocation은 OFF)
+- B. paper 1주 후 `edge_tier` ON
+- C. paper 1주 후 `allocation` ON (sizing 가중치 override 시작)
+- D. paper 2주 후 `pyramid` + `rotation` ON
+
+선결 조건이 calibration 품질이라 단기 (1~2개월) 내 충족 어려움. **OpportunityScorer
+자체가 5d return alpha 아니라는 데이터적 결론** — 단순 calibration 재학습으로
+해결 안 될 수 있음. 새 알파 입력 필요 (아래 2순위).
+
+### 2순위 — 추가 directional alpha 후보 promotion 조건
+
+5/13 IC 실험에서 4 candidate 측정:
+
+| Alpha | Vanilla IC | 최대 regime IC | 현재 상태 |
+|-------|----------:|--------------:|----------|
+| `volume_surprise` ✅ | +0.028 | caution +0.059 | DEFAULT 적용 |
+| `vol_term` | +0.019 | caution +0.041 | EXPERIMENTAL 보류 |
+| `earnings_proximity` | +0.012 | strong_bull +0.114 (n=99) / neutral +0.027 | EXPERIMENTAL 보류 |
+| `vol_predicted` | +0.007 | strong_bull +0.061 (n=99) | EXPERIMENTAL 보류 |
+
+**Promotion 조건** (다음 검토 시점):
+- Vanilla IC ≥ MIN_VANILLA_IC (0.02) — 1회 IC 측정 통과
+- 2~3개월 추가 panel data 누적 후 IC 시계열 robust 확인 — single point IC는
+  noise일 수 있음
+- `test_new_alphas.py` 재실행으로 verdict 안정성 확인
+
+`vol_term`이 가장 가까움 (vanilla 0.019, threshold 0.001 미달). 6/13 panel
+재측정 시 통과 가능성 있음.
+
+### 3순위 — `volume_surprise` 실효성 검증 (5/13~5/27)
+
+DEFAULT 추가됐으나 vanilla IC 0.028은 marginal. paper에서 실제 효과가
+나타나는지 1~2주 누적 측정.
+
+**관찰 포인트**:
+- caution regime 진입 시 `volume_surprise weight 0.60` 적용 — 종목 선택 패턴
+  변화 (이전: trend/reversion uniform 0.5 → 신규: volume-driven)
+- 진입 종목의 거래량 ratio (vs 20d MA) 분포
+- 진입 후 5일 return 분포 — IC 0.028 effect size 실측
+
+**비교 baseline**: 4/11~5/8 paper (V3.2.1 sizing 곱셈 + trend/reversion only)
+승률 71%·손익비 12:1. 5/13~5/27 (V3.3 부분 활성 + volume_surprise) 동일/유사
+승률·손익비 유지 + 사이즈 6.5배 효과로 누적 수익률 5~6배 가능성 검증.
+
+### 4순위 — OpportunityScorer 자체 재설계 (장기, 6/1 이후)
+
+5/13 follow-up #2 연구가 확정한 진단:
+- 기존 trend/reversion 둘 다 vanilla IC FAIL (+0.003 / −0.001)
+- vol_predicted (VolConviction을 signed alpha로 변환) IC 0.007 — VolTransformer
+  신호는 magnitude amplifier이지 directional alpha 아님
+- 4 candidate 중 volume_surprise만 marginal pass — 단일 알파로는 IC 0.028이
+  ceiling 가능성
+
+**근본 한계 가설**: OpportunityScorer 수식 (`direction × conviction`)이 단일
+종목 cross-sectional signed return을 예측하기에 본질적으로 부족. 검토할 방향:
+
+A. **Multi-horizon alpha** — 1d / 3d / 5d / 10d 별 alpha 측정 → 가장 강한
+horizon으로 OpportunityScorer 재학습 (현재 5d 고정)
+B. **Time-series momentum** — cross-sectional 대신 ticker-self time-series IC
+(현재 cross-sectional rank IC만 측정)
+C. **External data alpha** — sentiment / options flow / institutional ownership.
+가장 비용 큼. Tier C 후보 (Follow-up #2 옵션 4).
+D. **VolConviction을 OpportunityScorer 곱셈에서 분리** — conviction을 sizer
+input으로만 사용, opportunity = direction만으로 정의 (수식 단순화)
+
+이 항목은 paper 1~2주 누적 + 6/1 calibration 재시도 결과 본 후에야 의미.
+
+### 5순위 — `vol_term` 등 EXPERIMENTAL alpha 활용도
+
+`vol_term`은 caution regime에서 +0.041로 보조 가능. 그러나 vanilla 미달 →
+DEFAULT 추가 보류. 다음 옵션:
+- 6월 panel 재측정 후 vanilla 통과하면 DEFAULT 추가
+- regime-conditional weight 직접 부여 (`alpha_weights.json` 수동 편집) —
+  단 자동 cron이 덮어쓰니 의미 없음
+- `OpportunityScorer` 자체에 conditional alpha (regime별로 다른 알파 set
+  사용) 도입 — 정책 변경 큼
+
+대기 상태.
+
+### 6순위 — `compute_directional` `vol_scores` forwarding latent trap
+
+5/13 commit `ebdecc6` v3-evaluator 발견: `signal.py:122`에서 `vol_scores`를
+forward 안 했음. 같은 commit에서 fix됨 (compute_directional에 vol_scores
+kwarg 전달). 단 미래에 `AlphaVolPredicted` 같이 vol_scores 의존 알파가
+DEFAULT_DIRECTIONAL에 promote되면 silent empty Series 위험. 현재 fix로 안전.
+
+확인됨, 액션 없음.
+
+### 7순위 — `live_pipeline` hold_days `+1` 미세 버그 — ✅ 해소 (5/21, `31cb85f`)
+
+5/13 evaluator pre-existing 발견 (commit `4ced695` 도입): `_check_triggers_v33`
+가 hold_days = `int(pos.get("hold_days", 0)) + 1` (counter 증가)로 계산하고
+있는데 `_monitor_v33` / `executor.py:178` 는 calendar diff 사용. 트리거 1일
+일찍 fire 가능 (예: day-4 profit_take boundary 도달).
+
+영향: Phase 2/4 OFF라 dormant이었으나 Edge layer 재활성 시 pyramid/rotation/
+exit_thesis 타이밍 오류 유발 가능.
+
+**해소 (`31cb85f`, 5/21)**: 3곳(`_check_triggers_v33` + `_convert_to_position_states`
++ `_convert_one_position_state`)이 V3.3 BookOptimizer 입력으로 `hold_days + 1`을
+넘기던 것을, 공유 staticmethod `_hold_days(pos, today)` (entry_date calendar diff,
+canonical exit path와 동일)로 통일. 회귀 `TestV33HoldDaysCalendarBasis` 6건. Edge
+layer 재활성 선결 조건(1순위)에서 제거됨.
+
+---
+
+## 다음 의사결정 게이트 (2026-05-27 즈음)
+
+5/13 부분 활성 + sizing 재해석 + volume_surprise promotion 2주 paper 검증
+결과로 다음 단계 결정:
+
+| 측정 | 5/13 시점 baseline | 5/27 target | 미달 시 조치 |
+|------|-------------------|-------------|--------------|
+| 종목당 weight | 0.06 (이전) → 0.15~0.40 (현재) | 평균 ≥ 0.20 | sizing 추가 조정 |
+| 진입 빈도 | 4/11~5/8 BUY 7회 / 한 달 | 5/13~5/27 BUY ≥ 4회 / 2주 | regime 트리거 점검 |
+| 승률 | 71% (4월) | ≥ 65% | volume_surprise 효과 평가 |
+| 손익비 | 12:1 (4월) | ≥ 2:1 | conditional veto 작동 점검 |
+| MDD | < 4% (BT) | ≤ 5% | 사이즈 다시 조절 |
+| 누적 수익률 | +1.4% (4월) | ≥ +3% (사이즈 6.5배 효과 일부 발현) | 진단 |
+
+미달 시 단계적 rollback (`docs/V3.3_OPERATIONS.md` §4). 자동 rollback
+(`v33-rollback-check.timer`) 1주 PnL −2% 시 features OFF 안전망 작동.
