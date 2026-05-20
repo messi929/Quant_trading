@@ -48,18 +48,21 @@ class MacroCollector:
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.history_years = history_years
-        self.end_date = datetime.now()
-        self.start_date = self.end_date - timedelta(days=history_years * 365)
+        # NOTE: do NOT cache `datetime.now()` here — see OHLCVCollector. The
+        # long-running daemon would freeze the macro data clock at boot time,
+        # staling regime detection (2026-05-20 bug). `end`/`start` are computed
+        # fresh per collect() call.
         self.fred_api_key = fred_api_key or os.getenv("FRED_API_KEY", "")
 
         self.out_path = self.save_dir / "macro.parquet"
 
     def collect(self, incremental_days: int | None = None) -> pd.DataFrame:
         """Collect all macro series. Returns wide DataFrame indexed by date."""
+        end = datetime.now()
         start = (
-            datetime.now() - timedelta(days=incremental_days)
+            end - timedelta(days=incremental_days)
             if incremental_days
-            else self.start_date
+            else end - timedelta(days=self.history_years * 365)
         )
 
         frames: list[pd.Series] = []
@@ -67,7 +70,7 @@ class MacroCollector:
         # yfinance series
         for name, ticker in YFINANCE_SERIES.items():
             try:
-                s = self._fetch_yfinance(ticker, start)
+                s = self._fetch_yfinance(ticker, start, end)
                 if s is not None and len(s) > 0:
                     s.name = name
                     frames.append(s)
@@ -81,7 +84,7 @@ class MacroCollector:
         if self.fred_api_key:
             for name, sid in FRED_SERIES.items():
                 try:
-                    s = self._fetch_fred(sid, start)
+                    s = self._fetch_fred(sid, start, end)
                     if s is not None and len(s) > 0:
                         s.name = name
                         frames.append(s)
@@ -120,12 +123,14 @@ class MacroCollector:
             return df
         return None
 
-    def _fetch_yfinance(self, ticker: str, start: datetime) -> pd.Series | None:
+    def _fetch_yfinance(
+        self, ticker: str, start: datetime, end: datetime
+    ) -> pd.Series | None:
         """Fetch single yfinance series, return close price."""
         data = yf.download(
             ticker,
             start=start.strftime("%Y-%m-%d"),
-            end=self.end_date.strftime("%Y-%m-%d"),
+            end=end.strftime("%Y-%m-%d"),
             auto_adjust=True,
             progress=False,
             threads=False,
@@ -144,14 +149,16 @@ class MacroCollector:
         close.index = pd.DatetimeIndex(close.index).tz_localize(None).normalize()
         return close.astype(float)
 
-    def _fetch_fred(self, series_id: str, start: datetime) -> pd.Series | None:
+    def _fetch_fred(
+        self, series_id: str, start: datetime, end: datetime
+    ) -> pd.Series | None:
         """Fetch single FRED series via REST API."""
         params = {
             "series_id": series_id,
             "api_key": self.fred_api_key,
             "file_type": "json",
             "observation_start": start.strftime("%Y-%m-%d"),
-            "observation_end": self.end_date.strftime("%Y-%m-%d"),
+            "observation_end": end.strftime("%Y-%m-%d"),
         }
         r = requests.get(self.FRED_BASE, params=params, timeout=15)
         r.raise_for_status()

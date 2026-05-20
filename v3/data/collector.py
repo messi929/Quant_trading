@@ -23,8 +23,10 @@ class OHLCVCollector:
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.history_years = history_years
-        self.end_date = datetime.now()
-        self.start_date = self.end_date - timedelta(days=history_years * 365)
+        # NOTE: do NOT cache `datetime.now()` here. The live daemon constructs
+        # this collector once at startup; caching end_date freezes the data
+        # clock at boot time (2026-05-20 bug → repeated stale MU entries).
+        # `end`/`start` are computed fresh per collect() call below.
 
     def collect(
         self,
@@ -40,10 +42,11 @@ class OHLCVCollector:
         Returns:
             Combined DataFrame with columns: date, open, high, low, close, volume, ticker, market.
         """
+        end = datetime.now()
         if incremental_days:
-            start = datetime.now() - timedelta(days=incremental_days)
+            start = end - timedelta(days=incremental_days)
         else:
-            start = self.start_date
+            start = end - timedelta(days=self.history_years * 365)
 
         all_frames = []
 
@@ -53,9 +56,9 @@ class OHLCVCollector:
                 continue
 
             logger.info(f"Collecting {market}: {len(tickers)} tickers "
-                         f"({start.strftime('%Y-%m-%d')} ~ {self.end_date.strftime('%Y-%m-%d')})")
+                         f"({start.strftime('%Y-%m-%d')} ~ {end.strftime('%Y-%m-%d')})")
 
-            df = self._download_batch(tickers, market, start)
+            df = self._download_batch(tickers, market, start, end)
             if df is not None and len(df) > 0:
                 all_frames.append(df)
 
@@ -79,6 +82,7 @@ class OHLCVCollector:
         tickers: list[str],
         market: str,
         start: datetime,
+        end: datetime,
         batch_size: int = 50,
     ) -> pd.DataFrame | None:
         """Download OHLCV in batches via yfinance."""
@@ -93,7 +97,7 @@ class OHLCVCollector:
                 data = yf.download(
                     batch,
                     start=start.strftime("%Y-%m-%d"),
-                    end=self.end_date.strftime("%Y-%m-%d"),
+                    end=end.strftime("%Y-%m-%d"),
                     auto_adjust=True,
                     progress=False,
                     threads=True,

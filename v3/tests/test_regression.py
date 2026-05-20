@@ -1012,3 +1012,103 @@ class TestExperimentalAlphasContract:
                 f"decay invariant violated: near |alpha| {near_abs:.4f} "
                 f"<= far |alpha| {far_abs:.4f}"
             )
+
+
+# ── Bug (2026-05-20): collector end_date frozen at __init__ ──
+#
+# OHLCVCollector / MacroCollector stored `end_date = datetime.now()` in
+# __init__. The live daemon constructs the pipeline (and thus the collectors)
+# ONCE at startup, so every subsequent session downloaded data with a frozen
+# `end` — the daemon's data clock stopped at boot time (~5/13). With the start
+# advancing (datetime.now() - incremental_days) but the end frozen, signals were
+# computed on a 7-day-stale snapshot. On 5/13 MU was at its parabolic peak
+# (#1 momentum + volume_surprise), so the daemon re-bought MU every session
+# (804→776→699) while MU had actually rolled over. Invariant: the download `end`
+# must reflect the time of the collect() call, not construction time.
+
+class TestCollectorEndDateFreshness:
+    """Collectors must recompute `end` per collect() call, not cache it at
+    __init__, or a long-running daemon freezes its data clock."""
+
+    class _StubUniverse:
+        markets = ["NASDAQ"]
+
+        def build(self):  # pragma: no cover - not called by collect()
+            pass
+
+        def ticker_list(self, market):
+            return ["AAA", "BBB"]
+
+    @staticmethod
+    def _fake_clock(initial):
+        """Returns (FakeDatetime, clock_dict). Mutate clock['t'] to advance."""
+        from datetime import datetime as _real_dt
+        clock = {"t": initial}
+
+        class FakeDatetime:
+            @staticmethod
+            def now():
+                return clock["t"]
+
+            # passthrough so any other datetime use in the module still works
+            @staticmethod
+            def strptime(*a, **k):
+                return _real_dt.strptime(*a, **k)
+
+        return FakeDatetime, clock
+
+    def test_ohlcv_end_date_follows_collect_time(self, tmp_path, monkeypatch):
+        from datetime import datetime as real_dt
+        import pandas as pd
+        import v3.data.collector as cmod
+
+        FakeDatetime, clock = self._fake_clock(real_dt(2026, 5, 13, 9, 0, 0))
+        monkeypatch.setattr(cmod, "datetime", FakeDatetime)
+
+        captured: dict[str, str] = {}
+
+        def fake_download(tickers, **kwargs):
+            captured["start"] = kwargs.get("start")
+            captured["end"] = kwargs.get("end")
+            return pd.DataFrame()  # empty → batch yields no rows, no parquet write
+
+        monkeypatch.setattr(cmod.yf, "download", fake_download)
+
+        collector = cmod.OHLCVCollector(save_dir=str(tmp_path))
+        # Daemon keeps running; a week passes before the next session.
+        clock["t"] = real_dt(2026, 5, 20, 9, 30, 0)
+        collector.collect(self._StubUniverse(), incremental_days=10)
+
+        assert captured.get("end") == "2026-05-20", (
+            f"OHLCV download end={captured.get('end')} — expected fresh "
+            f"2026-05-20. end_date frozen at construction → daemon data clock "
+            f"stale (root cause of repeated MU entry, 2026-05-20)."
+        )
+        # start should also be fresh: 2026-05-20 - 10d
+        assert captured.get("start") == "2026-05-10"
+
+    def test_macro_end_date_follows_collect_time(self, tmp_path, monkeypatch):
+        from datetime import datetime as real_dt
+        import pandas as pd
+        import v3.data.macro_collector as mmod
+
+        FakeDatetime, clock = self._fake_clock(real_dt(2026, 5, 13, 9, 0, 0))
+        monkeypatch.setattr(mmod, "datetime", FakeDatetime)
+
+        captured: dict[str, str] = {}
+
+        def fake_download(ticker, **kwargs):
+            captured.setdefault("end", kwargs.get("end"))
+            return pd.DataFrame()  # empty → no frames, no parquet write
+
+        monkeypatch.setattr(mmod.yf, "download", fake_download)
+
+        # fred_api_key="" → FRED branch skipped, only yfinance path exercised
+        collector = mmod.MacroCollector(save_dir=str(tmp_path), fred_api_key="")
+        clock["t"] = real_dt(2026, 5, 20, 9, 30, 0)
+        collector.collect(incremental_days=10)
+
+        assert captured.get("end") == "2026-05-20", (
+            f"Macro download end={captured.get('end')} — expected fresh "
+            f"2026-05-20. Frozen end_date staled the regime macro inputs."
+        )
