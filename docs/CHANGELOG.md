@@ -18,6 +18,8 @@ CLAUDE.md에서 분리된 Phase별 이력. 운영 지침 자체는 CLAUDE.md, �
 - [Phase 25.2 — Sizer floor 0.05→0.15 (2026-05-07)](#phase-252--sizer-floor-005015-2026-05-07)
 - [Phase 26 (V3.3) — Profitability Engine (2026-05-09)](#phase-26-v33--profitability-engine-2026-05-09)
 - [V3.3 전체 활성화 (2026-05-10)](#v33-전체-활성화-2026-05-10)
+- [V3.3 부분 활성화 + sizing 재해석 (2026-05-13)](#v33-부분-활성화--sizing-재해석-2026-05-13)
+- [데이터 동결 버그 fix + cooldown/hold_days 정합 (2026-05-20~21)](#데이터-동결-버그-fix--cooldownhold_days-정합-2026-05-20-21)
 
 ---
 
@@ -1616,3 +1618,88 @@ ssh root@77.42.78.9 "ls -dt /opt/quant_v33_backup_* | head -1"
 - Edge layer 재활성: calibration 품질 개선 + validate_edge PASS 이후
 - 추가 알파 promotion: `vol_term/earnings_proximity/vol_predicted` IC
   시계열 robust 확인 후 (현재 vanilla 미달)
+
+---
+
+## 데이터 동결 버그 fix + cooldown/hold_days 정합 (2026-05-20~21)
+
+5/13 부분 활성화 후 paper 관찰 중 발견한 **데이터 시계 동결 버그**와, 그
+과정에서 함께 정리한 안전망 2건. 5/13~5/20 paper 손실(-1.15%)은 전략 실패가
+아니라 이 버그에 귀속됨 — paper 검증 시계는 5/20부터 재시작.
+
+### 발단 — MU 5회 반복 매수
+
+5/13~5/20 paper에서 3 round-trip 전부 손실, MU가 5/14·5/15·5/20 반복 매수됨
+(체결가 804→776→699, 떨어지는 칼). "근거 있는 진입인가" 검증 요청.
+
+| 일자 | 종목 | 진입자본 | PnL |
+|------|------|---------:|------:|
+| 5/13 | ABNB | 37.8M (자본 38%) | −326,941 (−0.86%) |
+| 5/14 | MU | 14.6M | −120,977 (−0.82%) |
+| 5/15 | MU | 14.1M | −706,044 (−4.98%) |
+| 5/20 | MU | 14.7M | 청산 +206,646 (+1.42%) |
+
+### 진단 — collector `end_date` 동결
+
+MU 알파 분해를 신선 데이터로 재구성한 결과 **상충**:
+
+| | 5/13 동결 스냅샷 (daemon이 본 것) | 5/19 신선 데이터 (실제) |
+|---|---|---|
+| volume_surprise (w=0.60) | +0.069 (급등+대량) | −0.048 (하락 반영, 부호반전) |
+| conviction(vol) | 0.909 | 0.576 |
+| opportunity | **+0.0551 → rank 1/99 PASS** | **−0.0053 → rank 65/99 FAIL** |
+
+로그 결정타 — collect 윈도우 종료일이 동결:
+
+```
+5/20 09:30 | Collecting NASDAQ (2026-05-10 ~ 2026-05-13)   ← end가 5/13 고정
+5/19 23:40 | Collecting NASDAQ (2026-05-09 ~ 2026-05-13)   ← 동일
+```
+
+근본 원인: `OHLCVCollector` / `MacroCollector`가 `__init__`에서
+`end_date = datetime.now()`를 캐시. 라이브 데몬은 시작 시 파이프라인(→collector)을
+**1회만** 생성하므로 데이터 종료일이 기동 시각(≈5/13, MU 파라볼릭 천정 = 모멘텀 #1)에
+동결. 시작일은 `now()-incremental`로 전진하나 종료일이 고정 → 매 세션 5/13 천정
+스냅샷으로 신호 계산 → MU 매수, 체결가만 realtime. **알파 로직 자체는 건전** —
+신선 데이터를 주면 MU를 정확히 거부.
+
+### 수정 3건 (테스트 선행 → v3-evaluator clean → 배포·재시작)
+
+**A. collector end_date fresh 계산 (commit `05b6b5e`)** — active 버그
+- `collect()`에서 `end = datetime.now()` 매 호출 재계산 후 `_download_batch` /
+  `_fetch_yfinance` / `_fetch_fred`에 인자로 전달. `__init__` 캐시 제거.
+- macro_collector도 동일 패턴 (regime macro도 동결됐었음).
+- 회귀 `TestCollectorEndDateFreshness` 2건 (download end가 collect 시점 기준인지).
+- 배포 후 데몬 재시작 필요 (메모리 frozen 갱신).
+
+**B. cooldown 거래일 기준 (commit `ff24723`)** — latent 보강
+- `is_cooled_down`가 calendar day window를 써서 주말이 손실을 창 밖으로 누락.
+  MU가 Thu 5/14 + Fri 5/15 연패했으나 Wed 5/20엔 5/14가 6 calendar day 전이라
+  1건만 카운트 → 재진입 허용.
+- `np.busday_count`로 `[loss, cur)` 거래일 계산, `0 ≤ n < COOLDOWN_DAYS`.
+  malformed date는 warning 후 skip.
+- 회귀 `TestCooldownTradingDayBasis` 3건.
+
+**C. V3.3 holding_days 정합 (commit `31cb85f`)** — dormant 선제
+- `_check_triggers_v33` + `_convert_to_position_states` + `_convert_one_position_state`
+  3곳이 BookOptimizer 입력으로 `hold_days + 1` (monitor-tick 증분)을 넘겨
+  canonical exit path(entry_date calendar diff)와 불일치. Phase 2/4 OFF라
+  dormant이나 Edge layer 재활성 시 pyramid/rotation/exit_thesis 타이밍 오류 유발.
+- 공유 staticmethod `_hold_days(pos, today)` 추출, 4곳 통일 (DRY).
+- 회귀 `TestV33HoldDaysCalendarBasis` 6건.
+
+### 검증
+
+- 587 → 598 tests pass (회귀 +11건).
+- 프로덕션 (5/20 23:40 세션, 데몬 재시작 후): collect 윈도우 `~2026-05-20` 전진,
+  regime score 0.25 / 41 pass gate (신선값으로 정정, 이전 stale 0.33 / 37),
+  **MU 게이트 탈락 → CASH, MU +1.42% 청산** (반복 매수 종료).
+
+### 교훈
+
+- 장기 실행 데몬에서 `datetime.now()`를 `__init__` 캐시 금지 — 시계가 동결됨.
+  데이터 수집 경계는 호출 시점에 재계산.
+- silent failure 패턴 반복 (5/11~12 calibration noise에 이어): 체결가는
+  realtime이라 "거래가 돌아가는 것처럼" 보였으나 신호 입력이 stale. 진단은
+  알파 분해를 **신선 데이터로 재구성**해 live와 대조하는 것이 결정타였음.
+- paper 손실을 전략 탓으로 오귀속하지 말 것 — 데이터 파이프라인부터 검증.
