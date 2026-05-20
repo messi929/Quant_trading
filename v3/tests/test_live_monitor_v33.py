@@ -303,13 +303,17 @@ class TestConvertOnePositionState:
             "hold_days": 2, "entry_date": "2026-05-08",
             "opportunity": 0.004,
         }
-        state = pipe._convert_one_position_state(pos, current_price=210.0)
+        state = pipe._convert_one_position_state(
+            pos, current_price=210.0, today="2026-05-11",
+        )
         assert state.ticker == "AAPL"
         assert state.entry_price == 200.0
         assert state.current_price == 210.0
         assert state.pnl_pct == pytest.approx(0.05)
         assert state.thesis_alive is True
-        assert state.holding_days == 3  # +1 increment
+        # calendar-day diff from entry_date 2026-05-08 → 2026-05-11 = 3
+        # (NOT stored hold_days 2 + 1; both happen to be 3 here)
+        assert state.holding_days == 3
         assert state.entry_edge == pytest.approx(0.004)
 
     def test_pnl_negative(self):

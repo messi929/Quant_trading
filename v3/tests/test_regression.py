@@ -1151,3 +1151,59 @@ class TestCollectorEndDateFreshness:
             f"Macro download end={captured.get('end')} — expected fresh "
             f"2026-05-20. Frozen end_date staled the regime macro inputs."
         )
+
+
+# ── Bug (2026-05-20, evaluator-flagged): V3.3 holding_days = tick-count ──
+
+class TestV33HoldDaysCalendarBasis:
+    """`_convert_to_position_states`, `_convert_one_position_state`, and
+    `_check_triggers_v33` fed the V3.3 BookOptimizer `holding_days =
+    stored hold_days + 1` (per-monitor-tick increment) instead of the
+    calendar-day diff used by the canonical exit path (live_pipeline.py:616).
+    Dormant while Phase 2/4 OFF, but would mis-time pyramid / rotation /
+    exit_thesis on Edge-layer re-activation. The shared `_hold_days` helper
+    must derive holding_days from entry_date, ignoring the stored count.
+    """
+
+    def test_hold_days_from_entry_date_ignores_stored(self):
+        from v3.pipeline.live_pipeline import LivePipeline
+        # stored hold_days=99 must be ignored; calendar diff = 6
+        pos = {"ticker": "MU", "entry_date": "2026-05-14", "hold_days": 99}
+        assert LivePipeline._hold_days(pos, "2026-05-20") == 6
+
+    def test_hold_days_same_day_zero(self):
+        from v3.pipeline.live_pipeline import LivePipeline
+        pos = {"ticker": "MU", "entry_date": "2026-05-20 09:30", "hold_days": 0}
+        assert LivePipeline._hold_days(pos, "2026-05-20") == 0
+
+    def test_hold_days_strips_time_suffix(self):
+        from v3.pipeline.live_pipeline import LivePipeline
+        pos = {"ticker": "MU", "entry_date": "2026-05-14 23:40", "hold_days": 0}
+        assert LivePipeline._hold_days(pos, "2026-05-20") == 6
+
+    def test_hold_days_falls_back_on_bad_entry_date(self):
+        from v3.pipeline.live_pipeline import LivePipeline
+        pos = {"ticker": "MU", "entry_date": "not-a-date", "hold_days": 3}
+        assert LivePipeline._hold_days(pos, "2026-05-20") == 3
+
+    def test_hold_days_never_negative(self):
+        from v3.pipeline.live_pipeline import LivePipeline
+        pos = {"ticker": "MU", "entry_date": "2026-05-25", "hold_days": 0}
+        assert LivePipeline._hold_days(pos, "2026-05-20") == 0
+
+    def test_convert_one_position_state_uses_calendar(self):
+        """End-to-end: _convert_one_position_state holding_days = calendar diff,
+        not stored hold_days + 1."""
+        from v3.pipeline.live_pipeline import LivePipeline
+        pipe = LivePipeline.__new__(LivePipeline)
+        pos = {
+            "ticker": "MU", "entry_price": 100.0, "weight": 0.3,
+            "hold_days": 99, "entry_date": "2026-05-14", "opportunity": 0.004,
+        }
+        state = pipe._convert_one_position_state(
+            pos, current_price=105.0, today="2026-05-20",
+        )
+        assert state.holding_days == 6, (
+            "holding_days must be entry_date calendar diff (6), not the stored "
+            f"hold_days+1; got {state.holding_days}"
+        )

@@ -285,9 +285,10 @@ class LivePipeline:
         position_states = self._convert_to_position_states(
             self.executor.positions.positions, df,
             candidates_by_ticker=last_candidates_map,
+            today=today,
         )
         exit_triggers = self._check_triggers_v33(
-            self.executor.positions.positions, df,
+            self.executor.positions.positions, df, today=today,
         )
         signal_age_h = self._signal_age_hours()
         rotations_this_month = self._refresh_rotations_counter(today)
@@ -374,11 +375,31 @@ class LivePipeline:
             or f.allocation or f.pyramid or f.rotation
         )
 
+    @staticmethod
+    def _hold_days(pos: dict, today: str | None = None) -> int:
+        """Calendar-day holding period from entry_date (NOT monitor-tick count).
+
+        Canonical hold-days computation, shared by the exit path and the V3.3
+        BookOptimizer inputs. Previously the BookOptimizer paths used
+        `hold_days + 1` (a per-tick increment) which mis-timed pyramid /
+        rotation / exit_thesis once the Edge layer is active. Falls back to the
+        stored hold_days only when entry_date is unparseable.
+        """
+        today = today or datetime.now().strftime("%Y-%m-%d")
+        entry_date_str = str(pos.get("entry_date", today))[:10]
+        try:
+            entry_d = date.fromisoformat(entry_date_str)
+            today_d = date.fromisoformat(today)
+            return max(0, (today_d - entry_d).days)
+        except (ValueError, TypeError):
+            return int(pos.get("hold_days", 0) or 0)
+
     def _convert_to_position_states(
         self,
         positions: list[dict],
         ohlcv: pd.DataFrame,
         candidates_by_ticker: dict | None = None,
+        today: str | None = None,
     ) -> list[PositionState]:
         """V3.2.1 position dicts → V3.3 PositionState (uses latest close per ticker).
 
@@ -428,7 +449,7 @@ class LivePipeline:
                 pnl_pct=pnl,
                 max_unrealized_pnl_pct=max(pnl, 0.0),
                 drawdown_from_peak_pct=min(pnl, 0.0),
-                holding_days=int(pos.get("hold_days", 0)) + 1,
+                holding_days=self._hold_days(pos, today),
                 dominant_alpha="trend",
                 expected_holding_days=10,
                 thesis_alive=pnl > 0,
@@ -437,6 +458,7 @@ class LivePipeline:
 
     def _check_triggers_v33(
         self, positions: list[dict], ohlcv: pd.DataFrame,
+        today: str | None = None,
     ) -> dict[str, str]:
         """ExitRules → {ticker: trigger_name} for BookOptimizer exit_triggers."""
         if not positions or ohlcv is None or ohlcv.empty:
@@ -452,7 +474,7 @@ class LivePipeline:
                 continue
             current_price = float(row.get("close", 0) or 0)
             current_vol = float(row.get("vol_cc_5d", pos.get("entry_vol", 0.3)) or 0.3)
-            hold_days = int(pos.get("hold_days", 0)) + 1
+            hold_days = self._hold_days(pos, today)
             decision = self.executor.exit_rules.check(
                 entry_price=float(pos["entry_price"]),
                 current_price=current_price,
@@ -609,13 +631,7 @@ class LivePipeline:
                 continue
             current_vol = price_info.get("vol", pos.get("entry_vol", 0.2))
             low_price = price_info.get("low", current_price)
-            entry_date_str = str(pos.get("entry_date", today))[:10]
-            try:
-                entry_d = date.fromisoformat(entry_date_str)
-                today_d = date.fromisoformat(today)
-                hold_days = max(0, (today_d - entry_d).days)
-            except ValueError:
-                hold_days = int(pos.get("hold_days", 0) or 0)
+            hold_days = self._hold_days(pos, today)
 
             decision = self.executor.exit_rules.check(
                 entry_price=pos["entry_price"],
@@ -631,7 +647,7 @@ class LivePipeline:
 
             current_edge = candidates_by_ticker.get(ticker)
             state = self._convert_one_position_state(
-                pos, current_price, current_edge=current_edge,
+                pos, current_price, current_edge=current_edge, today=today,
             )
             action = engine.decide(
                 position=state,
@@ -671,7 +687,7 @@ class LivePipeline:
 
     def _convert_one_position_state(
         self, pos: dict, current_price: float,
-        current_edge=None,
+        current_edge=None, today: str | None = None,
     ):
         """Build a single PositionState from V3.2.1 dict + live current_price.
 
@@ -702,7 +718,7 @@ class LivePipeline:
             pnl_pct=pnl,
             max_unrealized_pnl_pct=max(pnl, 0.0),
             drawdown_from_peak_pct=min(pnl, 0.0),
-            holding_days=int(pos.get("hold_days", 0)) + 1,
+            holding_days=self._hold_days(pos, today),
             dominant_alpha="trend",
             expected_holding_days=10,
             thesis_alive=pnl > 0,
