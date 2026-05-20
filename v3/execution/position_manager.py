@@ -10,6 +10,7 @@ import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 from loguru import logger
 
 
@@ -17,7 +18,7 @@ class PositionManager:
     """Manages open positions with disk persistence."""
 
     GHOST_MAX_RETRIES = 3
-    COOLDOWN_DAYS = 5
+    COOLDOWN_DAYS = 5            # TRADING days (weekends/holidays excluded)
     COOLDOWN_LOSS_COUNT = 2
     MAX_CONSECUTIVE_ENTRY = 3
 
@@ -119,15 +120,35 @@ class PositionManager:
         self.save()
 
     def is_cooled_down(self, ticker: str, current_date: str) -> bool:
-        """Returns True if ticker is in cooldown (too many recent losses)."""
+        """Returns True if ticker is in cooldown (too many recent losses).
+
+        Window is counted in TRADING days, not calendar days. A calendar-day
+        window leaked across weekends (2026-05-20 bug): MU lost Thu 5/14 +
+        Fri 5/15 but on Wed 5/20 the 5/14 loss was 6 calendar days back → out
+        of the 5-day window → re-entry allowed. np.busday_count excludes
+        weekends (holidays not modeled — acceptable for this guard rail).
+        """
         if ticker not in self.cooldown:
             return False
 
-        cutoff = (datetime.strptime(current_date, "%Y-%m-%d") - timedelta(days=self.COOLDOWN_DAYS)).strftime("%Y-%m-%d")
-        recent_losses = [d for d in self.cooldown[ticker] if d >= cutoff]
+        cur = datetime.strptime(current_date, "%Y-%m-%d").date()
+        recent_losses = []
+        for d in self.cooldown[ticker]:
+            try:
+                loss = datetime.strptime(d, "%Y-%m-%d").date()
+            except (ValueError, TypeError):
+                logger.warning(f"Skipping malformed cooldown date for {ticker}: {d!r}")
+                continue
+            # Trading days in [loss, cur). 0 ≤ n < COOLDOWN_DAYS → within window.
+            trading_days = int(np.busday_count(loss, cur))
+            if 0 <= trading_days < self.COOLDOWN_DAYS:
+                recent_losses.append(d)
 
         if len(recent_losses) >= self.COOLDOWN_LOSS_COUNT:
-            logger.info(f"Cooldown active: {ticker} ({len(recent_losses)} losses in {self.COOLDOWN_DAYS}d)")
+            logger.info(
+                f"Cooldown active: {ticker} ({len(recent_losses)} losses in "
+                f"{self.COOLDOWN_DAYS} trading days)"
+            )
             return True
         return False
 

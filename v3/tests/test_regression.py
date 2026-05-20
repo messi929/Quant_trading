@@ -156,6 +156,45 @@ class TestEntryHistoryPersisted:
             "Ghost removal must clear entry_history to avoid consecutive-entry veto"
 
 
+# ── Bug (2026-05-20): cooldown used calendar days, weekend opened a gap ──
+
+class TestCooldownTradingDayBasis:
+    """is_cooled_down counted CALENDAR days within COOLDOWN_DAYS. A weekend
+    pushed an earlier loss outside the window: MU lost Thu 5/14 + Fri 5/15,
+    but on the following Wed 5/20 the 5/14 loss was 6 calendar days back →
+    only 1 loss in window → re-entry allowed (it then lost again). The intent
+    is "2 losses within N TRADING days"; weekends/holidays must not leak the
+    window. Cooldown must count trading (business) days.
+    """
+
+    def test_two_losses_across_weekend_still_cools_down(self, tmp_save_dir):
+        pm = PositionManager(save_dir=str(tmp_save_dir))
+        # MU lost Thu 2026-05-14 and Fri 2026-05-15
+        pm.record_loss("MU", "2026-05-14")
+        pm.record_loss("MU", "2026-05-15")
+        # Following Wed 2026-05-20: 5/14 is 4 trading days back (weekend
+        # 5/16-17 between), 5/15 is 3 trading days back. Both within 5 td →
+        # 2 losses → must be cooled down.
+        assert pm.is_cooled_down("MU", "2026-05-20") is True, (
+            "2 losses on Thu+Fri must still cool down the following Wed "
+            "(calendar-day window leaked across the weekend)"
+        )
+
+    def test_single_loss_does_not_cool_down(self, tmp_save_dir):
+        pm = PositionManager(save_dir=str(tmp_save_dir))
+        pm.record_loss("MU", "2026-05-15")
+        # 1 loss < COOLDOWN_LOSS_COUNT(2) → not cooled
+        assert pm.is_cooled_down("MU", "2026-05-18") is False
+
+    def test_cooldown_expires_after_trading_day_window(self, tmp_save_dir):
+        pm = PositionManager(save_dir=str(tmp_save_dir))
+        pm.record_loss("MU", "2026-05-14")
+        pm.record_loss("MU", "2026-05-15")
+        # 2026-05-22 (Fri): 5/15 is 5 trading days back (5/15,5/18,5/19,5/20,
+        # 5/21) → at/over the 5 td window → both losses expired → not cooled.
+        assert pm.is_cooled_down("MU", "2026-05-22") is False
+
+
 # ── Phase 25.1 옵션 C: monthly cap = unique-ticker count ──
 
 class TestMonthlyUniqueTickerCount:
