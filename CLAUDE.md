@@ -1,14 +1,29 @@
 # Quant Trading System — CLAUDE.md
 
-현재 운영 정책(V3.3 active, 12 features ON since 2026-05-10) + 개발 워크플로우만
-다룬다. Phase별 이력은 `docs/CHANGELOG.md`, 후속 과제 추적은
-`docs/FOLLOW_UPS.md` 참조.
+현재 운영 정책(V3.3 부분 활성 — Phase 1/3 ON, Phase 2/4 OFF since 2026-05-13)
++ 개발 워크플로우만 다룬다. Phase별 이력은 `docs/CHANGELOG.md`, 후속 과제
+추적은 `docs/FOLLOW_UPS.md` 참조.
 
-> ⚠️ 2026-05-10 사용자 결정 — V3.3 12개 features 한 번에 ON (페르소나 무시,
-> ROADMAP §5 주차별 promotion 건너뜀). LivePipeline ctx.actions 통합 +
-> Edge layer 활성 (calibration validation FAIL 상태로 수동 publish).
-> 자세한 내용 + 위험 + 관찰 + rollback 절차는 CHANGELOG "V3.3 전체 활성화"
-> 섹션 참조. 페르소나 점수 측정은 1~2주 paper 데이터 누적 후.
+> ⚠️ 2026-05-10 → 2026-05-13 변천:
+>
+> - **5/10**: V3.3 12 features 한 번에 ON (사용자 결정, ROADMAP §5 주차별 promotion 건너뜀).
+> - **5/11~12 (4 거래일)**: entries=0 silent failure. 원인 = calibration validation
+>   FAIL (top-bottom −0.0001) 상태에서 AllocationEngine entry_pass가 모든 candidate
+>   drop. 추가로 LivePipeline에 flush_diagnostics 호출 누락으로 no_trade_logs 빈
+>   상태로 silent.
+> - **5/13**: V3.3 Edge layer 6 features OFF (`edge_calibrator/edge_engine/edge_tier/
+>   allocation/pyramid/rotation`). V3.2.1 SignalGenerator path 복귀. Phase 3 exit
+>   policies (`exit_thesis/partial_exit/signal_decay`) + Phase 1 diagnostics 3개 유지.
+> - **5/13 동시 변경**: (1) V3.2.1 sizing 수식 재정의 — `position_scale`을 포트폴리오
+>   `max_gross_exposure`로 해석 (이전: 종목당 곱셈), 종목당 floor는 절대값 유지. 결과
+>   ABNB 첫 진입 자본 38%(이전 6%) 6.5배 실증. (2) `vol_score → predicted_vol` 매핑
+>   버그 fix (`vol_cc_20d` 사용). (3) `BookOptimizer.flush_diagnostics()`를
+>   `LivePipeline.run_session` + `BacktestEngine.run`의 try/finally에 호출. (4)
+>   `AlphaVolumeSurprise` directional alpha 추가 (vanilla IC +0.028, caution +0.059).
+>   (5) `ic_to_weights` sqrt smoothing + 0.10 floor로 winner-take-most 완화.
+>
+> 자세한 narrative + 위험 + rollback은 `docs/CHANGELOG.md` "V3.3 부분 활성화 +
+> sizing 재해석 (2026-05-13)" 섹션, 운영 가이드는 `docs/V3.3_OPERATIONS.md`.
 
 ## 투자 철학 (Trading Philosophy)
 
@@ -54,9 +69,11 @@ enter_if:  opportunity > cost × 1.75       # cost = 0.001 (NASDAQ 왕복 0.1%)
                                             # gate = 0.00175
 ```
 
-- DirectionalAlpha: `trend`, `reversion` (signed return 예측)
+- DirectionalAlpha: `trend`, `reversion`, **`volume_surprise`** (5/13 promoted, signed return 예측)
 - ConvictionSource: `vol` (VolTransformer, 확신도 modulate)
-- Phase 2 원칙: VolTransformer는 risk model이지 alpha model 아님 (Two Sigma 컨벤션)
+- Phase 2 원칙: VolTransformer는 risk model이지 alpha model 아님 — 5/13 IC 실험으로
+  데이터 확인됨 (vol_score를 signed alpha로 변환 시 IC 0.178 → 0.007). 따라서
+  conviction multiplier 역할 유지가 정답.
 
 ### 운영 제약 — EntryFilter (5가지)
 
@@ -71,37 +88,59 @@ enter_if:  opportunity > cost × 1.75       # cost = 0.001 (NASDAQ 왕복 0.1%)
 ### Regime별 진입 — 게이트 고정, 가중치만 변경
 
 regime은 **알파 가중치**만 결정. 게이트(`opportunity > cost × 1.75`) 자체는 고정.
+가중치는 `alpha_weight_trainer.py` 매월 1일 06:00 KST 자동 재학습 → `alpha_weights.json`.
 
 ```
-strong_bull: {trend: 0.0,  reversion: 1.0}   # reversion IC=0.113 유일 양수
-bull:        {trend: 0.5,  reversion: 0.5}   # uniform fallback
-neutral:     {trend: 1.0,  reversion: 0.0}   # trend IC=0.028 유일 유의미
-caution:     {trend: 0.5,  reversion: 0.5}   # uniform
+2026-05-13 publish (sqrt smoothing + min_weight 0.10 floor 적용):
+strong_bull: {trend: 0.80, reversion: 0.10, volume_surprise: 0.10}  # n=99 표본 작음
+bull:        {trend: 0.10, reversion: 0.80, volume_surprise: 0.10}
+neutral:     {trend: 0.10, reversion: 0.10, volume_surprise: 0.80}
+caution:     {trend: 0.30, reversion: 0.10, volume_surprise: 0.60}  # paper 주력 regime
 bear:        position_scale=0 → CASH 단락
 ```
 
-### 포지션 사이징 — 공분산 + Half-Kelly + position_scale 연속화
+`ic_to_weights` 정책 (Phase 26.x 보수화):
+- `shrunk = max(IC − MIN_VANILLA_IC, 0)` — noise edge 제거
+- `smoothed = sqrt(shrunk)` — winner 완화
+- `min_weight = 0.10` floor — 모든 알파 최소 share, single marginal alpha winner-take-most 방지
+- 남은 budget을 smoothed 비례 분배
 
-- 예측 vol 역수 × confidence × 상관관계 drag (Ledoit-Wolf 축소)
-- 유동성 제약 (거래량 5% 이내)
-- position_scale: 연속 score → smooth scale (Bridgewater discrete + Medallion continuous 하이브리드)
+`volume_surprise` alpha (5/13 promoted):
+- `log(today_volume / SMA20(volume)) × sign(5d return)` → cross-sectional z-score → tanh
+- Vanilla IC +0.028 (MIN_VANILLA_IC 통과), caution conditional +0.059 (paper 주력)
+- 다른 후보(`vol_term/earnings_proximity/vol_predicted`)는 vanilla 미달 → EXPERIMENTAL only
+
+### 포지션 사이징 — 공분산 + Half-Kelly + position_scale = max_gross_exposure
+
+**2026-05-13 재해석**: `position_scale`은 종목당 곱셈이 아니라 **포트폴리오 노출
+한도** (`max_gross_exposure`). V3.3 `RegimeBudget`과 정합. signal.py `_size()`
+2단계:
+
+1. raw_weights = inv-vol × Half-Kelly × correlation drag → `min(max_weight, raw)`
+2. 종목당 `sizer.min_weight = 0.15` 미달 → drop
+3. 총합이 `position_scale` 초과 → opportunity 약한 종목부터 drop until total ≤ scale
+4. 정규화 안 함 — 미달이면 cash 유지 (페르소나 ①"확신 없으면 현금")
 
 ```
-POSITION_SCALE_CURVE (piecewise linear):
+POSITION_SCALE_CURVE (= max_gross_exposure per regime):
   score 0.00 → 0.00  (bear = CASH)
   score 0.25 → 0.30
   score 0.40 → 0.60
   score 0.55 → 0.90
-  score 0.75 → 1.10
-  score 1.00 → 1.20
+  score 0.75 → 1.10  # 1.00으로 cap (LEVERAGE_CAP)
+  score 1.00 → 1.20  # 1.00으로 cap
 ```
 
 - 최대 단일 종목: `max_single_weight = 0.40`
-- 최소 단일 종목: `min_position_weight = 0.15` (sizer floor, Phase 25.2)
-  · caution 최저 scale 0.35에서도 5M 통과 보장 (0.15 × 0.35 = 5.25M)
-  · bull 1종목 13.5%, 3종목 균등 40.5% — "1~3종목 집중" 부합
+- 최소 단일 종목: `sizer.min_weight = 0.15` (절대 floor, Phase 25.2)
+  · 곱셈 무력화 우려 없음 (5/13 fix). caution scale 0.47 × 0.15 = 0.07 같이 떨어지지 않음.
+  · 1종목 진입 시 자본 15~40%, "1~3종목 집중" 부합
+- predicted_vol은 `ohlcv['vol_cc_20d']` (annualized) 사용 — `vol_scores['vol_score']`는
+  cross-sectional ranking signal이지 vol 값이 아님 (5/13 매핑 버그 fix)
 - 최소 거래 금액: 500만원 (이하는 의미 없음)
 - long-only (NASDAQ, 공매도 미사용)
+
+**5/13 ABNB 실증**: caution scale 0.47에서 1종목 진입 자본 38% (이전 7%). 6.5배 사이즈.
 
 ---
 
@@ -319,13 +358,17 @@ alpha-retrain.timer            — 매월 1일 06:00 KST 자동 재학습 (Phase
   → service: alpha-retrain.service
   → 로그: /var/log/alpha-retrain.log
   → artifact: v3/config/alpha_weights_history/alpha_weights_YYYY-MM.json
+  → 다음 실행 시 DEFAULT_DIRECTIONAL = {trend, reversion, volume_surprise} 자동 포함
+v33-daily-report.timer         — 매일 16:00 KST 일일 리포트
+v33-rollback-check.timer       — 매일 16:30 KST 1주 PnL -2% 시 features 자동 OFF (안전망)
+calibration-retrain.timer      — 매월 1일 07:00 KST (Edge layer 활성 대비, 현재 무의미)
 ```
 
 ### 서버 배포
 
 ```bash
-# 배포
-bash deploy_v3.sh 77.42.78.9
+# 배포 (V3.3 활성 이후 git 기반 deploy 사용)
+bash deploy_v3_git.sh 77.42.78.9
 
 # 상태 확인
 ssh root@77.42.78.9 "systemctl status quant-trading-v3"
@@ -335,11 +378,17 @@ ssh root@77.42.78.9 "tail -f /var/log/quant-v3.log"
 
 # Paper trading 관찰 (일일)
 ssh root@77.42.78.9 "tail -100 /opt/quant/v3/logs/v3_$(date +%Y-%m-%d).log | \
-    grep -E 'Regime|Signal|Opportunity'"
+    grep -E 'Regime|Signal|Opportunity|BUY|SELL|Entries'"
 
-# V2 복원 (긴급)
-ssh root@77.42.78.9 "systemctl stop quant-trading-v3 && rm -rf /opt/quant && \
-    mv /opt/quant_v2_backup /opt/quant && systemctl start quant-trading"
+# 진단 layer 확인 (5/13 flush_diagnostics 적용 후)
+ssh root@77.42.78.9 "ls /opt/quant/v3/saved_models/no_trade_logs/"
+ssh root@77.42.78.9 "tail -10 /opt/quant/v3/saved_models/tc_history.jsonl"
+
+# 긴급 rollback — 최근 deploy 직전 백업으로 복귀
+ssh root@77.42.78.9 "ls -dt /opt/quant_v33_backup_* | head -1"
+# 위 출력의 backup 경로를 사용해서:
+# ssh root@77.42.78.9 "systemctl stop quant-trading-v3 && rm -rf /opt/quant && \
+#     mv /opt/quant_v33_backup_<ts> /opt/quant && systemctl start quant-trading-v3"
 ```
 
 ---
@@ -406,49 +455,57 @@ Evaluator 리포트가 3섹션(regression / invariant / silent-failure) 모두 c
 
 ---
 
-## V3.3 Profitability Engine — 12 features ON (2026-05-10 활성)
+## V3.3 Profitability Engine — 부분 활성 (Phase 1/3 ON, Phase 2/4 OFF since 2026-05-13)
 
 V3.3은 V3.2.1 위에 13개 신규 모듈 + `BookOptimizer` orchestrator를 추가해
-"Vol Expansion Trader"를 "기대수익 기반 자본 재배분 엔진"으로 진화시킨다.
+"Vol Expansion Trader"를 "기대수익 기반 자본 재배분 엔진"으로 진화시키려는
+설계. 5/10 12 features ON → 5/11~12 4 거래일 entries=0 silent failure →
+5/13 Edge layer 6 features OFF로 안정화.
 
-**현재 상태**: 12개 features 모두 ON (2026-05-10), 547 tests pass.
-서버 deploy 완료, F2 hook이 12개 신규 활성 기록 (`feature_activations.jsonl`).
-LivePipeline `ctx.actions` 소비 통합 (`TradingExecutor.execute_actions()` 5종
-핸들러). Edge layer는 `v3/config/edge_calibration.json` 수동 publish로 활성
-(validation FAIL 상태 — top-bottom -0.0001).
+**현재 상태** (2026-05-13 publish):
+
+| Phase | Features | 상태 | 사유 |
+|-------|----------|:-:|------|
+| Phase 1 (diagnostics) | `no_trade_logger / tc_monitor / execution_quality` | ON | read-only, 거래 결정 무영향 |
+| Phase 2 (Edge layer) | `edge_calibrator / edge_engine / edge_tier / allocation` | **OFF** | calibration validation FAIL (top-bottom −0.0001) — OpportunityScorer가 5d return alpha 아님이 데이터 확인 |
+| Phase 3 (exit policies) | `exit_thesis / partial_exit / signal_decay` | ON | exit 정책은 alpha 가정 무관, 기존 V3.2.1 conditional veto 강화 |
+| Phase 4 (capital) | `pyramid / rotation` | **OFF** | Edge layer `net_edge`에 의존, Phase 2 OFF와 함께 |
+
+587/587 tests pass. `feature_activations.jsonl` history 기록됨.
 
 ### 신규 모듈
 
 | 영역 | 모듈 |
 |------|------|
-| Edge layer | `edge_calibrator`, `edge_engine`, `edge_tier` |
-| Exit policies | `exit_thesis` (+ Conditional Veto), `signal_decay`, `partial_exit` |
-| Capital | `allocation` (leverage 영구 거부), `pyramid` (winner-only), `rotation` |
-| Diagnostics | `diagnostics` (NoTradeReason + TC), `execution_quality` |
-| Orchestrator | `book_optimizer` (BacktestEngine + LivePipeline 모두 wiring) |
-| Research | `build_edge_dataset`, `calibrate_edge`, `validate_edge` |
+| Edge layer | `edge_calibrator`, `edge_engine`, `edge_tier` (현재 OFF) |
+| Exit policies | `exit_thesis` (+ Conditional Veto), `signal_decay`, `partial_exit` (ON) |
+| Capital | `allocation`, `pyramid`, `rotation` (현재 OFF) |
+| Diagnostics | `diagnostics` (NoTradeReason + TC), `execution_quality` (ON, 5/13 flush 적용) |
+| Orchestrator | `book_optimizer` (BacktestEngine + LivePipeline 모두 wiring, flush try/finally) |
+| Research | `build_edge_dataset`, `calibrate_edge`, `validate_edge`, `test_new_alphas` (신규) |
 | Ablation | `ablation_specs/runner/report`, `promotion_decision` |
 | CLI | `scripts/run_ablation_sweep.py` |
 
-### V3.3 활성/비활성 제어 (현재 모두 ON)
+### V3.3 활성/비활성 제어
 
-`v3/config/v3_config.yaml` `features:` 섹션. ROADMAP §5의 주차별 promotion
-일정은 2026-05-10 사용자 결정으로 우회 — 12개 모두 ON 됨. 롤백:
+`v3/config/v3_config.yaml` `features:` 섹션. Edge layer 재활성 조건은
+`docs/FOLLOW_UPS.md` "Edge layer 재활성 조건" 참조 (calibration top-bottom
+의미값 + validate_edge PASS + paper 1~2주 검증).
 
 ```yaml
 features:
-  # 한 줄씩 false 전환 후 deploy_v3_git.sh 77.42.78.9
-  # Edge layer만 비활성: rm v3/config/edge_calibration.json + service restart
+  # Phase 2/4 OFF 상태에서 토글 시 deploy_v3_git.sh 77.42.78.9
+  # Phase 3 exit policies는 alpha 가정 무관이라 calibration 회복 전에도 안전
 ```
 
 자동 rollback (`v33-rollback-check.timer`)은 매일 16:30 KST 1주 PnL -2% 시
-flag OFF — 안전망. 자세한 rollback 절차 + 위험 분석은 CHANGELOG "V3.3 전체
-활성화" 섹션 H 참조.
+flag OFF — 안전망. 자세한 rollback 절차 + 위험 분석은
+`docs/CHANGELOG.md` "V3.3 부분 활성화 + sizing 재해석 (2026-05-13)" 섹션.
 
 ### V3.3 신규 운영 명령
 
 ```bash
-# Calibration pipeline (server, 매월)
+# Edge layer 재활성 대비 — calibration pipeline (server, 매월; 현재 무의미)
 $PYTHON v3/research/build_edge_dataset.py --start ... --end ... --output ...
 $PYTHON v3/research/calibrate_edge.py --panel ... --train-end ... --output ...
 $PYTHON v3/research/validate_edge.py --panel ... --calibration ... --output ...
@@ -457,18 +514,29 @@ $PYTHON v3/research/validate_edge.py --panel ... --calibration ... --output ...
 $PYTHON v3/scripts/run_ablation_sweep.py --synthetic           # sanity
 $PYTHON v3/scripts/run_ablation_sweep.py --panel <parquet>     # production
 
-# Feature 활성화 후 paper 검증
-ssh root@77.42.78.9 "tail -f /opt/quant/v3/saved_models/no_trade_logs/no_trade_*.jsonl"
+# 알파 IC 실험 (production write 차단, research only)
+PYTHONPATH=. $PYTHON v3/research/test_new_alphas.py --lookback-years 3
+# → v3/research/reports/experimental_alpha_ic_<ts>.json
+
+# Earnings 데이터 수집 (분기실적일 캐시)
+PYTHONPATH=. $PYTHON v3/data/earnings_collector.py
+# → v3/data/raw/earnings_dates.json
+
+# 진단 layer 관찰 (5/13 flush_diagnostics 적용 후 매 세션 disk write)
+ssh root@77.42.78.9 "ls /opt/quant/v3/saved_models/no_trade_logs/"
 ssh root@77.42.78.9 "tail -f /opt/quant/v3/saved_models/tc_history.jsonl"
 ```
 
-### 페르소나 영향
+### 페르소나 영향 (2026-05-13 update)
 
-| 원칙 | V3.2.1 | V3.3 처방 |
-|------|--------|----------|
-| 1. 확신 있을 때만 | 5/10 | EdgeCalibrator → 진짜 expected_return 측정. EdgeTier → S/A/B/C 등급화. |
-| 2. 크게 | 3/10 (가장 심각) | AllocationEngine net_edge / risk sizing + Pyramid winner add-on. Phase 25.2 sizer floor 0.15와 시너지. |
-| 3. 빠르게 | 8/10 | Conditional Veto 정상화 (FOLLOW_UPS 1순위) + ExitThesis 4-way (HOLD/REDUCE/ROTATE/EXIT). |
+| 원칙 | V3.2.1 | V3.3 부분 활성 (현재) | V3.3 전체 활성 (목표) |
+|------|:------:|:--------------------:|:--------------------:|
+| 1. 확신 있을 때만 | 5/10 | 5/10 (volume_surprise 추가로 약간 개선) | EdgeCalibrator로 진짜 expected_return 측정 시 7/10+ |
+| 2. 크게 | 3/10 | **7/10** (5/13 sizing 재해석 — ABNB 자본 38% 실증) | AllocationEngine winner-take-most + Pyramid 시 8/10 |
+| 3. 빠르게 | 8/10 | 8/10 (ExitThesis 16h staleness + signal_refresh 유지) | 동일 |
+
+**5/13 핵심 성과**: 원칙 ②"크게"가 3/10 → 7/10으로 즉시 개선. 알파 추가/Edge 재활성
+없이도 `position_scale` 의미 재정의만으로 6.5배 사이즈 확보.
 
 ### 참고 — V3.3 docs
 

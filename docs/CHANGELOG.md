@@ -1344,3 +1344,275 @@ ssh root@77.42.78.9 "rm /opt/quant/v3/config/edge_calibration.json && \
 
 측정은 `recommendation_log.jsonl` + `paper_account.json` + daily report
 1~2주 누적 후. FOLLOW_UPS §V3.3 활성화 추적 참조.
+
+
+## V3.3 부분 활성화 + sizing 재해석 (2026-05-13)
+
+V3.3 전체 활성화 (5/10) 이후 4 거래일(5/11~12) entries=0 silent failure가
+인지되면서 진단 → 4 commits로 안정화. 핵심 명제는 **"OpportunityScorer는
+5d return alpha가 아니다"** 가 데이터로 확정된 것.
+
+### 시작점 — 4 거래일 entries=0 silent failure
+
+5/10 12 features ON 후 첫 거래일(5/11 09:30 KR)부터 5/12 23:40 US 까지
+4 세션 연속 `entries_count = 0`. `recommendation_log.jsonl` 에는 매일 MELI
+(opp 0.0213, conv 0.97, weight 0.063~0.070)가 `selected_positions`에 등장
+하지만 실제 진입 없음. `rejections={}` 빈 dict, `no_trade_logs/` 디렉터리도
+빈 채로 silent.
+
+### 진단 — 두 가지 silent failure 체인
+
+**1차: V3.3 Edge layer가 모든 후보 drop**
+
+`features.allocation=True` 활성 상태에서 `BookOptimizer._generate_entries()`
+가 `SignalGenerator.positions` passthrough 대신 `AllocationEngine.allocate()`
+호출. 그러나 `AllocationEngine` Step 1이 `c.entry_pass AND c.net_edge_5d > 0`
+필터를 강제. `EdgeEngine.compute()`는 다음을 계산:
+
+```
+net_edge_5d = expected_return_5d - cost - slippage_buffer - λ_mae × |MAE|
+```
+
+5/10 publish된 calibration:
+- `calibration_table.json` global mean_forward_return_5d = 0.00314
+- mean |MAE| = 0.035, λ_mae = 0.20 → 페널티 0.007
+- cost ≈ 0.001, slip ≈ 0.002
+- **net_edge ≈ 0.003 − 0.010 = −0.007** ← 모든 ticker가 음수
+- `entry_pass = net_edge > entry_threshold(0.0040)` → **항상 False**
+
+→ AllocationEngine 빈 dict 반환 → ADD_NEW BookAction 0개 → 진입 0건.
+
+진단 트리거: CLAUDE.md에 명시되어 있던 "calibration validation FAIL —
+top-bottom −0.0001" 메모. decile 0과 decile 9의 평균 5d return 차이가
+−0.01bp → opportunity → return mapping이 noise 임을 폭로한 것. 이 결과를
+publish해도 무사히 통과하던 이유는 ablation runner가 별도 신호 측정만
+하지 EDR sanity check 없음.
+
+**2차: `flush_diagnostics()` 호출 누락**
+
+`no_trade_logger=true` 였으나 `BookOptimizer.flush_diagnostics()` 메서드는
+정의만 되어 있고 `LivePipeline.run_session()` / `BacktestEngine.run()`
+어디에서도 호출 안 됨. `ablation_runner.py:175` 만 호출. 결과:
+
+- `tc_monitor`, `execution_quality`, `no_trade_logger` 셋 모두 메모리
+  버퍼에만 쌓이고 process 종료 시 사라짐
+- 운영자가 reject reason 분포를 disk에서 확인 못 함 → 4일 silent
+
+### 4 commits 안정화
+
+| Commit | 범위 | 핵심 |
+|--------|------|------|
+| `5ffcae6` | V3.2.1 sizing 재해석 | `position_scale` 의미 변경 + vol_cc_20d 매핑 fix |
+| `daefa48` | V3.3 Edge layer 6 features OFF | Phase 2/4 OFF, Phase 1/3 유지 |
+| `fdb9eb0` | flush_diagnostics try/finally | Silent failure 차단 |
+| `ebdecc6` | `volume_surprise` 알파 promotion + ic_to_weights 보수화 | 종목 선택 신호 품질 ↑ |
+
+### A. V3.2.1 sizing 재해석 (commit 5ffcae6)
+
+**이전** (`signal._size()` 곱셈 흐름):
+```python
+raw_weights = sizer.size_portfolio(...)  # 내부 floor 0.15 적용 후 반환
+for c in selected:
+    w = raw_weights.get(...)
+    w = round(w * position_scale, 4)   # ← caution 0.42 × 0.15 = 0.063
+    w = min(w, max_weight)
+    if w < self.min_weight:            # SignalGen min_weight=0.02
+        continue
+    positions.append(...)
+```
+
+→ sizer 내부 floor 0.15가 곱셈으로 0.063 (6.3%)으로 무력화. 5/11 production
+MELI weight 0.0702 정확히 일치.
+
+**이후** (`position_scale = max_gross_exposure` 의미):
+```python
+raw_weights = sizer.size_portfolio(predicted_vols, confidences)
+
+# Stage 1: per-position cap + floor
+weights = {}
+for c in selected:
+    w = min(raw_weights[c.ticker], max_weight)
+    if w < sizer.min_weight:        # 0.15 절대 floor
+        continue
+    weights[c.ticker] = round(w, 4)
+
+# Stage 2: portfolio exposure cap — drop weakest until total ≤ scale
+while weights and sum(weights.values()) > position_scale + 1e-6:
+    weakest = min(weights, key=lambda t: candidate_map[t].opportunity)
+    del weights[weakest]
+```
+
+추가로 `predicted_vols` 매핑 fix:
+- 이전: `predicted_vols[t] = vol_scores['vol_score'][t]` (VolTransformer
+  cross-sectional ranking을 vol value로 잘못 매핑)
+- 이후: `_extract_vols()` 헬퍼 — `ohlcv['vol_cc_20d']` (feature_engineer
+  line 99에서 `rolling(20).std() * sqrt(252)`로 annualized) 사용
+
+V3.3 `RegimeBudget` (`v3/strategy/allocation.py:53-61`)과 정합 — 같은 의미를
+V3.2.1 sizer에도 적용. 페르소나 ②"1~3종목 집중" + ①"확신 없으면 cash" 부합.
+
+**실증**: 5/13 09:30 KR 첫 세션 — ABNB 매수 자본 38% (37.78M KRW). 이전
+PYPL 매수 자본 5.8% (5.76M KRW) 대비 **6.5배**. caution scale 0.47이 그대로
+포트폴리오 노출 한도로 작동, 1종목이 한도까지 채움.
+
+회귀 테스트: `test_regression.py` Bug 11 = `TestPositionScaleAsExposure`
+5개 invariant (single-candidate floor / total ≤ scale / underexposure
+keeps cash / weakest drop / vol_cc_20d source).
+
+### B. V3.3 Edge layer 6 features OFF (commit daefa48)
+
+`v3/config/v3_config.yaml` features 섹션에서 OFF:
+- `edge_calibrator` / `edge_engine` / `edge_tier` / `allocation` (Phase 2)
+- `pyramid` / `rotation` (Phase 4 — Edge net_edge 의존)
+
+유지:
+- `no_trade_logger` / `tc_monitor` / `execution_quality` (Phase 1 read-only)
+- `exit_thesis` / `partial_exit` / `signal_decay` (Phase 3 — alpha 가정 무관)
+
+V3.2.1 `SignalGenerator` path 복귀. `BookOptimizer._generate_entries()`가
+`allocation=False` 분기로 들어가 `SignalGenerator.positions` passthrough
+→ 우리 fix된 `_size()` 결과가 그대로 ADD_NEW BookAction `target_weight`로.
+
+**재활성 조건**: calibration top-bottom 의미값 (예: >1%) + `validate_edge.py`
+PASS + paper 1~2주 검증. `docs/FOLLOW_UPS.md` 참조.
+
+### C. flush_diagnostics try/finally (commit fdb9eb0)
+
+```python
+def run_session(self) -> dict:
+    logger.info("=" * 60)
+    logger.info(f"V3 Trading Session — ...")
+    logger.info("=" * 60)
+    try:
+        df = self.collect_data()
+        signal = self.generate_signal(df)
+        ...
+        return summary
+    finally:
+        self.book_optimizer.flush_diagnostics()
+```
+
+`BacktestEngine.run()`은 200줄 본문 indent shift 대신 method 분리:
+- `run()` — thin wrapper, `try: return self._run_impl(...) finally: flush_diagnostics()`
+- `_run_impl()` — 기존 본문 그대로 (flush 호출 제거)
+
+회귀 테스트 Bug 12 = `TestBookOptimizerFlushed`:
+- `_flush_in_finally(func)` 헬퍼: `textwrap.dedent + ast.parse` → `ast.Try.finalbody`
+  순회 → `flush_diagnostics` Call 존재 확인. 단순 source 문자열 검사는 try 밖
+  호출도 통과시켜 false negative.
+- `test_live_pipeline_run_session_flushes_in_finally`
+- `test_backtest_engine_run_flushes_in_finally`
+- `test_flush_persists_to_disk` — record → flush → file 존재 + 내용 검증
+
+### D. volume_surprise alpha promotion + ic_to_weights 보수화 (commit ebdecc6)
+
+**알파 후보 IC 측정** (`v3/research/test_new_alphas.py`, 3년 panel 14,403 rows):
+
+| Alpha | Vanilla IC | Caution | Verdict |
+|-------|----------:|--------:|---------|
+| `trend` (기존) | +0.003 | +0.026 | ❌ FAIL (vanilla 미달) |
+| `reversion` (기존) | −0.001 | −0.017 | ❌ FAIL |
+| **`volume_surprise`** (신규) | **+0.028** | **+0.059** | ✅ PROMOTE |
+| `vol_term` (신규) | +0.019 | +0.041 | ⚠️ REGIME_ONLY |
+| `earnings_proximity` (신규) | +0.012 | −0.002 | ⚠️ REGIME_ONLY (neutral만) |
+| `vol_predicted` (신규) | +0.007 | +0.036 | ⚠️ REGIME_ONLY |
+
+**결정적 발견 — `vol_predicted`의 IC 폭락**:
+- VolConviction.expansion_ic (cross-sectional rank vs realized vol) = **+0.178**
+- 같은 vol_score를 signed alpha로 변환: IC = **+0.007**
+- → VolTransformer 신호는 **magnitude amplification (multiplier)** 이지
+  signed directional alpha 아니라는 데이터 확정. CLAUDE.md "Phase 2 원칙:
+  VolTransformer는 risk model" 이 옳음.
+
+**`volume_surprise` 정식 promotion**:
+```python
+class AlphaVolumeSurprise(AlphaSource):
+    surprise   = log(today_volume / SMA20(volume))
+    direction  = sign(close[-1] / close[-6] - 1)
+    raw        = surprise × direction
+    → cross-sectional z-score → tanh(z/2) × ALPHA_SCALE
+```
+
+`DEFAULT_DIRECTIONAL` 확장 = `{trend, reversion, volume_surprise}`.
+
+**`ic_to_weights` 보수화** (winner-take-most 방지):
+```python
+def ic_to_weights(self, ic, *, min_weight=0.10):
+    shrunk = {a: max(v - MIN_VANILLA_IC, 0.0) for a, v in ic.items()}
+    if sum(shrunk.values()) <= 1e-9:
+        return uniform(ic)
+    smoothed = {a: sqrt(s) for a, s in shrunk.items()}
+    total = sum(smoothed.values())
+    free_budget = 1.0 - n * min_weight
+    return {a: min_weight + free_budget * smoothed[a] / total for a in ic}
+```
+
+2026-05-13 publish 신규 weights (`alpha_weights_2026-05.json`):
+
+| Regime | trend | reversion | volume_surprise | n |
+|--------|------:|----------:|----------------:|--:|
+| strong_bull | 0.80 | 0.10 | 0.10 | 99 |
+| bull | 0.10 | 0.80 | 0.10 | 2,373 |
+| neutral | 0.10 | 0.10 | 0.80 | 6,316 |
+| **caution** | **0.30** | **0.10** | **0.60** | **4,725** |
+| bear | 0.10 | 0.80 | 0.10 | 890 |
+
+이전 (winner-take-most, 같은 IC) 대비 caution: volume_surprise 86% → 60%,
+trend 14% → 30%, reversion 0 → 10%. winner 60~80% cap, marginal alpha 10%
+floor.
+
+**알파 시스템 인프라**:
+- `v3/data/earnings_collector.py` — yfinance `get_earnings_dates` 수집기
+  (99/99 NASDAQ tickers, 5년치)
+- `v3/data/raw/earnings_dates.json` — 캐시
+- `v3/strategy/alpha_sources.py` — `AlphaVolumeSurprise` /
+  `AlphaVolTermStructure` / `AlphaEarningsProximity` / `AlphaVolPredicted`
+  + `load_earnings_dates` 헬퍼 + `compute_directional` `vol_scores` kwarg
+- `v3/research/test_new_alphas.py` — production write 차단된 IC 실험
+- `v3/research/reports/` — 3차 실험 결과 JSON
+
+회귀 테스트 Bug 13 = `TestExperimentalAlphasContract` 11개:
+- 각 candidate alpha 범위/empty/decay invariant
+- `compute_directional` `vol_scores` forwarding
+- `DEFAULT_DIRECTIONAL = {trend, reversion, volume_surprise}` 정확한 enforce
+- `ic_to_weights` floor + dampening + uniform fallback
+
+### E. 페르소나 점수 변화
+
+| 원칙 | 5/10 (V3.3 전체 활성) | 5/13 (부분 활성 후) | 변화 |
+|------|:--------------------:|:-------------------:|:----:|
+| 1. 확신 있을 때만 | 5/10 (calibration FAIL) | 5/10 (volume_surprise +0.028 marginal) | ≈ |
+| 2. 크게 | 3/10 → 0/10 (entries=0) | **7/10** (ABNB 자본 38%) | **+4** |
+| 3. 빠르게 | 8/10 | 8/10 (ExitThesis 유지) | ≈ |
+
+원칙 ②"크게"가 가장 큰 lever. 알파 추가/Edge 재활성 없이도 sizing 수식
+재정의만으로 6.5배 사이즈 확보. 페르소나 정합성 진단의 본질이 sizing
+구조에 있었다는 확인.
+
+### F. 검증
+
+- pytest: **587/587** (이전 547 + 신규 invariant 40)
+- v3-evaluator: 3섹션 (regression / invariant / silent-failure) 모두 clean
+  (commit 단계마다 2회 호출, 발견 silent failure 5건 모두 fix)
+- Paper 첫 결과 (5/13 09:30 KR): ABNB 199주 매수, 자본 38%
+
+### G. Rollback 절차
+
+```bash
+# 최근 deploy 직전 백업으로 복귀
+ssh root@77.42.78.9 "ls -dt /opt/quant_v33_backup_* | head -1"
+# 출력된 경로 사용:
+# ssh root@77.42.78.9 "systemctl stop quant-trading-v3 && rm -rf /opt/quant && \
+#     mv /opt/quant_v33_backup_<ts> /opt/quant && systemctl start quant-trading-v3"
+```
+
+자동 rollback (`v33-rollback-check.timer`)도 1주 PnL −2% 시 features OFF
+유지.
+
+### H. 다음 관찰 포인트
+
+- **5/13~5/27 paper**: sizing fix + 알파 weight 변화 종합 효과. sharpe / 승률
+  (>65%) / 손익비 (>2:1) / MDD (<5%) 회귀 없는지.
+- Edge layer 재활성: calibration 품질 개선 + validate_edge PASS 이후
+- 추가 알파 promotion: `vol_term/earnings_proximity/vol_predicted` IC
+  시계열 robust 확인 후 (현재 vanilla 미달)
