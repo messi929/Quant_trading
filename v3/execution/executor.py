@@ -169,6 +169,7 @@ class TradingExecutor:
                 continue
 
             current_price = price_info["price"]
+            current_high = price_info.get("high", current_price)
             # Calendar-day hold count (not monitor-tick count).
             # entry_date is "YYYY-MM-DD" (possibly with time suffix from paper broker).
             entry_date_str = str(pos.get("entry_date", current_date))[:10]
@@ -180,6 +181,15 @@ class TradingExecutor:
                 hold_days = int(pos.get("hold_days", 0) or 0)
             pos["hold_days"] = hold_days
 
+            # A1 (2026-05-27): trailing stop을 위한 peak price 추적.
+            # monitor tick마다 intraday high로 update. live는 15분 간격이라
+            # intraday peak이 일봉 high보다 작을 수 있지만, 누적 update로 근사.
+            pos["peak_price"] = max(
+                float(pos.get("peak_price", pos["entry_price"]) or pos["entry_price"]),
+                float(current_high),
+                float(current_price),
+            )
+
             # Check exit
             exit_decision = self.exit_rules.check(
                 entry_price=pos["entry_price"],
@@ -189,11 +199,13 @@ class TradingExecutor:
                 current_vol=price_info.get("vol", 0.2),
                 confidence=pos.get("confidence", 0.5),
                 low_price=price_info.get("low", current_price),
+                peak_price=pos["peak_price"],
             )
 
             # Conditional exit veto: if profit_take OR max_hold triggered BUT
             # opportunity still exceeds the gate, hold. Risk-based exits
-            # (vol_contraction, dynamic_stop_mae, portfolio_stop) remain unconditional.
+            # (vol_contraction, dynamic_stop_mae, portfolio_stop, trailing_stop)
+            # remain unconditional.
             VETOABLE = ("profit_take", "max_hold")
             if exit_decision.should_exit and exit_decision.reason in VETOABLE:
                 opp = opportunity_map.get(ticker)

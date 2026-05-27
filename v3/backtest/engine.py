@@ -397,6 +397,7 @@ class BacktestEngine:
                                     "opportunity": pos_dict.get("opportunity", 0.0),
                                     "capital_allocated": allocated,
                                     "last_unrealized": init_unrealized,
+                                    "peak_price": entry_price,
                                 })
                                 cash -= allocated
                                 monthly_unique_tickers.add(ticker)
@@ -474,8 +475,12 @@ class BacktestEngine:
                 continue
             row = tdata.iloc[0]
             current_price = float(row["close"])
+            current_high = float(row.get("high", current_price))
             current_vol = float(row.get("vol_cc_5d", pos.get("entry_vol", 0.3)) or 0.3)
             hold_days = pos["hold_days"] + 1
+
+            # A1 (2026-05-27): trailing stop을 위한 peak price 추적 (intraday high 포함)
+            pos["peak_price"] = max(pos.get("peak_price", pos["entry_price"]), current_high)
 
             deployed = 1.0 - (cash / max(sum(p["capital_allocated"] for p in positions) + cash, 1))
             exit_decision = self.exit_rules.check(
@@ -487,6 +492,7 @@ class BacktestEngine:
                 confidence=0.5,
                 low_price=float(row.get("low", current_price)),
                 portfolio_deployed=deployed,
+                peak_price=pos["peak_price"],
             )
 
             if exit_decision.should_exit:
@@ -579,10 +585,15 @@ class BacktestEngine:
                 continue
             row = tdata.iloc[0]
             current_price = float(row["close"])
+            current_high = float(row.get("high", current_price))
             current_vol = float(
                 row.get("vol_cc_5d", pos.get("entry_vol", 0.3)) or 0.3
             )
             hold_days = int(pos.get("hold_days", 0)) + 1
+
+            # A1 (2026-05-27): trailing stop을 위한 peak price 추적
+            pos["peak_price"] = max(pos.get("peak_price", pos["entry_price"]), current_high)
+
             decision = self.exit_rules.check(
                 entry_price=float(pos["entry_price"]),
                 current_price=current_price,
@@ -592,6 +603,7 @@ class BacktestEngine:
                 confidence=0.5,
                 low_price=float(row.get("low", current_price)),
                 portfolio_deployed=portfolio_deployed,
+                peak_price=pos["peak_price"],
             )
             triggers[pos["ticker"]] = (
                 decision.reason if decision.should_exit else "max_hold"
@@ -780,6 +792,7 @@ class BacktestEngine:
             "opportunity": float(action.expected_impact or 0.0),
             "capital_allocated": allocated,
             "last_unrealized": init_unrealized,
+            "peak_price": entry_price,
         }
         new_positions = list(positions) + [new_pos]
         monthly_unique_tickers.add(ticker)

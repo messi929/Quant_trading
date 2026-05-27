@@ -471,7 +471,47 @@ Phase 2 (`edge_calibrator / edge_engine / edge_tier / allocation`) + Phase 4
 3. **paper 1~2주 검증** — 부분 활성 환경에서 5/13 sizing 효과 누적 (사이즈
    확대가 sharpe / 손익비 유지하는지).
 
-위 3개 동시 만족 시 Phase 2/4 단계적 ON 검토. 단계 순서:
+위 3개 동시 만족 시 Phase 2/4 단계적 ON 검토.
+
+#### 1.0 (선행 과제) — Calibration build wrapper script 작성
+
+2026-05-27 사용자 재활성 시도 중 발견:
+- `v3/research/build_edge_dataset.py` CLI는 **stub** ("CLI is a stub.
+  Production usage: 1. Run from server with v3/data/raw/ populated 2. Ensure
+  v3/saved_models/vol_transformer_best.pt exists 3. Provide ohlcv_data,
+  macro_pctl, vol_predictions to build_edge_dataset()")
+- 즉 panel 생성을 위해 OHLCV 로드 + VolTransformer 전체 기간 추론 + macro
+  percentile 계산을 직접 호출하는 Python wrapper가 필요
+- alpha-retrain.timer는 `alpha_weight_trainer.py`만 자동화하지 Edge
+  calibration pipeline은 자동화 미구현
+
+**필요 작업** (별도 세션):
+- `v3/research/run_calibration_pipeline.py` 신설 — end-to-end orchestrator:
+  1. `Collector` 또는 OHLCV parquet 로드
+  2. `MacroCollector` + `MacroFeatures` percentile 계산
+  3. `VolTransformer` 로드 + walk-forward 추론 (lookback window 전체)
+  4. `build_edge_dataset()` 함수 호출 + parquet 저장
+  5. `calibrate_edge.py` 호출 또는 함수 직접 호출
+  6. `validate_edge.py` 호출 + PASS/FAIL 보고
+  7. PASS면 `/opt/quant/v3/config/edge_calibration.json` 갱신
+- 회귀 테스트 추가 (`v3/tests/test_calibration_pipeline.py`에 wrapper 통합 케이스)
+- alpha-retrain.timer와 별도로 `calibration-retrain.timer` 활용 또는 신설
+  (CLAUDE.md "calibration-retrain.timer — 매월 1일 07:00 KST (Edge layer
+  활성 대비, 현재 무의미)" 이미 등록되어 있음 — service script 작성)
+
+**서버 calibration JSON 현재 상태** (2026-05-27 14:00 KST 확인):
+- `/opt/quant/v3/config/edge_calibration.json` 84KB 존재 but
+  `top_bottom_spread=None, train_end_date=MISSING, table_entries=0`
+  → SF-1 (silent-failure) 100% 활성 상태. wrapper 완성 + 정상 calibration
+  생성 전까지 Phase 2/4 ON 절대 금지.
+
+**v3-evaluator SF-3 발견** — `v33-rollback-check.timer` 안전망 한계:
+- `rollback.py:150` `max(eligible, key=activated_at)` 한 번에 1 feature만 OFF
+- 4 features 동시 ON 시 완전 rollback에 **4 거래일 × -2% PnL 사이클** 필요
+- wrapper 완성 후 재활성 시에도 단계적 ON (A → 1주 → B → 1주 → C ...) 필수
+- 또는 `rollback.py` 수정: 같은 startup timestamp의 features 일괄 OFF
+
+#### 1.1 단계 순서 (선행 1.0 완료 후) 단계 순서:
 - A. `edge_calibrator` + `edge_engine` ON (Edge tier 분류 활성, allocation은 OFF)
 - B. paper 1주 후 `edge_tier` ON
 - C. paper 1주 후 `allocation` ON (sizing 가중치 override 시작)

@@ -23,11 +23,12 @@ class PaperBroker:
         save_dir: str = "v3/saved_models",
         commission_rate: float = 0.0001,    # US 편도 0.01%
         slippage_rate: float = 0.001,        # US 0.1%
-        usd_krw: float = 1400.0,
+        usd_krw: float = 1400.0,             # A6 (2026-05-27): fallback only; 실시간은 _fetch_fx_rate()
     ):
         self.commission = commission_rate
         self.slippage = slippage_rate
-        self.usd_krw = usd_krw
+        self.usd_krw = usd_krw                # 마지막 fetched rate (cache)
+        self._fx_fallback = usd_krw           # fetch 실패 시 사용
         self.save_path = Path(save_dir) / "paper_account.json"
 
         # Load or init account
@@ -39,11 +40,38 @@ class PaperBroker:
             self.trade_history: list[dict] = []
             self._save()
 
+        # A6: 초기 환율 실시간 fetch (실패 시 fallback)
+        self._fetch_fx_rate()
+
         logger.info(f"PaperBroker: cash={self.cash_krw:,.0f} KRW, "
-                     f"positions={len(self.positions)}, rate={usd_krw} KRW/USD")
+                     f"positions={len(self.positions)}, rate={self.usd_krw:.2f} KRW/USD")
+
+    def _fetch_fx_rate(self) -> float:
+        """A6 (2026-05-27): yfinance에서 USD/KRW 실시간 환율 fetch.
+
+        실패 시 self._fx_fallback (init 시 받은 1400 기본) 사용. self.usd_krw를
+        성공 시 update하여 다음 호출까지 cache. paper PnL accuracy 개선
+        (subagent B finding: 고정 1400은 paper PnL ±2%p 오차 유발).
+        """
+        try:
+            t = yf.Ticker("KRW=X")
+            info = t.fast_info
+            rate = float(info.get("lastPrice", 0) or info.get("previousClose", 0))
+            if rate <= 0:
+                hist = t.history(period="1d")
+                if not hist.empty:
+                    rate = float(hist["Close"].iloc[-1])
+            if rate > 0 and 800.0 < rate < 2000.0:   # sanity range
+                self.usd_krw = rate
+                return rate
+        except Exception as e:
+            logger.warning(f"FX fetch failed (KRW=X): {e} — fallback {self._fx_fallback}")
+        return self._fx_fallback
 
     def get_price(self, ticker: str) -> dict:
-        """Get current price from yfinance."""
+        """Get current price from yfinance + fresh FX rate (A6)."""
+        # A6: 매 가격 fetch마다 환율도 fresh
+        self._fetch_fx_rate()
         try:
             t = yf.Ticker(ticker)
             info = t.fast_info

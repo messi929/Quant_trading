@@ -92,7 +92,7 @@ trading:
   max_positions: 1                 # v3.1-safe: 3→1 (실거래 미검증, paper 보수 운영)
   max_single_weight: 0.40
   min_order_amount_krw: 5_000_000
-  max_trades_per_month: 5          # 월 5회 이하 (V2: 매일 → V3: 조건부)
+  max_trades_per_month: 10         # A3 (2026-05-27): 5→10 (paper entries=0 해소, 알파 게이트가 quality 통제)
   max_hold_days: 5                 # 5일 보유 (V2: 3일)
   profit_take_pct: 0.05
   vol_contraction_exit_ratio: 0.70 # vol이 진입 시 70% 이하로 감소 → 청산
@@ -185,12 +185,13 @@ features:
   no_trade_logger: true
   tc_monitor: true
   execution_quality: true
-  # Phase 2 (Edge layer) — 2026-05-12 OFF.
-  # 사유: calibration validation FAIL (top-bottom -0.0001) 상태에서 net_edge가
-  # 구조적으로 음수가 되어 AllocationEngine entry_pass 단계에서 모든 candidate
-  # drop. 5/11~5/12 4 거래일 entries=0 silent failure 원인. OpportunityScorer
-  # 가 5일 수익률을 예측하는 알파라는 V3.3 가정이 noise로 확인. calibration
-  # 품질 개선 또는 Edge 입력 재설계 후 재활성.
+  # Phase 2 (Edge layer) — 2026-05-12 OFF, 2026-05-27 재활성 시도 후 revert.
+  # 5/27 사용자가 단계 A+B+C 재활성 결정했으나 v3-evaluator + 서버 점검 결과:
+  #   (SF-1) /opt/quant/v3/config/edge_calibration.json은 placeholder
+  #          (top_bottom=None, table_entries=0) — 5/11~12 사고 100% 재현 조건.
+  #   (CLI stub) build_edge_dataset.py는 wrapper script 없이 단독 실행 불가.
+  # 결정: 로컬 false 복원, deploy 안 함. wrapper script 작성은 별도 세션 과제
+  # (docs/FOLLOW_UPS.md 1순위에 추가).
   edge_calibrator: false
   edge_engine: false
   edge_tier: false

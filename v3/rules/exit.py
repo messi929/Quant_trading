@@ -46,6 +46,9 @@ class ExitRules:
         use_time_decay_tp: bool = True,
         mae_stop_threshold: float = -0.03,   # MAE -3% → tighten stop
         mae_stop_tightened: float = -0.025,   # After MAE trigger → -2.5% stop
+        trailing_activation: float = 0.03,   # Peak ≥ +3% → activate trailing
+        trailing_drop: float = 0.02,         # Drop ≥ 2% from peak → exit
+        use_trailing_stop: bool = True,      # A1 (2026-05-27): trailing stop 도입
     ):
         self.profit_take_pct = profit_take_pct
         self.max_hold_days = max_hold_days
@@ -54,6 +57,9 @@ class ExitRules:
         self.use_time_decay = use_time_decay_tp
         self.mae_threshold = mae_stop_threshold
         self.mae_tightened = mae_stop_tightened
+        self.trailing_activation = trailing_activation
+        self.trailing_drop = trailing_drop
+        self.use_trailing_stop = use_trailing_stop
 
     def check(
         self,
@@ -67,10 +73,16 @@ class ExitRules:
         low_price: float = 0.0,
         portfolio_deployed: float = 0.5,
         vol_history: list[float] | None = None,
+        peak_price: float = 0.0,
     ) -> ExitDecision:
-        """Check all exit conditions with Medallion-grade enhancements."""
+        """Check all exit conditions with Medallion-grade enhancements.
+
+        peak_price: 진입 후 관측된 최고가 (intraday high 포함). A1 trailing stop
+        용. 0이면 trailing 비활성 (backward-compat).
+        """
         return_pct = (current_price / entry_price - 1) if entry_price > 0 else 0
         mae = (low_price / entry_price - 1) if (entry_price > 0 and low_price > 0) else 0
+        peak_return = (peak_price / entry_price - 1) if (entry_price > 0 and peak_price > 0) else return_pct
 
         # P1: Portfolio-proportional daily stop
         dynamic_limit = self._dynamic_daily_limit(portfolio_deployed)
@@ -83,6 +95,15 @@ class ExitRules:
         if mae < self.mae_threshold or return_pct < self.mae_tightened:
             if return_pct < self.mae_tightened:
                 return ExitDecision(True, "dynamic_stop_mae", current_price, return_pct,
+                                    max_adverse_excursion=mae, trailing_stop_triggered=True)
+
+        # P2.5: Trailing stop (A1, 2026-05-27)
+        # peak ≥ +3% 도달 후, peak 대비 2% drop 시 청산 — winner 보호 + 비대칭
+        # 손익비 개선. profit_take time-decay 이전에 평가하여 큰 winner riding.
+        if self.use_trailing_stop and peak_return >= self.trailing_activation:
+            drawdown_from_peak = peak_return - return_pct
+            if drawdown_from_peak >= self.trailing_drop:
+                return ExitDecision(True, "trailing_stop", current_price, return_pct,
                                     max_adverse_excursion=mae, trailing_stop_triggered=True)
 
         # P3: Time-decay profit take (confidence-adjusted)
