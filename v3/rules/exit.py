@@ -29,8 +29,9 @@ class ExitRules:
     """Determines when to exit a position with time-decay and dynamic stops."""
 
     # Profit target decay: edge erodes over holding period
+    # A11 (2026-05-28): Day 1 5% → 7% (winner 첫날 강제 청산 완화, 페르소나 ②)
     TIME_DECAY_TARGETS = {
-        0: 0.050,   # Day 1: 5.0%
+        0: 0.070,   # Day 1: 7.0% (was 5.0%)
         1: 0.040,   # Day 2: 4.0%
         2: 0.030,   # Day 3: 3.0%
         3: 0.020,   # Day 4: 2.0%
@@ -135,11 +136,13 @@ class ExitRules:
         else:
             base = self.profit_take_pct
 
-        # Confidence adjustment: high conf → tighter (take faster), low → wider
+        # A10 (2026-05-28): Confidence 반전. high conf → wider (let winner run),
+        # low conf → tighter (take faster). 페르소나 ②"확신 있을 때 크게"
+        # 정합. 기존 logic은 거꾸로였음 (high conf에서 빠른 청산).
         if confidence > 0.75:
-            base *= 0.7
-        elif confidence < 0.45:
             base *= 1.3
+        elif confidence < 0.45:
+            base *= 0.7
 
         # Vol regime: high current vol → take smaller profits (more uncertain)
         if entry_vol > 0 and current_vol > 0:
