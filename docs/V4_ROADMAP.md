@@ -247,14 +247,30 @@ gate_multiplier = 3.0   # was 1.75
 ### C2. 새 alpha R&D 🔴 본질적 개선
 **문제**: subagent A + 5/13 IC 실험: trend +0.003, reversion -0.001 (둘 다 noise). volume_surprise +0.028만 marginal.
 
-**5/28 시도: AlphaPriceAcceleration**:
-- 구현: `v3/strategy/alpha_sources.py` AlphaPriceAcceleration (5d return − 이전 5d return, 2차 미분 의미)
-- 측정 (3년 lookback, panel 14,207): vanilla IC **+0.0052** (FAIL, threshold 0.02 미달)
-- Regime conditional 최대: strong_bull +0.0562 (n=198 표본 작음 noise), caution +0.0377
-- **Verdict: REGIME_ONLY** (DEFAULT 추가 안 함, REJECT for vanilla promotion)
+**5/28 시도 #1: AlphaPriceAcceleration**:
+- 구현: 2차 미분 (recent 5d return − previous 5d return)
+- 측정 (3년 lookback, panel 14,207): vanilla IC **+0.0052** (FAIL)
+- Regime 최대: strong_bull +0.0562 (n=198), caution +0.0377
+- **Verdict: REGIME_ONLY** (REJECT)
 - Report: `v3/research/reports/experimental_alpha_ic_20260528_074444.json`
 
-**5/13 + 5/28 누적**: 5 candidate 측정, 0개 vanilla PASS (volume_surprise 5/13 이미 promoted). **단순 cross-sectional alpha로는 한계 명확**.
+**5/28 시도 #2: AlphaBreakoutFade** ✅ PROMOTE_VANILLA:
+- 초기 구현 AlphaBreakout (20d high 돌파 + 추세 추종): vanilla IC **−0.0200**
+  → **부호 반대!** NASDAQ-100 대형주에서 20d high 돌파는 단기 exhaustion
+  (pop & drop) 신호로 측정됨
+- 부호 negation 후 AlphaBreakoutFade로 rename: vanilla IC **+0.0200** PASS
+- Regime conditional:
+  · **bear: +0.0815** (가장 강함, breakdown 후 회복)
+  · bull: +0.0585, neutral: +0.0266
+  · **caution: −0.0109** (paper 주력 regime, 약한 음수 — 효과 의문)
+  · strong_bull: +0.0019
+- **DEFAULT_DIRECTIONAL에 추가** (2026-05-28 c5c0853 다음 commit)
+  · test_regression.py `test_default_directional_promoted_set` invariant 갱신
+  · alpha_weights.json 5/13 학습이라 breakout_fade weight = 0 (production 0)
+  · **6/1 06:00 KST 자동 retrain 후** regime별 weight 부여, production 효과 발생
+- Report: `v3/research/reports/experimental_alpha_ic_20260528_080352.json`
+
+**5/13 + 5/28 누적**: 6 candidate 측정, 2개 vanilla PASS (volume_surprise +0.030 → 5/13 promoted, breakout_fade +0.020 negation 후 → 5/28 promoted).
 
 **다음 탐색 영역** (각 1~3개월):
 - AlphaBreakout: 20d high 돌파 + 거래량 confirmation

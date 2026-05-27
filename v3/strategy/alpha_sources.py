@@ -435,6 +435,99 @@ class AlphaVolPredicted(AlphaSource):
         return (np.tanh(z / 2.0) * ALPHA_SCALE).rename(self.name)
 
 
+class AlphaBreakoutFade(AlphaSource):
+    """20-day breakout fade with volume confirmation (V4 C2, 2026-05-28).
+
+    초기 가설(AlphaBreakout, 추세 추종): high 돌파 → 양수 alpha. → 측정 vanilla
+    IC -0.0200 (반대 방향). NASDAQ-100 대형주에서 **20d high 돌파는 단기
+    exhaustion 신호** (pop & drop). 부호 뒤집어 production 사용.
+
+    Hypothesis (final): high 돌파 → 5일 뒤 mean revert (음수 alpha).
+    Low 돌파 → 5일 뒤 회복 (양수 alpha). 거래량 surge가 confirm 시 더 강한 효과.
+
+    Construction:
+      recent_high  = max(close[-recent_n:])
+      recent_low   = min(close[-recent_n:])
+      prior_high   = max(close[-lookback:-recent_n])
+      prior_low    = min(close[-lookback:-recent_n])
+      breakout     = +1 if recent_high > prior_high else 0
+      breakdown    = -1 if recent_low  < prior_low  else 0
+      vol_ratio    = log( mean(volume[-recent_n:]) / SMA(lookback, volume) )
+      raw          = -1 × (breakout + breakdown) × max(vol_ratio + 1.0, 0.0)
+                     ^^^ negation for fade (vs 원래 추세 추종)
+      → cross-sectional z-score → tanh(z/2) × ALPHA_SCALE
+    """
+
+    def __init__(self, lookback: int = 20, recent_n: int = 5):
+        if lookback < recent_n + 1 or recent_n < 1:
+            raise ValueError(
+                f"AlphaBreakoutFade: lookback({lookback}) must be > recent_n({recent_n}) >= 1"
+            )
+        self.lookback: int = lookback
+        self.recent_n: int = recent_n
+        self._min_history: int = lookback + 1
+
+    @property
+    def name(self) -> str:
+        return "breakout_fade"
+
+    def compute(self, ohlcv: pd.DataFrame, **_: object) -> pd.Series:
+        if ohlcv.empty:
+            return pd.Series(dtype=float, name=self.name)
+        if "volume" not in ohlcv.columns:
+            return pd.Series(dtype=float, name=self.name)
+
+        df = ohlcv[["date", "ticker", "close", "volume"]].sort_values(["ticker", "date"])
+        raw: dict[str, float] = {}
+        for ticker, group in df.groupby("ticker", sort=False):
+            close = group["close"].to_numpy(dtype=float)
+            volume = group["volume"].to_numpy(dtype=float)
+            if len(close) < self._min_history or len(volume) < self._min_history:
+                continue
+
+            recent_close = close[-self.recent_n:]
+            prior_close = close[-self.lookback:-self.recent_n]
+            recent_vol = volume[-self.recent_n:]
+            prior_vol = volume[-self.lookback:]
+
+            if (
+                prior_close.size == 0 or prior_vol.size == 0
+                or not np.all(np.isfinite(recent_close))
+                or not np.all(np.isfinite(prior_close))
+            ):
+                continue
+
+            recent_high = float(recent_close.max())
+            recent_low = float(recent_close.min())
+            prior_high = float(prior_close.max())
+            prior_low = float(prior_close.min())
+
+            breakout = 1.0 if recent_high > prior_high else 0.0
+            breakdown = -1.0 if recent_low < prior_low else 0.0
+            signal = breakout + breakdown   # ∈ {-1, 0, +1}
+
+            mean_recent_vol = float(recent_vol.mean()) if recent_vol.size > 0 else 0.0
+            mean_prior_vol = float(prior_vol.mean()) if prior_vol.size > 0 else 0.0
+            if mean_prior_vol <= 0 or mean_recent_vol <= 0:
+                vol_factor = 1.0
+            else:
+                vol_ratio_log = float(np.log(mean_recent_vol / mean_prior_vol))
+                vol_factor = max(vol_ratio_log + 1.0, 0.0)
+
+            raw[ticker] = -1.0 * signal * vol_factor   # fade: negation
+
+        if not raw:
+            return pd.Series(dtype=float, name=self.name)
+
+        s = pd.Series(raw, dtype=float)
+        std = s.std(ddof=0)
+        if std < 1e-12:
+            return pd.Series(0.0, index=s.index, name=self.name)
+
+        z = (s - s.mean()) / std
+        return (np.tanh(z / 2.0) * ALPHA_SCALE).rename(self.name)
+
+
 class AlphaPriceAcceleration(AlphaSource):
     """Price acceleration: recent N-day return − previous N-day return.
 
@@ -546,6 +639,8 @@ DEFAULT_DIRECTIONAL: tuple[AlphaSource, ...] = (
     AlphaTrend(),
     AlphaReversion(),
     AlphaVolumeSurprise(),  # 2026-05-13 promoted: vanilla IC +0.028, caution +0.059
+    AlphaBreakoutFade(),    # 2026-05-28 promoted: vanilla IC +0.020 (negation 후),
+                             # bear +0.082, bull +0.059, caution -0.011 (paper 주력 약함)
 )
 
 # Experimental tuple — used only by v3/research/test_new_alphas.py for IC

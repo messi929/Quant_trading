@@ -940,11 +940,13 @@ class TestExperimentalAlphasContract:
 
         2026-05-13 follow-up #2: volume_surprise vanilla IC +0.028 통과로
         promoted. vol_term / earnings_proximity / vol_predicted는 vanilla 미달.
+        2026-05-28 V4 C2: breakout_fade vanilla IC +0.020 (부호 negation 후)
+        통과로 promoted. price_acceleration은 vanilla 미달 (REGIME_ONLY).
         DEFAULT_DIRECTIONAL이 임의 확장되지 않도록 정확한 멤버 enforce.
         """
         from v3.strategy.alpha_sources import DEFAULT_DIRECTIONAL
         names = {s.name for s in DEFAULT_DIRECTIONAL}
-        assert names == {"trend", "reversion", "volume_surprise"}, (
+        assert names == {"trend", "reversion", "volume_surprise", "breakout_fade"}, (
             f"DEFAULT_DIRECTIONAL changed unexpectedly: {names}. "
             f"신규 알파 promotion은 v3/research/test_new_alphas.py IC 검증 후"
             f" 본 invariant 갱신과 함께만 가능."
