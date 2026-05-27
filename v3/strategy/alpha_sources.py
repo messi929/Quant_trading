@@ -435,6 +435,72 @@ class AlphaVolPredicted(AlphaSource):
         return (np.tanh(z / 2.0) * ALPHA_SCALE).rename(self.name)
 
 
+class AlphaPriceAcceleration(AlphaSource):
+    """Price acceleration: recent N-day return − previous N-day return.
+
+    Hypothesis (V4 C2, 2026-05-28): 2nd derivative of price = momentum
+    building or dying. Recent strong > Previous strong → accelerating.
+    Trend (1st derivative) is average return; acceleration is *change* in
+    return — orthogonal information.
+
+    Construction:
+      recent_ret = close[-1] / close[-N-1] - 1
+      prev_ret   = close[-N-1] / close[-2N-1] - 1
+      raw        = recent_ret - prev_ret
+      → cross-sectional z-score → tanh(z/2) × ALPHA_SCALE
+
+    Default window=5: 1-week acceleration over previous week. Tested via
+    v3/research/test_new_alphas.py before any promotion.
+    """
+
+    def __init__(self, window: int = 5):
+        if window < 1:
+            raise ValueError(f"AlphaPriceAcceleration window must be >= 1: {window}")
+        self.window: int = window
+        self._max_period: int = 2 * window
+
+    @property
+    def name(self) -> str:
+        return "price_acceleration"
+
+    def compute(self, ohlcv: pd.DataFrame, **_: object) -> pd.Series:
+        if ohlcv.empty:
+            return pd.Series(dtype=float, name=self.name)
+
+        df = ohlcv[["date", "ticker", "close"]].sort_values(["ticker", "date"])
+        raw: dict[str, float] = {}
+        for ticker, group in df.groupby("ticker", sort=False):
+            close = group["close"].to_numpy(dtype=float)
+            if len(close) < self._max_period + 1:
+                continue
+
+            recent_base = float(close[-self.window - 1])
+            prev_base = float(close[-self._max_period - 1])
+
+            if (
+                recent_base <= 0 or prev_base <= 0
+                or not np.isfinite(recent_base)
+                or not np.isfinite(prev_base)
+            ):
+                continue
+
+            recent_ret = float(close[-1] / recent_base - 1.0)
+            prev_ret = float(recent_base / prev_base - 1.0)
+
+            raw[ticker] = recent_ret - prev_ret
+
+        if not raw:
+            return pd.Series(dtype=float, name=self.name)
+
+        s = pd.Series(raw, dtype=float)
+        std = s.std(ddof=0)
+        if std < 1e-12:
+            return pd.Series(0.0, index=s.index, name=self.name)
+
+        z = (s - s.mean()) / std
+        return (np.tanh(z / 2.0) * ALPHA_SCALE).rename(self.name)
+
+
 # ──────────────────────────────────────────────────────────────
 # Conviction sources
 # ──────────────────────────────────────────────────────────────

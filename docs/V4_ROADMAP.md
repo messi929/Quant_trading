@@ -247,13 +247,26 @@ gate_multiplier = 3.0   # was 1.75
 ### C2. 새 alpha R&D 🔴 본질적 개선
 **문제**: subagent A + 5/13 IC 실험: trend +0.003, reversion -0.001 (둘 다 noise). volume_surprise +0.028만 marginal.
 
-**탐색 영역**:
-- Options flow alpha (P/C ratio, gamma exposure) — 데이터 수집부터
-- Sentiment alpha (news NLP, NAAIM, Fear & Greed)
-- Multi-timeframe momentum (주봉/월봉 confirmation)
-- Cross-asset alpha (bond → equity flow)
-- Insider trading (Form 4) signals
-- Institutional positioning (13F)
+**5/28 시도: AlphaPriceAcceleration**:
+- 구현: `v3/strategy/alpha_sources.py` AlphaPriceAcceleration (5d return − 이전 5d return, 2차 미분 의미)
+- 측정 (3년 lookback, panel 14,207): vanilla IC **+0.0052** (FAIL, threshold 0.02 미달)
+- Regime conditional 최대: strong_bull +0.0562 (n=198 표본 작음 noise), caution +0.0377
+- **Verdict: REGIME_ONLY** (DEFAULT 추가 안 함, REJECT for vanilla promotion)
+- Report: `v3/research/reports/experimental_alpha_ic_20260528_074444.json`
+
+**5/13 + 5/28 누적**: 5 candidate 측정, 0개 vanilla PASS (volume_surprise 5/13 이미 promoted). **단순 cross-sectional alpha로는 한계 명확**.
+
+**다음 탐색 영역** (각 1~3개월):
+- AlphaBreakout: 20d high 돌파 + 거래량 confirmation
+- AlphaMACD: 12-26 cross + histogram momentum
+- AlphaRelativeStrength vs SPY (sector neutral) — SPY 데이터 추가 필요
+- Multi-timeframe alpha (주봉/4시간봉 confirmation, 별도 데이터)
+- Options flow alpha (P/C ratio, gamma exposure) — 외부 데이터 필수
+- Sentiment alpha (news NLP, NAAIM, Fear & Greed) — 외부 데이터
+- Cross-asset alpha (bond → equity flow) — macro 확장
+- Insider trading (Form 4), Institutional 13F — 외부 데이터
+
+**핵심 통찰**: 시스템이 작은 edge (volume_surprise 0.03)로 작동 중. **큰 개선은 새 정보 소스 필요** — 단순 가격/거래량 derivative로는 ceiling 확인됨.
 
 **소요**: 각 alpha당 1~3개월 (데이터 수집 + IC 측정 + production)
 

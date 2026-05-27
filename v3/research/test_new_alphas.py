@@ -36,6 +36,7 @@ from v3.backtest.alpha_weight_trainer import (
 )
 from v3.strategy.alpha_sources import (
     AlphaEarningsProximity,
+    AlphaPriceAcceleration,
     AlphaReversion,
     AlphaTrend,
     AlphaVolPredicted,
@@ -48,6 +49,7 @@ from v3.strategy.alpha_sources import (
 
 CANDIDATE_NAMES: tuple[str, ...] = (
     "volume_surprise", "vol_term", "earnings_proximity", "vol_predicted",
+    "price_acceleration",  # V4 C2 (2026-05-28)
 )
 
 
@@ -90,6 +92,7 @@ def main() -> int:
         AlphaVolTermStructure(),
         AlphaEarningsProximity(earnings_map, decay_days=args.earnings_decay_days),
         AlphaVolPredicted(),  # vol_scores는 trainer가 compute_directional 호출 시 forward
+        AlphaPriceAcceleration(),  # V4 C2 (2026-05-28)
     )
     trainer = AlphaWeightTrainer(
         directional_sources=sources,
