@@ -91,7 +91,7 @@ gates:
 trading:
   max_positions: 1                 # v3.1-safe: 3→1 (실거래 미검증, paper 보수 운영)
   max_single_weight: 0.40
-  min_order_amount_krw: 15_000_000  # A12 (2026-05-28): 5M→15M (페르소나 ②"크게" 직접 처방)
+  min_order_amount_krw: 5_000_000   # A12 시도 (15M) → pyramid test 회귀 fail로 5M revert
   max_trades_per_month: 10         # A3 (2026-05-27): 5→10 (paper entries=0 해소, 알파 게이트가 quality 통제)
   max_hold_days: 5                 # 5일 보유 (V2: 3일)
   profit_take_pct: 0.05

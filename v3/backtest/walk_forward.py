@@ -35,6 +35,7 @@ class WalkForwardValidator:
         step_days: int = 63,
         train_epochs: int = 15,   # Fewer epochs per fold (speed)
         patience: int = 5,
+        max_folds: int = 0,        # 0 = all
     ) -> dict:
         """Run walk-forward with model retraining per fold.
 
@@ -60,6 +61,9 @@ class WalkForwardValidator:
                 break
 
             fold += 1
+            if max_folds > 0 and fold > max_folds:
+                logger.info(f"max_folds={max_folds} reached, stopping")
+                break
             train_dates = set(dates[start_idx:train_end])
             test_dates_set = set(dates[train_end:test_end])
 
@@ -150,13 +154,10 @@ class WalkForwardValidator:
             vol_preds = pd.DataFrame(predictions)
 
             # 5. Backtest
+            # Phase 2 재설계 이후 entry_filter는 SignalGenerator 내부.
+            # cfg default 그대로 사용 (baseline backtest와 동일 logic).
+            # mae override (구버전 -0.99)도 제거 — baseline과 정합.
             engine = BacktestEngine(self.cfg)
-            engine.exit_rules.mae_threshold = -0.99
-            engine.exit_rules.mae_tightened = -0.99
-            engine.entry_filter.min_vol_expansion = self.cfg.trading.min_vol_expansion
-            engine.entry_filter.min_confidence = self.cfg.trading.min_confidence
-            engine.entry_filter.min_clarity = self.cfg.trading.direction_rules.min_direction_clarity
-
             bt_result = engine.run(df, vol_preds)
 
             logger.info(f"  Fold {fold}: trades={bt_result.total_trades} "

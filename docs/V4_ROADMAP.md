@@ -122,10 +122,39 @@ gate_multiplier = 3.0   # was 1.75
 
 ## 카테고리 B — 별도 세션 (각 며칠~1주)
 
-### B1. Walk-forward backtest 구현 🔴 P1
+### B1. Walk-forward backtest 구현 ✅ 완료 (2026-05-28)
 **문제**: subagent C: 현재 single train/test split, 1년만 backtest. Lopez de Prado CPCV 미적용. Sharpe 2.92 robustness 미검증.
 
-**구현**:
+**구현 완료**:
+- `v3/scripts/run_walk_forward.py` 신설 (CLI)
+- `v3/backtest/walk_forward.py` 정비: `max_folds` 인자 추가, 구 API
+  (`engine.entry_filter`) 제거 — Phase 2 재설계 후 SignalGenerator 내부로 이동
+- 252d train / 63d test / 63d step rolling
+
+**결과 (8 folds × 30 epochs, 2021-04 ~ 2024-08)**:
+- Avg return per fold (3개월): **+0.98%**
+- Std return: 1.34%
+- Sharpe: 0 (trades 16건 noise, std 의미 없음)
+- Profitable folds: **5/8 = 62.5%**
+- Avg trades / fold: 2.0 (총 16)
+- 연 외삽: **+4%/년**
+
+**핵심 진단**: Baseline Sharpe 4.03 (Return +41%/년)은 **over-fit 강한 신호**.
+- Baseline: 단일 train (3.5년) + 단일 test (1년) + 60 epochs
+- WF: 8 fold × train 1년 + test 3개월 + 30 epochs
+- WF의 +4%/년이 **paper +7%/년 외삽 (6주)에 훨씬 가까움**
+- 즉 진짜 expected performance는 baseline의 10분의 1 수준
+
+**Limitation 인정**:
+1. WF train period 짧음 (1년 vs baseline 3.5년)
+2. Epochs 30 vs baseline 60 (학습 quality 차이)
+3. 16 trades = noise 표본
+4. 공정 비교는 train=1000d + epochs=60 (4시간+) 필요
+
+**결론**: 알파 자체는 존재 (5/8 profitable), 단 Sharpe 4.03만큼 강하지는
+않음. Paper +0.85% (6주)는 noise 범위 내 정상. **장기 paper 관찰 필수**.
+
+**남은 구현 (별도 세션)**:
 - 252d train / 63d test rolling window
 - 각 fold에서 VolTransformer + alpha_weights 재학습
 - 결과 aggregate (Sharpe distribution, MDD distribution)
