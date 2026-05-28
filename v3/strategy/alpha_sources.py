@@ -319,6 +319,103 @@ def load_earnings_dates(path: str | "Path") -> dict[str, list[pd.Timestamp]]:
     return {t: [pd.Timestamp(d) for d in dates] for t, dates in data.items()}
 
 
+class AlphaEarningsSurprise(AlphaSource):
+    """Post-earnings announcement drift (PEAD) — V4 C2 edge (2026-05-28).
+
+    Hypothesis (학술적으로 robust한 anomaly): positive earnings surprise 후
+    가격이 며칠~수주 동안 같은 방향으로 drift. Market underreacts to earnings.
+
+    Construction:
+      last       = most recent PAST earnings (date ≤ as_of) with surprise
+      days_since = (as_of - last.date).days
+      if days_since > window_days: 0 (drift 소멸)
+      raw        = surprise_pct × exp(-days_since / decay_days)   # PEAD signed
+      → cross-sectional z-score → tanh(z/2) × ALPHA_SCALE
+
+    Requires surprise_by_ticker map (earnings_collector --with-surprise output).
+    Use `load_earnings_surprise(json_path)`.
+    """
+
+    def __init__(
+        self,
+        surprise_by_ticker: dict[str, list[dict]],
+        window_days: int = 15,
+        decay_days: float = 7.0,
+    ):
+        if decay_days <= 0:
+            raise ValueError(f"decay_days must be positive: {decay_days}")
+        if window_days < 1:
+            raise ValueError(f"window_days must be >= 1: {window_days}")
+        normalized: dict[str, list[tuple[pd.Timestamp, float]]] = {}
+        for ticker, rows in (surprise_by_ticker or {}).items():
+            seq: list[tuple[pd.Timestamp, float]] = []
+            for r in rows:
+                ts = pd.Timestamp(r["date"])
+                if getattr(ts, "tz", None) is not None:
+                    ts = ts.tz_convert(None) if ts.tz is not None else ts
+                sp = r.get("surprise_pct")
+                if sp is None:
+                    continue
+                seq.append((ts.normalize(), float(sp)))
+            normalized[ticker] = sorted(seq, key=lambda x: x[0])
+        self._surprise = normalized
+        self.window_days = int(window_days)
+        self.decay_days = float(decay_days)
+
+    @property
+    def name(self) -> str:
+        return "earnings_surprise"
+
+    def compute(self, ohlcv: pd.DataFrame, **_: object) -> pd.Series:
+        if ohlcv.empty or "date" not in ohlcv.columns:
+            return pd.Series(dtype=float, name=self.name)
+
+        as_of = pd.Timestamp(ohlcv["date"].max()).normalize()
+
+        raw: dict[str, float] = {}
+        for ticker, seq in self._surprise.items():
+            past = [(d, sp) for d, sp in seq if d <= as_of]
+            if not past:
+                continue
+            last_date, surprise_pct = past[-1]
+            days_since = float((as_of - last_date).days)
+            if days_since < 0 or days_since > self.window_days:
+                continue
+            drift = surprise_pct * float(np.exp(-days_since / self.decay_days))
+            raw[ticker] = drift
+
+        if not raw:
+            return pd.Series(dtype=float, name=self.name)
+        s = pd.Series(raw, dtype=float)
+        std = s.std(ddof=0)
+        if std < 1e-12:
+            return pd.Series(0.0, index=s.index, name=self.name)
+        z = (s - s.mean()) / std
+        return (np.tanh(z / 2.0) * ALPHA_SCALE).rename(self.name)
+
+
+def load_earnings_surprise(path: str | "Path") -> dict[str, list[dict]]:
+    """Load earnings_surprise.json (collector --with-surprise) into ticker→rows.
+
+    rows: [{date: Timestamp, surprise_pct: float}, ...]
+    """
+    import json
+    from pathlib import Path as _Path
+    p = _Path(path)
+    if not p.exists():
+        return {}
+    artifact = json.loads(p.read_text(encoding="utf-8"))
+    data = artifact.get("data", {})
+    out: dict[str, list[dict]] = {}
+    for t, rows in data.items():
+        out[t] = [
+            {"date": pd.Timestamp(r["date"]), "surprise_pct": r["surprise_pct"]}
+            for r in rows
+            if r.get("surprise_pct") is not None
+        ]
+    return out
+
+
 class AlphaVolTermStructure(AlphaSource):
     """Vol term-structure alpha: short/long vol ratio, signed by recent return.
 

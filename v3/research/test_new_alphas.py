@@ -37,6 +37,7 @@ from v3.backtest.alpha_weight_trainer import (
 from v3.strategy.alpha_sources import (
     AlphaBreakoutFade,
     AlphaEarningsProximity,
+    AlphaEarningsSurprise,
     AlphaGapFade,
     AlphaPriceAcceleration,
     AlphaRSIReversal,
@@ -47,6 +48,7 @@ from v3.strategy.alpha_sources import (
     AlphaVolumeSurprise,
     DEFAULT_CONVICTION,
     load_earnings_dates,
+    load_earnings_surprise,
 )
 
 
@@ -55,6 +57,7 @@ CANDIDATE_NAMES: tuple[str, ...] = (
     "price_acceleration",  # V4 C2 (2026-05-28)
     "breakout_fade",       # V4 C2 (2026-05-28 #2, IC negation 후)
     "rsi_reversal", "gap_fade",  # V4 C2 (2026-05-28 #3, #4 contrarian)
+    "earnings_surprise",   # V4 C2 (2026-05-28 #5, PEAD edge)
 )
 
 
@@ -79,6 +82,12 @@ def main() -> int:
         default=7.0,
         help="exp(-days/decay) for proximity magnitude",
     )
+    parser.add_argument(
+        "--earnings-surprise",
+        type=str,
+        default="v3/data/raw/earnings_surprise.json",
+        help="Path to earnings_surprise.json (collector --with-surprise)",
+    )
     args = parser.parse_args()
 
     # Earnings proximity needs external data; skip the alpha if file missing.
@@ -88,6 +97,14 @@ def main() -> int:
             f"earnings_dates not found at {args.earnings_dates} — "
             f"AlphaEarningsProximity will produce empty signal. Run "
             f"v3/data/earnings_collector.py first."
+        )
+
+    # Earnings surprise (PEAD) needs --with-surprise output.
+    surprise_map = load_earnings_surprise(args.earnings_surprise)
+    if not surprise_map:
+        logger.warning(
+            f"earnings_surprise not found at {args.earnings_surprise} — "
+            f"AlphaEarningsSurprise empty. Run earnings_collector.py --with-surprise."
         )
 
     sources = (
@@ -101,6 +118,7 @@ def main() -> int:
         AlphaBreakoutFade(),       # V4 C2 (2026-05-28 #2, fade: 부호 negation 후 양수 IC)
         AlphaRSIReversal(),        # V4 C2 (2026-05-28 #3, contrarian)
         AlphaGapFade(),            # V4 C2 (2026-05-28 #4, contrarian)
+        AlphaEarningsSurprise(surprise_map),  # V4 C2 (2026-05-28 #5, PEAD edge)
     )
     trainer = AlphaWeightTrainer(
         directional_sources=sources,

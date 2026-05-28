@@ -75,6 +75,63 @@ def collect_earnings_dates(
     return result
 
 
+def collect_earnings_surprise(
+    tickers: list[str],
+    limit_per_ticker: int = 20,
+    sleep_sec: float = 0.5,
+) -> dict[str, list[dict]]:
+    """Fetch earnings dates + surprise for each ticker (V4 C2 PEAD alpha).
+
+    Returns {ticker: [{date, surprise_pct, eps_estimate, reported_eps}, ...]}
+    sorted ascending. Only past earnings with non-NaN Reported EPS kept
+    (future/unreported dates excluded to avoid lookahead).
+    """
+    result: dict[str, list[dict]] = {}
+
+    for i, ticker in enumerate(tickers, 1):
+        rows: list[dict] = []
+        try:
+            t = yf.Ticker(ticker)
+            ed = t.get_earnings_dates(limit=limit_per_ticker)
+            if ed is None or ed.empty:
+                logger.warning(f"[{i}/{len(tickers)}] {ticker}: empty")
+                result[ticker] = []
+                continue
+            idx = ed.index
+            if getattr(idx, "tz", None) is not None:
+                idx = idx.tz_convert(None) if idx.tz is not None else idx
+            dates = pd.to_datetime(idx).normalize()
+            for j, d in enumerate(dates):
+                reported = ed["Reported EPS"].iloc[j]
+                surprise = ed["Surprise(%)"].iloc[j]
+                estimate = ed["EPS Estimate"].iloc[j]
+                # Skip future / unreported (Reported EPS NaN → lookahead 방지)
+                if pd.isna(reported) or pd.isna(surprise):
+                    continue
+                rows.append({
+                    "date": d.to_pydatetime().date().isoformat(),
+                    "surprise_pct": float(surprise),
+                    "eps_estimate": float(estimate) if pd.notna(estimate) else None,
+                    "reported_eps": float(reported),
+                })
+            rows.sort(key=lambda r: r["date"])
+            result[ticker] = rows
+            if rows:
+                logger.info(
+                    f"[{i}/{len(tickers)}] {ticker}: {len(rows)} reported "
+                    f"({rows[0]['date']} ~ {rows[-1]['date']})"
+                )
+            else:
+                logger.warning(f"[{i}/{len(tickers)}] {ticker}: no reported earnings")
+        except (KeyError, ValueError, AttributeError, ConnectionError) as exc:
+            logger.warning(f"[{i}/{len(tickers)}] {ticker}: {type(exc).__name__} {exc}")
+            result[ticker] = []
+        if i < len(tickers):
+            time.sleep(sleep_sec)
+
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -90,13 +147,25 @@ def main() -> int:
     )
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--sleep", type=float, default=0.5)
+    parser.add_argument(
+        "--with-surprise",
+        action="store_true",
+        help="Collect EPS surprise(%)/estimate/reported (V4 C2 PEAD alpha). "
+        "Output schema: data[ticker] = [{date, surprise_pct, eps_estimate, reported_eps}]",
+    )
     args = parser.parse_args()
 
     df = pd.read_parquet(args.tickers_from)
     tickers = sorted(df["ticker"].unique().tolist())
-    logger.info(f"Collecting earnings dates for {len(tickers)} tickers...")
 
-    data = collect_earnings_dates(tickers, args.limit, args.sleep)
+    if args.with_surprise:
+        logger.info(f"Collecting earnings surprise for {len(tickers)} tickers...")
+        data = collect_earnings_surprise(tickers, args.limit, args.sleep)
+        source = "yfinance.Ticker.get_earnings_dates (with surprise)"
+    else:
+        logger.info(f"Collecting earnings dates for {len(tickers)} tickers...")
+        data = collect_earnings_dates(tickers, args.limit, args.sleep)
+        source = "yfinance.Ticker.get_earnings_dates"
 
     n_with_data = sum(1 for v in data.values() if v)
     out_path = Path(args.output)
@@ -107,7 +176,8 @@ def main() -> int:
             "n_tickers": len(tickers),
             "n_with_data": n_with_data,
             "limit_per_ticker": args.limit,
-            "source": "yfinance.Ticker.get_earnings_dates",
+            "source": source,
+            "with_surprise": args.with_surprise,
         },
         "data": data,
     }

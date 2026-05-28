@@ -294,6 +294,36 @@ gate_multiplier = 3.0   # was 1.75
 ceiling ≈ 0.02~0.03**. 큰 개선은 **새 정보 소스 필요** (options flow, sentiment,
 institutional positioning, multi-asset). 단순 OHLCV derivative로는 한계 명확.
 
+#### 외부 데이터 edge 시도 (2026-05-28) — earnings surprise (PEAD)
+
+A+B+D 배치 시도 → 데이터 가용성:
+- **A. Earnings surprise**: ✅ yfinance get_earnings_dates에 EPS Estimate/Reported/
+  Surprise(%) 5년 quarterly. collector `--with-surprise` 확장 + 재수집 (99/99).
+- **B. Short interest**: ❌ yfinance snapshot만, historical 없음 → backtest IC 불가
+- **D. Insider Form 4**: 🟡 SEC EDGAR 3년치 수집 큰 작업 → 별도 세션
+
+**AlphaEarningsSurprise (PEAD) IC**: vanilla **+0.0007** (REJECT)
+- bull +0.048, **bear −0.111**, caution −0.012, neutral −0.003
+- panel 2505 (earnings window 15d 내 종목만, 전체의 18%)
+
+**메타 통찰 — universe가 edge ceiling을 결정**:
+- PEAD는 학술적으로 robust anomaly인데 NASDAQ-100에서 ~0
+- 이유: PEAD는 **small-cap에서 강하고 large-cap에서 약함** (analyst coverage
+  많아 earnings 정보 즉시 반영 = efficient)
+- 종합: 단순 alpha (ceiling 0.02~0.03) + 외부 데이터 PEAD (~0)
+  → **문제는 alpha가 아니라 universe**. NASDAQ-100은 세계에서 가장 efficient한
+  large-cap 집합. 어떤 alpha든 ceiling 낮음.
+
+**철학 재검토 결론 — 새 edge는 alpha가 아닌 universe/시장에서**:
+| 방향 | 근거 | 트레이드오프 |
+|------|------|-------------|
+| 비효율 universe (small/mid-cap, 신흥국) | PEAD/momentum/breakout 강해짐 | 유동성↓ 비용↑ 데이터 |
+| vol-self trade (옵션 straddle) | 우리 IC 0.70 활용, direction 무관 | 옵션 인프라 (큰 작업) |
+| 현 수준 수용 | WF +4%/년, paper +7%/년 | 페르소나 목표(월1%) 미달 |
+
+B(short interest)/D(insider)도 large-cap efficiency로 비슷한 결과 예상.
+**단일 alpha 추가 트랙 졸업 — universe 전환 또는 vol-self trade가 본질적 lever.**
+
 #### Multi-horizon IC 실험 (2026-05-28) — forward_horizon 5d 유지 결론
 
 alpha별 vanilla IC를 1d/3d/5d/10d horizon에서 측정:
