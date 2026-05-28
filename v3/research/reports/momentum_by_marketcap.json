@@ -1,0 +1,115 @@
+{
+  "generated_at": "2026-05-29T00:59:25",
+  "horizon": 20,
+  "lookbacks": [
+    20,
+    60,
+    120
+  ],
+  "groups": {
+    "NASDAQ_megacap": {
+      "lookback_20": {
+        "ts_momentum_premium": -0.020167291461075657,
+        "ts_long_fwd_mean": 0.013954157600973339,
+        "ts_down_fwd_mean": 0.034121449062048996,
+        "cs_momentum_ic": -0.048430141287284144,
+        "n_long": 694,
+        "n_short": 531
+      },
+      "lookback_60": {
+        "ts_momentum_premium": 0.0072151504572300455,
+        "ts_long_fwd_mean": 0.02638582925880848,
+        "ts_down_fwd_mean": 0.019170678801578436,
+        "cs_momentum_ic": 0.023715220949263496,
+        "n_long": 730,
+        "n_short": 445
+      },
+      "lookback_120": {
+        "ts_momentum_premium": -0.007153361946818666,
+        "ts_long_fwd_mean": 0.025321187675328486,
+        "ts_down_fwd_mean": 0.03247454962214715,
+        "cs_momentum_ic": -0.013006993006993007,
+        "n_long": 757,
+        "n_short": 343
+      }
+    },
+    "NASDAQ_smallcap": {
+      "lookback_20": {
+        "ts_momentum_premium": -0.012656116642061375,
+        "ts_long_fwd_mean": 0.001201061955100015,
+        "ts_down_fwd_mean": 0.01385717859716139,
+        "cs_momentum_ic": -0.04628887944817208,
+        "n_long": 702,
+        "n_short": 765
+      },
+      "lookback_60": {
+        "ts_momentum_premium": -0.0226695614273058,
+        "ts_long_fwd_mean": -0.005499147143356726,
+        "ts_down_fwd_mean": 0.017170414283949074,
+        "cs_momentum_ic": -0.05428084565423925,
+        "n_long": 681,
+        "n_short": 727
+      },
+      "lookback_120": {
+        "ts_momentum_premium": -0.02758409331045782,
+        "ts_long_fwd_mean": -0.005041468349029361,
+        "ts_down_fwd_mean": 0.02254262496142846,
+        "cs_momentum_ic": -0.06393539719457407,
+        "n_long": 595,
+        "n_short": 721
+      }
+    },
+    "KOSPI": {
+      "lookback_20": {
+        "ts_momentum_premium": 0.003133724405051462,
+        "ts_long_fwd_mean": 0.020307575523666,
+        "ts_down_fwd_mean": 0.01717385111861454,
+        "cs_momentum_ic": 0.0350900163666121,
+        "n_long": 620,
+        "n_short": 546
+      },
+      "lookback_60": {
+        "ts_momentum_premium": 0.014649738974819809,
+        "ts_long_fwd_mean": 0.026953801157005203,
+        "ts_down_fwd_mean": 0.012304062182185395,
+        "cs_momentum_ic": 0.0631111111111111,
+        "n_long": 630,
+        "n_short": 490
+      },
+      "lookback_120": {
+        "ts_momentum_premium": 0.016816047863165613,
+        "ts_long_fwd_mean": 0.028950033536858204,
+        "ts_down_fwd_mean": 0.012133985673692591,
+        "cs_momentum_ic": 0.052399267399267396,
+        "n_long": 656,
+        "n_short": 392
+      }
+    },
+    "KOSDAQ": {
+      "lookback_20": {
+        "ts_momentum_premium": 0.009931363546948551,
+        "ts_long_fwd_mean": 0.02947044039074244,
+        "ts_down_fwd_mean": 0.019539076843793888,
+        "cs_momentum_ic": 0.045295182372524424,
+        "n_long": 557,
+        "n_short": 520
+      },
+      "lookback_60": {
+        "ts_momentum_premium": 0.029163842477256167,
+        "ts_long_fwd_mean": 0.040290348242934544,
+        "ts_down_fwd_mean": 0.011126505765678378,
+        "cs_momentum_ic": 0.048397013614404905,
+        "n_long": 553,
+        "n_short": 480
+      },
+      "lookback_120": {
+        "ts_momentum_premium": 0.024357621359179682,
+        "ts_long_fwd_mean": 0.042506227861519356,
+        "ts_down_fwd_mean": 0.018148606502339674,
+        "cs_momentum_ic": 0.041878411443628825,
+        "n_long": 525,
+        "n_short": 441
+      }
+    }
+  }
+}

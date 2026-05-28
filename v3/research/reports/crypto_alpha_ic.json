@@ -1,0 +1,79 @@
+{
+  "generated_at": "2026-05-29T00:17:46",
+  "universe": [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "DOGEUSDT",
+    "ADAUSDT",
+    "AVAXUSDT",
+    "LINKUSDT",
+    "DOTUSDT",
+    "LTCUSDT",
+    "BCHUSDT",
+    "ATOMUSDT",
+    "UNIUSDT",
+    "ETCUSDT",
+    "FILUSDT",
+    "APTUSDT",
+    "ARBUSDT",
+    "OPUSDT",
+    "INJUSDT",
+    "SUIUSDT",
+    "NEARUSDT",
+    "AAVEUSDT",
+    "TIAUSDT",
+    "SEIUSDT",
+    "LDOUSDT",
+    "RNDRUSDT",
+    "FETUSDT",
+    "MKRUSDT",
+    "STXUSDT"
+  ],
+  "n_coins": 30,
+  "ohlcv_rows": 32066,
+  "alpha_ic_by_horizon": {
+    "1": {
+      "trend": -0.003480144336071962,
+      "reversion": 0.017851205575524807,
+      "volume_surprise": -0.003828447311838274,
+      "breakout_fade": 0.005659824355420205,
+      "rsi_reversal": 0.0021358911372717716
+    },
+    "3": {
+      "trend": 0.013572958130107953,
+      "reversion": 0.0009116130940211458,
+      "volume_surprise": 0.007735832590648953,
+      "breakout_fade": -0.001089262839907854,
+      "rsi_reversal": -0.01053768491906997
+    },
+    "5": {
+      "trend": 0.02334962902220548,
+      "reversion": -0.033141304250136436,
+      "volume_surprise": -0.002407460951741723,
+      "breakout_fade": -0.01215067036086873,
+      "rsi_reversal": -0.03816016103115935
+    },
+    "7": {
+      "trend": 0.012046919161400098,
+      "reversion": 0.00539888183675398,
+      "volume_surprise": -0.0249957503703496,
+      "breakout_fade": 0.0033035755031453583,
+      "rsi_reversal": -0.026288916766150926
+    }
+  },
+  "funding_carry": {
+    "funding_carry_ic": -0.03778852591666652,
+    "n_dates": 66
+  },
+  "baseline_nasdaq_5d": {
+    "trend": -0.002,
+    "reversion": 0.004,
+    "volume_surprise": 0.03,
+    "breakout_fade": 0.02,
+    "rsi_reversal": 0.015
+  },
+  "best_abs_ic": 0.03816016103115935
+}
