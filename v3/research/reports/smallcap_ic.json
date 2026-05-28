@@ -1,0 +1,74 @@
+{
+  "generated_at": "2026-05-28T20:03:19",
+  "universe_size": 31,
+  "tickers": [
+    "APPN",
+    "BL",
+    "PD",
+    "AI",
+    "BRZE",
+    "ASAN",
+    "FSLY",
+    "GTLB",
+    "BEAM",
+    "NTLA",
+    "RARE",
+    "FOLD",
+    "YETI",
+    "SHAK",
+    "WING",
+    "CAKE",
+    "PLAY",
+    "DNUT",
+    "KFY",
+    "UPST",
+    "LMND",
+    "TREE",
+    "OPEN",
+    "AMBA",
+    "POWI",
+    "INDI",
+    "CRK",
+    "DOCS",
+    "PRVA",
+    "OMCL",
+    "PGNY"
+  ],
+  "cap_max": 5000000000.0,
+  "cap_min": 300000000.0,
+  "horizon": 5,
+  "ic": {
+    "trend": {
+      "mean_ic": -0.00974429605772676,
+      "n_dates": 138,
+      "ic_std": 0.22979062724099586
+    },
+    "reversion": {
+      "mean_ic": -0.001635932611894561,
+      "n_dates": 138,
+      "ic_std": 0.21809912106367843
+    },
+    "volume_surprise": {
+      "mean_ic": -0.009807739849632409,
+      "n_dates": 138,
+      "ic_std": 0.18935684803364025
+    },
+    "breakout_fade": {
+      "mean_ic": 0.016419008791225858,
+      "n_dates": 138,
+      "ic_std": 0.2138728931022953
+    },
+    "rsi_reversal": {
+      "mean_ic": 0.0036817942626874755,
+      "n_dates": 138,
+      "ic_std": 0.23131095520625128
+    }
+  },
+  "baseline_largecap_5d": {
+    "trend": -0.002,
+    "reversion": 0.004,
+    "volume_surprise": 0.03,
+    "breakout_fade": 0.02,
+    "rsi_reversal": 0.015
+  }
+}

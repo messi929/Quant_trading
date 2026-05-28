@@ -366,6 +366,54 @@ multi-horizon alpha 설계 참고용 보존.
 
 **소요**: 각 alpha당 1~3개월 (데이터 수집 + IC 측정 + production)
 
+#### Small/mid-cap universe 검증 (2026-05-28) — 가설 기각
+
+철학 재검토: "NASDAQ-100 large-cap이 efficient라 alpha 약함 → small-cap은
+비효율이라 alpha 강할 것" 가설 검증.
+
+방법: 대표 small/mid-cap 31종목 ($0.3B~$5B, 유동성 ≥$10M/day) yfinance 3년
+OHLCV → directional alpha IC 측정 (138 rebalance dates).
+스크립트: `v3/research/test_smallcap_alphas.py`
+
+결과 (gross IC, small/mid vs large-cap):
+| Alpha | small/mid | large | 평가 |
+|-------|----------:|------:|------|
+| trend | −0.0097 | −0.0020 | 둘 다 noise |
+| reversion | −0.0016 | +0.0040 | small 더 나쁨 |
+| volume_surprise | **−0.0098** | **+0.0300** | small에서 음수! |
+| breakout_fade | +0.0164 | +0.0200 | 비슷 |
+| rsi_reversal | +0.0037 | +0.0150 | small 더 약함 |
+
+**가설 기각**: small/mid-cap IC가 large-cap과 비슷하거나 오히려 낮음.
++ small-cap 비용(0.5~1%)이 large(0.1%)보다 높음 → **net edge 더 나쁠 가능성**
+(KRX 1% 버린 것과 동일 결론).
+
+한계: 31종목 표본 작음 (cross-section noisy), micro-cap(<$300M) 미포함
+(유동성 극악으로 제외 — 진짜 비효율 영역일 수 있으나 거래 불가),
+alpha가 large-cap용 설계.
+
+**결론**: small-cap 전환은 수개월 투자를 정당화하지 않음. PEAD가 small-cap에서
+강하다는 학술 결과는 *earnings 특정 anomaly*였고, 가격/거래량 alpha는 universe
+무관하게 약함. **direction alpha는 어떤 universe/데이터에서도 약하다.**
+
+#### 종합 결론 (2026-05-28) — 유일한 진짜 강점은 vol 예측
+
+| 탐색 트랙 | 결과 |
+|----------|------|
+| 단순 alpha 8개 | IC ceiling 0.02~0.03 |
+| 외부 데이터 (PEAD) | ~0 (large-cap efficient) |
+| Multi-horizon | 효과 미미 |
+| small/mid-cap universe | 기각 (IC 비슷/낮음 + 비용↑) |
+| **vol 예측** | **IC 0.70 (유일한 확실한 edge)** |
+
+**direction alpha는 universe/데이터/horizon 무관하게 약함. 단 하나 확실한 edge는
+vol 예측(IC 0.70)인데 direction trade의 보조로만 사용 중.** → 데이터가 가리키는
+유일한 본질적 방향은 **vol-self trade** (옵션 straddle/variance, direction 무관).
+단 옵션 인프라(pricing/백테스트/브로커) 구축 = 수개월. C4 hedging 항목과 연계.
+
+**대안: 현 시스템 (WF +4%/년, paper +7%/년) 수용** — 페르소나 목표(월1%) 미달이나
+positive edge는 실재.
+
 ### C3. Survivorship-free historical universe 🔴 P1
 **문제**: subagent C: 현재 99 NASDAQ을 5년 retroactive 적용. delisted 종목 누락. BT inflation +5~10%.
 
