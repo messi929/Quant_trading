@@ -43,3 +43,4 @@ v3/saved_models/entry_history.json
 v3/logs/
 v3/results/
 tools/
+v3/research/reports/korea_kosdaq_ohlcv_cache.parquet

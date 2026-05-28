@@ -1,0 +1,19 @@
+{
+  "generated_at": "2026-05-29T01:42:06",
+  "n_live": 149,
+  "n_delisted": 237,
+  "lookback": 60,
+  "horizon": 20,
+  "survivor_only": {
+    "ts_premium": 0.018454961100449634,
+    "ts_long": 0.04473371251938384,
+    "cs_ic": -0.015253120856618532,
+    "n_long": 4199
+  },
+  "survivorship_free": {
+    "ts_premium": 0.01773051215258956,
+    "ts_long": 0.03251652821364177,
+    "cs_ic": 0.0069917214198141,
+    "n_long": 6443
+  }
+}
