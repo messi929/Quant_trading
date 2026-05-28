@@ -44,3 +44,5 @@ v3/logs/
 v3/results/
 tools/
 v3/research/reports/korea_kosdaq_ohlcv_cache.parquet
+v3/research/reports/korea_kospi_pit_cache.parquet
+v3/research/reports/korea_kosdaq_pit_cache.parquet
