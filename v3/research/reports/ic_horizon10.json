@@ -1,0 +1,116 @@
+{
+  "generated_at": "2026-05-28T19:04:52",
+  "lookback_years": 3.0,
+  "forward_horizon": 10,
+  "step_days": 5,
+  "panel_size": 14108,
+  "min_vanilla_ic_threshold": 0.02,
+  "candidate_alphas": [
+    "volume_surprise",
+    "vol_term",
+    "earnings_proximity",
+    "vol_predicted",
+    "price_acceleration",
+    "breakout_fade",
+    "rsi_reversal",
+    "gap_fade"
+  ],
+  "verdicts": {
+    "volume_surprise": "REGIME_ONLY",
+    "vol_term": "REGIME_ONLY",
+    "earnings_proximity": "REGIME_ONLY",
+    "vol_predicted": "REGIME_ONLY",
+    "price_acceleration": "REGIME_ONLY",
+    "breakout_fade": "REGIME_ONLY",
+    "rsi_reversal": "REGIME_ONLY",
+    "gap_fade": "REGIME_ONLY"
+  },
+  "vanilla_ic": {
+    "trend": -0.0029,
+    "reversion": 0.0088,
+    "volume_surprise": 0.0183,
+    "vol_term": 0.0109,
+    "earnings_proximity": 0.0169,
+    "vol_predicted": 0.004,
+    "price_acceleration": -0.0018,
+    "breakout_fade": 0.0128,
+    "rsi_reversal": 0.0191,
+    "gap_fade": 0.0099
+  },
+  "conditional_ic": {
+    "strong_bull": {
+      "trend": -0.1357,
+      "reversion": 0.0198,
+      "volume_surprise": 0.1077,
+      "vol_term": 0.1003,
+      "earnings_proximity": -0.008,
+      "vol_predicted": 0.0427,
+      "price_acceleration": 0.0146,
+      "breakout_fade": -0.1396,
+      "rsi_reversal": 0.0032,
+      "gap_fade": -0.2611
+    },
+    "bull": {
+      "trend": -0.0741,
+      "reversion": 0.0934,
+      "volume_surprise": -0.0342,
+      "vol_term": -0.0209,
+      "earnings_proximity": 0.0064,
+      "vol_predicted": -0.0505,
+      "price_acceleration": 0.0118,
+      "breakout_fade": 0.1081,
+      "rsi_reversal": 0.1167,
+      "gap_fade": 0.128
+    },
+    "neutral": {
+      "trend": 0.0427,
+      "reversion": -0.0247,
+      "volume_surprise": 0.0328,
+      "vol_term": 0.0007,
+      "earnings_proximity": 0.0228,
+      "vol_predicted": 0.0015,
+      "price_acceleration": -0.0127,
+      "breakout_fade": -0.0085,
+      "rsi_reversal": -0.0303,
+      "gap_fade": -0.0184
+    },
+    "caution": {
+      "trend": -0.0102,
+      "reversion": -0.0028,
+      "volume_surprise": 0.0247,
+      "vol_term": 0.03,
+      "earnings_proximity": 0.0143,
+      "vol_predicted": 0.0301,
+      "price_acceleration": 0.0005,
+      "breakout_fade": 0.003,
+      "rsi_reversal": 0.0225,
+      "gap_fade": 0.0067
+    },
+    "bear": {
+      "trend": 0.0082,
+      "reversion": 0.1429,
+      "volume_surprise": -0.0676,
+      "vol_term": 0.0331,
+      "earnings_proximity": 0.0688,
+      "vol_predicted": -0.0387,
+      "price_acceleration": -0.0257,
+      "breakout_fade": -0.0047,
+      "rsi_reversal": 0.0867,
+      "gap_fade": 0.0715
+    }
+  },
+  "regime_counts": {
+    "caution": 5616,
+    "neutral": 5525,
+    "bull": 2275,
+    "strong_bull": 396,
+    "bear": 296
+  },
+  "conviction_metrics": {
+    "vol": {
+      "expansion_ic": 0.2013,
+      "sample_size": 14108,
+      "level_ic": 0.0303
+    }
+  }
+}

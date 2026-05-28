@@ -294,6 +294,34 @@ gate_multiplier = 3.0   # was 1.75
 ceiling ≈ 0.02~0.03**. 큰 개선은 **새 정보 소스 필요** (options flow, sentiment,
 institutional positioning, multi-asset). 단순 OHLCV derivative로는 한계 명확.
 
+#### Multi-horizon IC 실험 (2026-05-28) — forward_horizon 5d 유지 결론
+
+alpha별 vanilla IC를 1d/3d/5d/10d horizon에서 측정:
+
+| Alpha | 1d | 3d | 5d | 10d | 최적 |
+|-------|---:|---:|---:|----:|:----:|
+| volume_surprise | +0.009 | +0.029 | +0.030 | +0.018 | 3~5d |
+| breakout_fade | +0.018 | +0.024 | +0.020 | +0.013 | 3d |
+| rsi_reversal | +0.023 | +0.020 | +0.015 | +0.019 | 1d (1d만 PASS) |
+| vol_term | +0.012 | +0.014 | +0.020 | +0.011 | 5d |
+
+**발견 1**: alpha마다 최적 horizon 다름 (rsi 1d, breakout 3d, volume 5d).
+**발견 2 (가설)**: backtest/paper avg hold = 1d인데 alpha는 5d로 학습 → mismatch.
+1d로 학습하면 caution regime에서 reversion/breakout_fade가 음수→양수 전환.
+
+**검증 (alpha weight 직접 비교, production write 차단)**:
+- caution (paper 주력): 5d {trend .33, vol_surp .47} vs 1d {trend .40, vol_surp .40}
+  → **거의 동일, production 효과 미미**
+- 극단 regime (strong_bull/bear): 1d는 floor 균등 .25 → **변별력 손실**.
+  5d는 strong_bull trend=.70로 명확
+- bull/neutral에서 차이 크지만 paper 진입 빈도 낮음
+
+**결론**: forward_horizon **5d 유지**. mismatch 가설은 흥미로웠으나 paper 주력
+caution에서 weight 차이 미미 + 극단 regime 변별력 손실. 데이터로 "변경 안 함"
+확인 — V3가 이미 5d로 적절히 calibrated. multi-horizon 발견은 미래
+multi-horizon alpha 설계 참고용 보존.
+- Reports: `ic_horizon1.json`, `ic_horizon3.json`, `ic_horizon10.json`
+
 **다음 탐색 영역** (각 1~3개월):
 - AlphaBreakout: 20d high 돌파 + 거래량 confirmation
 - AlphaMACD: 12-26 cross + histogram momentum
