@@ -20,6 +20,7 @@ CLAUDE.md에서 분리된 Phase별 이력. 운영 지침 자체는 CLAUDE.md, �
 - [V3.3 전체 활성화 (2026-05-10)](#v33-전체-활성화-2026-05-10)
 - [V3.3 부분 활성화 + sizing 재해석 (2026-05-13)](#v33-부분-활성화--sizing-재해석-2026-05-13)
 - [데이터 동결 버그 fix + cooldown/hold_days 정합 (2026-05-20~21)](#데이터-동결-버그-fix--cooldownhold_days-정합-2026-05-20-21)
+- [V4 — Edge 탐색 + 철학 재검토 (2026-05-27~28)](#v4--edge-탐색--철학-재검토-2026-05-27-28)
 
 ---
 
@@ -1703,3 +1704,104 @@ MU 알파 분해를 신선 데이터로 재구성한 결과 **상충**:
   realtime이라 "거래가 돌아가는 것처럼" 보였으나 신호 입력이 stale. 진단은
   알파 분해를 **신선 데이터로 재구성**해 live와 대조하는 것이 결정타였음.
 - paper 손실을 전략 탓으로 오귀속하지 말 것 — 데이터 파이프라인부터 검증.
+
+---
+
+## V4 — Edge 탐색 + 철학 재검토 (2026-05-27~28)
+
+3 세션에 걸친 수익 개선 lever 전수 탐색. 상세 실험·수치는
+`docs/V4_ROADMAP.md` 참조. 본 섹션은 narrative 요약.
+
+### 배경 — 왜 V4
+
+paper 6주 +0.85% 정체. backtest(당시 Sharpe 2.92)와 큰 갭. "수익을 어떻게
+올리나"라는 사용자 질문에서 출발. subagent 3개 종합 리서치로 24개 결함 식별
+(`docs/V4_ROADMAP.md`), 우선순위별 단독 backtest 검증 원칙.
+
+### A. Lever 실험 (A1~A12) — A3만 효과
+
+단독 변경 → backtest → baseline 대비 효과 → 통과 시 적용, 악화 시 revert.
+
+| Lever | 결과 |
+|-------|------|
+| **A3 monthly_trades 5→10** | ✅ **BT Sharpe 2.92→4.03, Return +23.77%→+41.02%, MDD 4.98%→4.17%**. baseline binding constraint 해소 |
+| A1 trailing stop | 효과 0 (avg hold 1d → trigger 시간 부족). 코드 유지 |
+| A6 환율 동적 (yfinance KRW=X) | paper PnL 정확성 (1400 고정 → 실측 1498~1499) |
+| A10 profit_take confidence 반전 | marginal (logic 정합: high conf → longer hold) |
+| A11 Day1 TP 5%→7% | BT 동일 (no_fresh_signal 80% dominance) |
+| A2 Cost 0.1%→0.25% | ❌ NEGATIVE (gate-cost coupling, Sharpe FAIL) → revert |
+| A4 mae_tightened -2.5%→-2.0% | marginal → revert |
+| A12 min_order 5M→15M | pyramid test 회귀 fail → revert |
+| max_positions 1→2 | ❌ SEVERE NEGATIVE (Sharpe -1.22, WBD -17.63%) → revert |
+| A5/A7/A8 | SKIP (가짜 결함 또는 환경 의존) |
+
+### B1. Walk-forward — baseline over-fit 확정
+
+`v3/scripts/run_walk_forward.py` 신설. 8 folds × 30 epochs (252d train /
+63d test rolling). 결과: avg **+0.98%/fold (~+4%/년)**, 5/8 profitable.
+→ **baseline Sharpe 4.03은 over-fit**. paper +7%/년 외삽이 WF +4%에 가까움
+(baseline +41%보다). 진짜 expected는 보수적.
+
+### C2. 새 alpha R&D — 8 candidate 중 2 PASS
+
+| Alpha | Vanilla IC | 결과 |
+|-------|-----------:|------|
+| volume_surprise | +0.030 | DEFAULT (5/13) |
+| **breakout_fade** | **+0.020** | ✅ DEFAULT (5/28). 단 부호 발견 — 20d high 돌파는 NASDAQ-100에서 pop&drop(exhaustion), negation 후 PASS |
+| rsi_reversal | +0.015 (1d +0.023) | REGIME_ONLY (1d horizon만 PASS) |
+| price_acceleration / gap_fade / vol_term / earnings_proximity / vol_predicted | < 0.02 | REGIME_ONLY |
+
+Multi-horizon 실험: alpha별 최적 horizon 다름(rsi 1d, breakout 3d, volume 5d)
+but caution(paper 주력) weight는 1d≈5d → forward_horizon 5d 유지.
+
+### 철학 재검토 — 모든 본질적 방향 기각
+
+수익 개선의 진짜 질문은 alpha가 아니라 **universe/전략**임을 인식 후:
+
+1. **외부 데이터 (earnings PEAD)**: collector `--with-surprise` 확장 + 재수집.
+   vanilla IC **+0.0007** REJECT. PEAD는 small-cap anomaly — NASDAQ-100
+   large-cap은 efficient라 ~0.
+2. **small/mid-cap universe**: 31종목 ($0.3B~$5B) IC 측정. large-cap과
+   비슷하거나 낮음 (volume_surprise small에서 −0.010). + 비용 높아 net 악화.
+   **기각** (KRX 1% 버린 것과 동일 논리).
+3. **vol-self trade (옵션 straddle)**: Phase 0 edge 검증. straddle PnL% ≈
+   |forward move| − implied_breakeven. **모든 quintile 음수** (옵션 비용
+   미반영 낙관에서도). **FAIL** — VolTransformer realized vol 예측(IC 0.70)이
+   옵션 implied vol을 못 이김 (variance risk premium). realized 예측 ≠
+   implied 초과 예측.
+
+### V4 최종 결론
+
+| 탐색 트랙 | 결과 |
+|----------|------|
+| direction alpha | universe/데이터/horizon 무관하게 약함 (IC ≤ 0.03) |
+| vol 예측 (IC 0.70) | monetize 불가 (옵션 시장 efficient, VRP) |
+| **현실적 상한** | **현 시스템 (WF +4%/년, paper +7%/년)** |
+
+**교훈**:
+- direction 예측은 NASDAQ-100 efficiency 앞에서 ceiling. small-cap은 비용이
+  alpha 잠식. 어떤 단순 데이터/전략도 이 벽을 못 넘음.
+- vol IC 0.70조차 옵션으로 monetize 안 됨 — "잘 예측하는 것"과 "수익으로
+  바꾸는 것"은 다름. 시장이 이미 가격에 반영.
+- 더 가려면 alternative data(수개월+비용) 또는 다른 자산군 = 코드가 아닌
+  사업 결정.
+
+### Production 적용 (commit `9f285ad`, server deployed)
+
+A3 + A1 + A6 + A10 + A11 + breakout_fade(6/1 retrain 후 활성).
+git: `ca4ec58 → ... → 6fade57` (14 commit). 모든 변경 회귀 598/598 통과.
+
+### 잔여 신호 (미착수, 별개 영역)
+
+- long-short vol arb: vol high−low straddle spread +0.019 (short vol 위험)
+- rsi_reversal 1d horizon +0.023 (현 5d와 mismatch, 1d 전략 재설계 시)
+- Edge layer wrapper (C1), survivorship correction (C3) — 인프라, edge 무관
+
+### 검증 도구 (신규)
+
+- `v3/scripts/run_walk_forward.py` — walk-forward backtest CLI
+- `v3/research/test_smallcap_alphas.py` — small-cap IC 검증
+- `v3/research/test_vol_straddle_edge.py` — vol-self trade Phase 0
+- `v3/data/earnings_collector.py --with-surprise` — earnings surprise 수집
+- 신규 alpha: `AlphaBreakoutFade`(DEFAULT), `AlphaPriceAcceleration`,
+  `AlphaRSIReversal`, `AlphaGapFade`, `AlphaEarningsSurprise` (후자 4개 EXPERIMENTAL)
