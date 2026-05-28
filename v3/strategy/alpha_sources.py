@@ -594,6 +594,115 @@ class AlphaPriceAcceleration(AlphaSource):
         return (np.tanh(z / 2.0) * ALPHA_SCALE).rename(self.name)
 
 
+class AlphaRSIReversal(AlphaSource):
+    """RSI(N) overbought/oversold mean reversion (V4 C2, 2026-05-28 #3).
+
+    Hypothesis (breakout_fade 성공 패턴 따라 contrarian): RSI 과매수 →
+    단기 pullback (음수 alpha), 과매도 → bounce (양수 alpha).
+
+    Construction:
+      rsi  = RSI(close, period)   ∈ [0, 100]
+      raw  = -(rsi - 50) / 50      # overbought(>50) → negative
+      → cross-sectional z-score → tanh(z/2) × ALPHA_SCALE
+    """
+
+    def __init__(self, period: int = 14):
+        if period < 2:
+            raise ValueError(f"AlphaRSIReversal period must be >= 2: {period}")
+        self.period: int = period
+
+    @property
+    def name(self) -> str:
+        return "rsi_reversal"
+
+    @staticmethod
+    def _rsi(close: np.ndarray, period: int) -> float:
+        if len(close) < period + 1:
+            return 50.0
+        deltas = np.diff(close[-(period + 1):])
+        gains = np.where(deltas > 0, deltas, 0.0)
+        losses = np.where(deltas < 0, -deltas, 0.0)
+        avg_gain = float(gains.mean())
+        avg_loss = float(losses.mean())
+        if avg_loss < 1e-12:
+            return 100.0 if avg_gain > 0 else 50.0
+        rs = avg_gain / avg_loss
+        return 100.0 - 100.0 / (1.0 + rs)
+
+    def compute(self, ohlcv: pd.DataFrame, **_: object) -> pd.Series:
+        if ohlcv.empty:
+            return pd.Series(dtype=float, name=self.name)
+
+        df = ohlcv[["date", "ticker", "close"]].sort_values(["ticker", "date"])
+        raw: dict[str, float] = {}
+        for ticker, group in df.groupby("ticker", sort=False):
+            close = group["close"].to_numpy(dtype=float)
+            if len(close) < self.period + 1:
+                continue
+            rsi = self._rsi(close, self.period)
+            raw[ticker] = -(rsi - 50.0) / 50.0   # overbought → negative (fade)
+
+        if not raw:
+            return pd.Series(dtype=float, name=self.name)
+
+        s = pd.Series(raw, dtype=float)
+        std = s.std(ddof=0)
+        if std < 1e-12:
+            return pd.Series(0.0, index=s.index, name=self.name)
+
+        z = (s - s.mean()) / std
+        return (np.tanh(z / 2.0) * ALPHA_SCALE).rename(self.name)
+
+
+class AlphaGapFade(AlphaSource):
+    """Overnight gap fade (V4 C2, 2026-05-28 #4).
+
+    Hypothesis: 큰 overnight gap은 overreaction → 단기 fill.
+    Gap up (open >> prev close) → 음수 alpha (fade down).
+    Gap down → 양수 alpha (fade up).
+
+    Construction:
+      gap  = open[-1] / close[-2] - 1
+      raw  = -gap                  # gap up → negative
+      → cross-sectional z-score → tanh(z/2) × ALPHA_SCALE
+    """
+
+    @property
+    def name(self) -> str:
+        return "gap_fade"
+
+    def compute(self, ohlcv: pd.DataFrame, **_: object) -> pd.Series:
+        if ohlcv.empty:
+            return pd.Series(dtype=float, name=self.name)
+        if "open" not in ohlcv.columns:
+            return pd.Series(dtype=float, name=self.name)
+
+        df = ohlcv[["date", "ticker", "open", "close"]].sort_values(["ticker", "date"])
+        raw: dict[str, float] = {}
+        for ticker, group in df.groupby("ticker", sort=False):
+            open_ = group["open"].to_numpy(dtype=float)
+            close = group["close"].to_numpy(dtype=float)
+            if len(close) < 2 or len(open_) < 1:
+                continue
+            prev_close = float(close[-2])
+            today_open = float(open_[-1])
+            if prev_close <= 0 or not np.isfinite(prev_close) or not np.isfinite(today_open):
+                continue
+            gap = today_open / prev_close - 1.0
+            raw[ticker] = -gap   # gap up → negative (fade)
+
+        if not raw:
+            return pd.Series(dtype=float, name=self.name)
+
+        s = pd.Series(raw, dtype=float)
+        std = s.std(ddof=0)
+        if std < 1e-12:
+            return pd.Series(0.0, index=s.index, name=self.name)
+
+        z = (s - s.mean()) / std
+        return (np.tanh(z / 2.0) * ALPHA_SCALE).rename(self.name)
+
+
 # ──────────────────────────────────────────────────────────────
 # Conviction sources
 # ──────────────────────────────────────────────────────────────

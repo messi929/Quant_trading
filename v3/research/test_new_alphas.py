@@ -37,7 +37,9 @@ from v3.backtest.alpha_weight_trainer import (
 from v3.strategy.alpha_sources import (
     AlphaBreakoutFade,
     AlphaEarningsProximity,
+    AlphaGapFade,
     AlphaPriceAcceleration,
+    AlphaRSIReversal,
     AlphaReversion,
     AlphaTrend,
     AlphaVolPredicted,
@@ -52,6 +54,7 @@ CANDIDATE_NAMES: tuple[str, ...] = (
     "volume_surprise", "vol_term", "earnings_proximity", "vol_predicted",
     "price_acceleration",  # V4 C2 (2026-05-28)
     "breakout_fade",       # V4 C2 (2026-05-28 #2, IC negation 후)
+    "rsi_reversal", "gap_fade",  # V4 C2 (2026-05-28 #3, #4 contrarian)
 )
 
 
@@ -96,6 +99,8 @@ def main() -> int:
         AlphaVolPredicted(),  # vol_scores는 trainer가 compute_directional 호출 시 forward
         AlphaPriceAcceleration(),  # V4 C2 (2026-05-28)
         AlphaBreakoutFade(),       # V4 C2 (2026-05-28 #2, fade: 부호 negation 후 양수 IC)
+        AlphaRSIReversal(),        # V4 C2 (2026-05-28 #3, contrarian)
+        AlphaGapFade(),            # V4 C2 (2026-05-28 #4, contrarian)
     )
     trainer = AlphaWeightTrainer(
         directional_sources=sources,

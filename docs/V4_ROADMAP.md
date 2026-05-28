@@ -270,7 +270,29 @@ gate_multiplier = 3.0   # was 1.75
   · **6/1 06:00 KST 자동 retrain 후** regime별 weight 부여, production 효과 발생
 - Report: `v3/research/reports/experimental_alpha_ic_20260528_080352.json`
 
-**5/13 + 5/28 누적**: 6 candidate 측정, 2개 vanilla PASS (volume_surprise +0.030 → 5/13 promoted, breakout_fade +0.020 negation 후 → 5/28 promoted).
+**5/28 시도 #3, #4: AlphaRSIReversal + AlphaGapFade** (contrarian):
+- RSIReversal (RSI14 과매수 fade): vanilla IC +0.0151 (FAIL, 근접) → REGIME_ONLY
+  · bear +0.094, bull +0.050, strong_bull −0.156 (강세장 momentum), caution −0.002
+- GapFade (overnight gap reversal): vanilla IC +0.0084 (FAIL) → REGIME_ONLY
+  · strong_bull +0.228 (n=198 noise), bear +0.107, caution −0.047 (paper 주력 음수)
+- 둘 다 DEFAULT 추가 안 함. EXPERIMENTAL candidate 보존.
+- Report: `v3/research/reports/experimental_alpha_ic_20260528_125049.json`
+
+**5/13 + 5/28 누적 (8 candidate 측정)**:
+| Alpha | Vanilla IC | 결과 |
+|-------|-----------:|------|
+| volume_surprise | +0.030 | ✅ DEFAULT (5/13) |
+| breakout_fade | +0.020 | ✅ DEFAULT (5/28) |
+| vol_term | +0.020 | REGIME_ONLY |
+| rsi_reversal | +0.015 | REGIME_ONLY |
+| earnings_proximity | +0.009 | REGIME_ONLY |
+| gap_fade | +0.008 | REGIME_ONLY |
+| vol_predicted | +0.005 | REGIME_ONLY |
+| price_acceleration | +0.005 | REGIME_ONLY |
+
+**핵심 결론**: 8 candidate 중 2 PASS. **단일 가격/거래량 기반 alpha의 vanilla IC
+ceiling ≈ 0.02~0.03**. 큰 개선은 **새 정보 소스 필요** (options flow, sentiment,
+institutional positioning, multi-asset). 단순 OHLCV derivative로는 한계 명확.
 
 **다음 탐색 영역** (각 1~3개월):
 - AlphaBreakout: 20d high 돌파 + 거래량 confirmation
