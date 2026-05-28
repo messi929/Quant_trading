@@ -14,6 +14,44 @@
 
 ---
 
+## ⭐ V4 최종 결론 (2026-05-28) — 모든 edge 탐색 경로 소진
+
+3 세션에 걸친 lever/alpha/universe/vol-trade 전수 탐색 결과:
+
+| 탐색 트랙 | 결과 |
+|----------|------|
+| Lever A1~A12 | **A3 (monthly 5→10)만 효과** (BT Sharpe 2.92→4.03). 나머지 marginal/revert |
+| direction alpha 8개 | IC ceiling 0.02~0.03 (volume_surprise, breakout_fade만 PASS) |
+| Multi-horizon | 효과 미미 (5d 유지) |
+| 외부 데이터 (earnings PEAD) | IC ~0 (large-cap efficient) |
+| small/mid-cap universe | 기각 (IC 비슷/낮음 + 비용↑) |
+| **vol-self trade (straddle)** | **FAIL — VRP 못 이김** (Phase 0, 모든 quintile 음수) |
+
+**핵심 교훈 3가지**:
+1. **direction 예측은 universe/데이터/horizon 무관하게 약함** (IC ≤ 0.03). NASDAQ-100은
+   너무 efficient, small-cap은 비용이 alpha 잠식.
+2. **vol 예측(IC 0.70)은 monetize 불가** — 옵션 시장이 expansion을 implied vol에
+   이미 반영. realized vol 예측 ≠ implied 초과 예측. straddle은 VRP에 짐.
+3. **접근 가능한 데이터/전략의 현실적 상한 = 현 시스템** (direction-based,
+   WF +4%/년, paper +7%/년). 더 가려면 alternative data (수개월+비용) 또는
+   다른 자산군/도메인 = 사업 결정 영역.
+
+**실제 적용된 개선 (production deployed, commit 9f285ad)**:
+- A3 monthly_trades 5→10 (BT Sharpe +1.11)
+- A1 trailing / A6 FX 동적 / A10 conf 반전 / A11 Day1 7% (marginal, logic 정합)
+- breakout_fade alpha DEFAULT (6/1 retrain 후 활성)
+
+**잔여 신호 (별개 영역, 미착수)**:
+- vol high−low spread +0.019 → long-short vol arb 가능성 (short vol 위험, retail 부적합)
+- rsi_reversal 1d horizon +0.023 → 1d 전략 재설계 시 (현 5d와 mismatch)
+- Edge layer (C1), survivorship (C3) — 인프라 작업, edge와 무관
+
+**권고**: 단순 코드 탐색 종료. 다음은 (a) 현 시스템 paper 장기 운영 +
+6/1 retrain breakout_fade 효과 관찰, (b) alternative data 사업 투자 결정,
+(c) 다른 자산군 — 셋 다 코드가 아닌 전략/사업 판단.
+
+---
+
 ## 카테고리 A — 단기 적용 가능 (한 세션, 각 backtest 검증)
 
 각 항목은 단독 변경 → backtest → baseline 대비 효과 측정 → 통과 시 적용, 악화 시 revert.

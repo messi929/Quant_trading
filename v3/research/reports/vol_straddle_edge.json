@@ -1,0 +1,32 @@
+{
+  "generated_at": "2026-05-28T22:59:57",
+  "horizon": 5,
+  "panel_size": 18216,
+  "vrp_factors": [
+    1.0,
+    1.2,
+    1.3
+  ],
+  "summary": {
+    "1.0": {
+      "high_q_mean_pnl": -0.007236409802023866,
+      "low_q_mean_pnl": -0.023601001815149632,
+      "high_low_spread": 0.016364592013125765,
+      "overall_mean_pnl": -0.009666949515174026
+    },
+    "1.2": {
+      "high_q_mean_pnl": -0.01661011103316174,
+      "low_q_mean_pnl": -0.03562889987014279,
+      "high_low_spread": 0.01901878883698105,
+      "overall_mean_pnl": -0.019317091363915444
+    },
+    "1.3": {
+      "high_q_mean_pnl": -0.021296961648730687,
+      "low_q_mean_pnl": -0.04164284889763937,
+      "high_low_spread": 0.020345887248908682,
+      "overall_mean_pnl": -0.024142162288286154
+    }
+  },
+  "verdict_vrp12_high_q_pnl": -0.01661011103316174,
+  "note": "ATM \ub9cc\uae30\ubcf4\uc720 \uadfc\uc0ac, \uc635\uc158 bid-ask/commission \ubbf8\ubc18\uc601 \u2192 \ub099\uad00\uc801"
+}
