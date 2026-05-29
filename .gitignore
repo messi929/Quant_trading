@@ -50,3 +50,6 @@ v3/research/reports/korea_kosdaq_pit_cache.parquet
 # 재생성 가능한 대용량 캐시 + 심볼 덤프 (코드/결과만 커밋)
 v3/research/reports/*_cache.parquet
 v3/research/reports/nasdaq_symbols.json
+# V4 live 런타임 상태/로그
+v4/saved_models/
+v4/logs/
