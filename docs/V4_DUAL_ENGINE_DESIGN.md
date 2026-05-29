@@ -271,6 +271,24 @@ modest — 운영 노력 대비 가치는 사용자 판단. ④ KIS 국내 paper
 모듈 + 200d SMA regime + vol-target sizing + KIS 국내 paper 연동. V3 인프라
 (regime 프레임워크/sizing/백테스트 엔진/PaperBroker) 재활용, 신호·universe만 교체.
 
+### 1.10 KOSPI 엣지 탐색 — 가격신호 배포불가 확정 (2026-05-30)
+
+"KOSPI도 설계" 요청에 대해 가격 기반 엣지 전수 탐색 (`v3/research/korea_kospi_edge.py`,
+KOSPI long캐시 + KS11, full-cycle):
+
+| KOSPI 전략 (raw) | Sharpe |
+|---|---:|
+| reversion (lb5~20, hold5~20) | −0.35 ~ +0.03 |
+| low-vol (hold20) | +0.06 |
+| momentum (lb60) | +0.06 |
+| best + gate | 0.17 (regime 효과일 뿐, 종목선택 엣지 아님) |
+| best + gate + vol-target | 0.05 |
+
+**전부 0 근처/음수 → KOSPI 대형주는 가격신호로 배포불가.** NASDAQ-100과 동일 —
+효율적 시장이라 momentum/reversion/low-vol 차익거래로 소멸. 가격신호 KOSPI 엔진 =
+Sharpe 0.1 신기루 → 설계 안 함. **유일한 경로 = 펀더멘털(value/저PBR/quality)**, DART
+재무데이터 필요한 별도 연구 (보류). **V4 = KOSDAQ momentum 단일 엔진 확정.**
+
 ---
 
 ## 2. 미국 엔진 (윤곽 완료 — EODHD 확정 대기)
