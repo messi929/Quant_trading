@@ -4,6 +4,15 @@
 + 개발 워크플로우만 다룬다. Phase별 이력은 `docs/CHANGELOG.md`, 후속 과제
 추적은 `docs/FOLLOW_UPS.md` 참조.
 
+> 📌 **V4 KOSDAQ 엔진 (신규 트랙, 2026-05-30)**: V3.3(NASDAQ vol-expansion)과 **별개**
+> 의 신규 엔진 `v4/` 패키지가 추가됨. KOSDAQ multi-lb ensemble momentum + 200d SMA
+> regime gate + vol-targeting — full-cycle(2014-2026) survivorship-free 검증 Sharpe
+> 0.66/+10.5%/MDD-17%. 코드 완성·실행정확·테스트 38개 통과(backtest=live 단일 경로,
+> KIS 국내 paper 연동). **아직 paper 미가동** — 가동 전 (1)sandbox 계좌 리셋 (2)KR 장중
+> 실주문 smoke (3)systemd timer 배포 필요(전부 장중/배포 액션). 미국·KOSPI는 효율적
+> 시장이라 가격·펀더멘털 엣지 없음 확인(기각). 설계/검증 상세 = `docs/V4_DUAL_ENGINE_DESIGN.md`.
+> V3.3은 그대로 live 유지(V4와 독립).
+
 > ⚠️ 2026-05-10 → 2026-05-13 변천:
 >
 > - **5/10**: V3.3 12 features 한 번에 ON (사용자 결정, ROADMAP §5 주차별 promotion 건너뜀).

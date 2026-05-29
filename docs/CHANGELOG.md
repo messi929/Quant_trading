@@ -21,6 +21,7 @@ CLAUDE.md에서 분리된 Phase별 이력. 운영 지침 자체는 CLAUDE.md, �
 - [V3.3 부분 활성화 + sizing 재해석 (2026-05-13)](#v33-부분-활성화--sizing-재해석-2026-05-13)
 - [데이터 동결 버그 fix + cooldown/hold_days 정합 (2026-05-20~21)](#데이터-동결-버그-fix--cooldownhold_days-정합-2026-05-20-21)
 - [V4 — Edge 탐색 + 철학 재검토 (2026-05-27~28)](#v4--edge-탐색--철학-재검토-2026-05-27-28)
+- [V4 Dual-Engine → KOSDAQ 단일 엔진 확정 + Phase B 구현 (2026-05-29~30)](#v4-dual-engine--kosdaq-단일-엔진-확정--phase-b-구현-2026-05-29--05-30)
 
 ---
 
@@ -1805,3 +1806,60 @@ git: `ca4ec58 → ... → 6fade57` (14 commit). 모든 변경 회귀 598/598 통
 - `v3/data/earnings_collector.py --with-surprise` — earnings surprise 수집
 - 신규 alpha: `AlphaBreakoutFade`(DEFAULT), `AlphaPriceAcceleration`,
   `AlphaRSIReversal`, `AlphaGapFade`, `AlphaEarningsSurprise` (후자 4개 EXPERIMENTAL)
+
+---
+
+## V4 Dual-Engine → KOSDAQ 단일 엔진 확정 + Phase B 구현 (2026-05-29 ~ 05-30)
+
+"시장마다 맞는 전략" thesis를 시장 × 신호 × 데이터클래스 전수 검증. EODHD(미국
+상폐포함) + DART(한국 펀더멘털) 데이터 확보. 상세 narrative + 수치는
+`docs/V4_DUAL_ENGINE_DESIGN.md` §1.1~1.11 + SPEC.
+
+### 멀티마켓 탐색 결과
+
+| 시장 | 가격 신호 | 펀더멘털 | 결론 |
+|------|----------|---------|------|
+| **KOSDAQ** (소형·비효율) | ✅ momentum full-cycle Sharpe 0.66 | — | **유일한 real 엣지** |
+| KOSPI (대형·효율) | ❌ 0.15 | ❌ clean 0.15 (0.5는 survivor-biased mirage) | 엣지 없음 |
+| NASDAQ (대형·효율) | ❌ 전부 음수(survivorship-free) | 미검증(유료) | 엣지 없음 |
+
+- **미국 reversion 기각**: EODHD 상폐포함 재검증 → survivor-only +30%는 전부
+  survivorship bias, 제거 시 음수. momentum/low-vol도 음수.
+- **KOSDAQ momentum 6중 게이트 통과**: survivorship-free + beta + 다중하락기
+  (2015/18/20/22) + look-ahead(PIT) + walk-forward + param robust(ensemble).
+  2021-26 Sharpe 1.0은 period luck, full-cycle 0.66이 진실.
+- **regime filter(200d SMA)** = 크래시 보험(MDD 반감), **vol-target**(MDD→-17%),
+  **trailing stop 기각**(추세 훼손, V3 교훈 재확인), **multi-lb ensemble**
+  (lb40/60/90/120 랭크평균)로 단일 lb fragility 제거 → robust 0.66.
+- **KOSPI 가격·펀더멘털 양쪽 기각**: 효율적 시장. value/composite 0.5는 상폐주
+  (value trap) 제외에 의한 낙관 편향.
+
+### 최종 검증 엔진 SPEC
+
+KOSDAQ / multi-lb ensemble momentum / PIT 거래대금 top100 / hold20·N20·long-only /
+200d SMA regime gate / vol-target(0.15,cap1.5) / 비용 0.4%+상폐50% →
+**full-cycle(2014-2026) Sharpe 0.66 / annual +10.5% / MDD -17%**.
+
+### Phase B 구현 (`v4/` 패키지, commit `2931bed`→`a49ffbf` 7개)
+
+- **Stage 1**: `config/engine/data/backtest` — backtest·live 단일 코드 경로,
+  research 수치 정확 재현(Sharpe 0.662).
+- **Stage 2**: `execution/kis_broker`(KISApi 국내 래퍼) + `executor`(reconcile) —
+  KIS sandbox 토큰/잔고/시세 live 실증.
+- **Stage 3**: `live/state·runner·data_live` + `run_v4_live.py` — rebalance-or-hold,
+  vol-target live history, 상태 영속화.
+- **Stage3 #1 fix**: 패널 종가 sizing 전환(KIS 시세 500에러 의존 제거, parity 일치)
+  → smoke picks20→buys20(누락0). **v4 테스트 38개 통과.**
+
+### KOSDAQ 가동 전 잔여 (장중/배포 액션, 코드는 완성)
+
+(1) sandbox 국내계좌 V1/V2 잔여 6종목 청산·1억 리셋 (2) KR 장중 실주문 smoke
+(3) systemd timer 배포(종가 후 1일1회). numpy 2.x v3 회귀 미점검은 보류.
+
+### 신규 데이터/연구 도구
+
+- EODHD(All-World $19.99) — 미국 survivorship-free EOD. DART(무료) — 한국 PIT 재무.
+- 검증: `backtest_nasdaq_pit`, `probe_nasdaq_alphas`, `korea_risk_overlay`,
+  `korea_gate_robustness`, `korea_long_history`, `korea_risk_levers`,
+  `korea_lever_sweep`, `korea_ensemble`, `korea_kospi_edge`, `dart_fetch`,
+  `kospi_fundamental_factor` (v3/research/).
