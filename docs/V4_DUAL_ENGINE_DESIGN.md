@@ -289,6 +289,28 @@ KOSPI long캐시 + KS11, full-cycle):
 Sharpe 0.1 신기루 → 설계 안 함. **유일한 경로 = 펀더멘털(value/저PBR/quality)**, DART
 재무데이터 필요한 별도 연구 (보류). **V4 = KOSDAQ momentum 단일 엔진 확정.**
 
+### 1.11 KOSPI 펀더멘털 factor — clean 신호 약함, 0.5는 mirage 가능성 (2026-05-30)
+
+DART API(무료) 확보 → `v3/research/dart_fetch.py`(corp_code 매핑 + 연간재무 IFRS
+태그 추출, 620종목 2015-2024) + `kospi_fundamental_factor.py`(PIT lag Y→Y+1 4월).
+
+| factor | 데이터 | raw Sharpe | +gate |
+|--------|------|-----------:|------:|
+| quality_roe | ✅ clean SF | 0.15 | −0.02 |
+| quality_lowdebt | ✅ clean SF | −0.01 | −0.19 |
+| value_pbr | ⚠️ survivor-biased | 0.41 | 0.17 |
+| composite(value+quality) | ⚠️ survivor-biased | 0.44 | 0.51 |
+
+**완전 survivorship-free(quality)는 약함(0.15).** 0.4~0.5는 전부 value/composite인데
+**survivor-biased** — 시총=close×현재주식수라 상폐주(현재 주식수 없음)가 value 랭킹에서
+제외됨 = value trap(싸 보였지만 망한 종목) 누락 → value 수익 부풀림. 오늘 내내 본 mirage
+패턴. composite+gate 0.51도 gate의 MDD 효과(−50%→−28%)지 factor 자체는 0.44 biased.
+
+**판정**: KOSPI 가격(0.15)에 이어 펀더멘털 clean 신호도 약함. 0.5 근처는 낙관편향 →
+survivorship-free 정밀화(상폐주 PIT 발행주식수, DART stockTotqySttus 추가) 시 하락 예상.
+**KOSPI는 가격·펀더멘털 둘 다 접근가능 데이터로 deployable 엣지 없음 (효율적 시장).
+V4 = KOSDAQ 단일 엔진 유지.** (value SF 정밀검증은 prior 낮아 보류.)
+
 ---
 
 ## 2. 미국 엔진 (윤곽 완료 — EODHD 확정 대기)
