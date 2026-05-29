@@ -91,8 +91,9 @@ def run_session(broker, close: pd.DataFrame, dvol: pd.DataFrame, index: pd.Serie
     book = ({t: exp / len(picks.tickers) for t in picks.tickers}
             if picks.tickers and exp > 0 else {})
 
-    # 3. 주문 reconcile (gate off → book {} → 전량 청산)
-    plan = rebalance(broker, book, execute=execute)
+    # 3. 주문 reconcile — sizing은 패널 종가로 (KIS 시세 불요). gate off → book {} → 전량 청산
+    prices = close.iloc[i].dropna().to_dict()
+    plan = rebalance(broker, book, prices, execute=execute)
 
     # 4. state 갱신 — 오늘 phantom 픽을 pending 으로 (다음 rebalance에 측정)
     state.pending_entries = {t: float(close.iloc[i][t]) for t in picks.tickers}

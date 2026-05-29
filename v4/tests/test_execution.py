@@ -32,12 +32,12 @@ class FakeBroker:
     def get_price_krw(self, ticker: str) -> float:
         return self.prices.get(self.norm(ticker), 0.0)
 
-    def buy(self, ticker: str, amount_krw: float) -> dict:
-        t = self.norm(ticker); qty = int(amount_krw // self.prices[t])
-        self.orders.append(("buy", t, qty))
-        return {"order_no": "FAKE", "ticker": t, "qty": qty}
+    def buy_qty(self, ticker: str, qty: int, ref_price: float = 0.0) -> dict:
+        t = self.norm(ticker)
+        self.orders.append(("buy", t, int(qty)))
+        return {"order_no": "FAKE", "ticker": t, "qty": int(qty)}
 
-    def sell(self, ticker: str, qty: int) -> dict:
+    def sell(self, ticker: str, qty: int, ref_price=None) -> dict:
         t = self.norm(ticker)
         self.orders.append(("sell", t, int(qty)))
         return {"order_no": "FAKE", "ticker": t, "qty": int(qty)}
@@ -61,26 +61,26 @@ class TestReconcile:
     def test_exit_unlisted_position(self):
         # 보유 400000 이 target 에 없음 → 전량 청산
         b = FakeBroker(cash=0, positions={"400000": 100}, prices=self.PRICES)
-        plan = rebalance(b, {"100000": 1.0})
+        plan = rebalance(b, {"100000": 1.0}, self.PRICES)
         assert ("sell", "400000", 100) in b.orders
         assert any(o["ticker"] == "400000" and o["reason"] == "exit" for o in plan.sells)
 
     def test_new_buy_sizing(self):
         # 100% → 100000(가격 1만) on 10,000,000 → 1000주
         b = FakeBroker(cash=10_000_000, positions={}, prices=self.PRICES)
-        rebalance(b, {"100000": 1.0})
+        rebalance(b, {"100000": 1.0}, self.PRICES)
         assert ("buy", "100000", 1000) in b.orders
 
     def test_equal_weight_two_names(self):
         b = FakeBroker(cash=10_000_000, positions={}, prices=self.PRICES)
-        rebalance(b, {"100000": 0.5, "200000": 0.5})  # 각 5,000,000
+        rebalance(b, {"100000": 0.5, "200000": 0.5}, self.PRICES)  # 각 5,000,000
         assert ("buy", "100000", 500) in b.orders   # 5M/10000
         assert ("buy", "200000", 250) in b.orders   # 5M/20000
 
     def test_no_margin_clamp(self):
         # 합 1.5 (cap leverage) → 1.0 으로 clamp
         b = FakeBroker(cash=10_000_000, positions={}, prices=self.PRICES)
-        plan = rebalance(b, {"100000": 0.75, "200000": 0.75})
+        plan = rebalance(b, {"100000": 0.75, "200000": 0.75}, self.PRICES)
         assert plan.clamped
         spent = sum(q * self.PRICES[t] for _, t, q in b.orders if _ == "buy")
         assert spent <= plan.total_eval + 1e-6      # 무레버리지: 총매수 ≤ 평가액
@@ -88,24 +88,24 @@ class TestReconcile:
     def test_dust_skip(self):
         # 이미 target 비중 거의 충족 → 미세 조정 skip
         b = FakeBroker(cash=0, positions={"100000": 1000}, prices=self.PRICES)
-        plan = rebalance(b, {"100000": 1.0}, min_order_krw=500_000)
+        plan = rebalance(b, {"100000": 1.0}, self.PRICES, min_order_krw=500_000)
         # 1000주 보유 = 10M, target 10M → diff 0 → 주문 없음
         assert not b.orders
 
     def test_trim_overweight(self):
         # 보유 1000주(10M)인데 target 50% (5M=500주) → 500주 매도
         b = FakeBroker(cash=0, positions={"100000": 1000}, prices=self.PRICES)
-        rebalance(b, {"100000": 0.5})
+        rebalance(b, {"100000": 0.5}, self.PRICES)
         assert ("sell", "100000", 500) in b.orders
 
     def test_long_only_no_negative_qty(self):
         b = FakeBroker(cash=5_000_000, positions={"200000": 50}, prices=self.PRICES)
-        rebalance(b, {"100000": 0.5, "300000": 0.5})
+        rebalance(b, {"100000": 0.5, "300000": 0.5}, self.PRICES)
         assert all(q > 0 for _, _, q in b.orders)   # 음수 수량 없음
 
     def test_plan_only_no_execute(self):
         b = FakeBroker(cash=10_000_000, positions={}, prices=self.PRICES)
-        plan = rebalance(b, {"100000": 1.0}, execute=False)
+        plan = rebalance(b, {"100000": 1.0}, self.PRICES, execute=False)
         assert b.orders == []                        # 미주문
         assert len(plan.buys) == 1                    # 계획엔 존재
 

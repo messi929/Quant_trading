@@ -52,6 +52,7 @@ class KisKoreaBroker:
         return {self.norm(p["ticker"]): int(p["qty"]) for p in self.get_balance()["positions"]}
 
     def buy(self, ticker: str, amount_krw: float) -> dict | None:
+        """금액 기반 매수 (KIS 시세로 qty 환산). 독립 사용/smoke 용 — executor는 buy_qty 사용."""
         t = self.norm(ticker)
         px = self.get_price_krw(t)
         if px <= 0:
@@ -63,12 +64,22 @@ class KisKoreaBroker:
             return None
         return self._order(t, "buy", qty, px, qty * px)
 
-    def sell(self, ticker: str, qty: int) -> dict | None:
+    def buy_qty(self, ticker: str, qty: int, ref_price: float = 0.0) -> dict | None:
+        """수량 기반 시장가 매수. sizing은 호출자(executor)가 패널 종가로 — KIS 시세 불요.
+        ref_price는 로그/금액 추정용(시장가라 실제 체결가는 별도)."""
         t = self.norm(ticker)
         qty = int(qty)
         if qty < 1:
             return None
-        px = self.get_price_krw(t)
+        return self._order(t, "buy", qty, ref_price, qty * ref_price)
+
+    def sell(self, ticker: str, qty: int, ref_price: float | None = None) -> dict | None:
+        """수량 기반 시장가 매도. ref_price 주면 그 값 사용(KIS 시세 불요), None이면 조회."""
+        t = self.norm(ticker)
+        qty = int(qty)
+        if qty < 1:
+            return None
+        px = ref_price if ref_price is not None else self.get_price_krw(t)
         return self._order(t, "sell", qty, px, qty * px)
 
     def _order(self, ticker: str, side: str, qty: int, px: float, amount: float) -> dict | None:

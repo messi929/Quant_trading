@@ -51,11 +51,11 @@ class FakeBroker:
     def get_price_krw(self, t):
         return self.prices.get(self.norm(t), 0.0)
 
-    def buy(self, t, amt):
-        tn = self.norm(t); q = int(amt // self.prices[tn]); self.orders.append(("buy", tn, q))
-        return {"order_no": "F", "ticker": tn, "qty": q}
+    def buy_qty(self, t, qty, ref_price=0.0):
+        tn = self.norm(t); self.orders.append(("buy", tn, int(qty)))
+        return {"order_no": "F", "ticker": tn, "qty": int(qty)}
 
-    def sell(self, t, qty):
+    def sell(self, t, qty, ref_price=None):
         tn = self.norm(t); self.orders.append(("sell", tn, int(qty)))
         return {"order_no": "F", "ticker": tn, "qty": int(qty)}
 

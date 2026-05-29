@@ -26,14 +26,17 @@ class RebalancePlan:
     total_eval: float
 
 
-def rebalance(broker, targets: dict[str, float], *, min_order_krw: float = 500_000,
-              max_total_weight: float = 1.0, execute: bool = True) -> RebalancePlan:
-    """targets(ticker→weight) → KIS 잔고 reconcile. execute=False면 계획만(미주문)."""
+def rebalance(broker, targets: dict[str, float], prices: dict[str, float], *,
+              min_order_krw: float = 500_000, max_total_weight: float = 1.0,
+              execute: bool = True) -> RebalancePlan:
+    """targets(ticker→weight) → KIS 잔고 reconcile. sizing은 prices(패널 종가)로 —
+    KIS 실시간 시세 불요(500에러 회피) + backtest parity(종가 sizing). execute=False면 계획만."""
     bal = broker.get_balance()
     total = float(bal.get("total_eval") or 0.0)
     if total <= 0:
         total = float(bal.get("cash") or 0.0)
     current = {broker.norm(p["ticker"]): int(p["qty"]) for p in bal.get("positions", [])}
+    px_of = {broker.norm(t): p for t, p in prices.items()}
 
     # no-margin clamp
     tw = sum(targets.values())
@@ -46,21 +49,22 @@ def rebalance(broker, targets: dict[str, float], *, min_order_krw: float = 500_0
 
     sells, buys = [], []
 
-    # 1. target 에 없는 보유 종목 전량 청산
+    # 1. target 에 없는 보유 종목 전량 청산 (ref_price=패널 종가, 없으면 broker 조회)
     for tk, qty in current.items():
         if tk not in tgt and qty > 0:
             o = {"ticker": tk, "side": "sell", "qty": qty, "reason": "exit"}
             if execute:
-                r = broker.sell(tk, qty)
+                r = broker.sell(tk, qty, ref_price=px_of.get(tk))
                 if r is None:
                     continue
                 o.update(r)
             sells.append(o)
 
-    # 2. target 별 desired qty 조정
+    # 2. target 별 desired qty 조정 — 패널 종가로 sizing
     for tk, w in tgt.items():
-        px = broker.get_price_krw(tk)
-        if px <= 0:
+        px = px_of.get(tk)
+        if px is None or px <= 0:
+            logger.warning(f"sizing skip {tk}: 패널 종가 없음")
             continue
         desired = int((w * total) // px)
         cur = current.get(tk, 0)
@@ -70,7 +74,7 @@ def rebalance(broker, targets: dict[str, float], *, min_order_krw: float = 500_0
         if diff > 0:
             o = {"ticker": tk, "side": "buy", "qty": diff, "reason": "adjust" if cur else "new"}
             if execute:
-                r = broker.buy(tk, diff * px)
+                r = broker.buy_qty(tk, diff, ref_price=px)
                 if r is None:
                     continue
                 o.update(r)
@@ -78,7 +82,7 @@ def rebalance(broker, targets: dict[str, float], *, min_order_krw: float = 500_0
         else:
             o = {"ticker": tk, "side": "sell", "qty": -diff, "reason": "trim"}
             if execute:
-                r = broker.sell(tk, -diff)
+                r = broker.sell(tk, -diff, ref_price=px)
                 if r is None:
                     continue
                 o.update(r)
