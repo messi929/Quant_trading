@@ -38,7 +38,7 @@ if [ ! -d venv_v4 ]; then
     echo '  venv_v4 생성'
 fi
 ./venv_v4/bin/pip install -q --upgrade pip 2>&1 | tail -1 || true
-./venv_v4/bin/pip install -q finance-datareader pandas numpy scipy loguru pyyaml pydantic pyarrow requests 2>&1 | tail -2 || true
+./venv_v4/bin/pip install -q finance-datareader pandas numpy scipy loguru pyyaml pydantic pyarrow requests python-dotenv beautifulsoup4 lxml pytest 2>&1 | tail -2 || true
 PYTHONPATH=$REMOTE_DIR ./venv_v4/bin/python -c 'import FinanceDataReader, numpy, pandas; print(\"  venv_v4 ok: FDR\", FinanceDataReader.__version__, \"numpy\", numpy.__version__)' || \
     { echo '  ⚠️ venv_v4 import 실패'; exit 1; }
 # V3 venv 무손상 확인
