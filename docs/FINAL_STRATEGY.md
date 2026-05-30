@@ -12,6 +12,7 @@
 |------|------|----------|:----:|--------|
 | **NASDAQ** | V3.3 Vol-Expansion Trader | 변동성 팽창 예측 → 확신도 사이징 (방향 무관) | ✅ LIVE (paper) | 미국 밤 (KST 22:00~04:30) |
 | **KOSDAQ** | V4 Momentum Engine | multi-lb ensemble 추세 + regime gate (retail herding) | 🟢 paper 자동 (2026-06-01~) | 한국 낮 (KST 09:00~15:30) |
+| KOSPI (후보) | vol-expansion (V3.3 메커니즘 이식) | 변동성 conviction × 약한 direction (효율적 대형주) | 🟡 검증 중 (알파 real, §4.1) | 한국 낮 |
 
 **왜 2-엔진인가**:
 - 두 메커니즘이 반대(미국=변동성 크기, 한국=추세 herding) → 상관 낮음 → 결합 분산효과
@@ -161,12 +162,19 @@ v4/execution/   : kis_broker(KIS 국내) + executor(reconcile: target→청산/�
 
 > "수익 올리자 / 새 alpha 시도" 시 **먼저 여기 참조.** 막힌 경로 반복 금지.
 
-### 4.1 KOSPI — 배포 가능 엣지 없음 (효율적 시장)
-| 접근 | 결과 |
-|------|------|
-| 가격신호(reversion/low-vol/momentum) | full-cycle Sharpe ~0 (효율적, NASDAQ-100과 동일) |
-| 펀더멘털(value/quality, DART) | clean ROE IC 0.15(약함), 0.5 근처는 survivor-bias mirage |
-→ KOSPI ensemble momentum 0.15로도 기각. **가격·펀더멘털 둘 다 deployable 엣지 없음.**
+### 4.1 KOSPI — 가격/펀더멘털 기각, **vol-expansion은 알파 real (검증 중)**
+| 접근 | 결과 | 판정 |
+|------|------|:----:|
+| 가격신호(reversion/low-vol/momentum) | full-cycle Sharpe ~0 (효율적, NASDAQ-100과 동일) | ❌ 기각 |
+| 펀더멘털(value/quality, DART) | clean ROE IC 0.15(약함), 0.5 근처는 survivor-bias mirage | ❌ 기각 |
+| **vol-expansion** (V3.3 메커니즘) | **conviction marginal alpha +2.8%/yr, market-neutral (β0.67)** | 🟡 검증 중 |
+
+**핵심 (2026-05-30 발견)**: KOSPI = NASDAQ-100의 구조적 쌍둥이(효율적 대형주) → 올바른 무기는 momentum(KOSDAQ용)이 아니라 **vol-expansion**. 과거 기각은 "KRX 1% 비용" 가정 탓인데 KOSPI 대형주 현실 왕복 ~0.3%(거래세 인하).
+- `kospi_vol_expansion_probe.py` + `_v2.py` (full-cycle 2014-2026, top100 거래대금, 200d gate)
+- **vol-expansion conviction이 진짜 market-neutral 알파 생성** — opp-only α+2.9% → opp×conv α+5.7% (동일 β0.67). 베타틸트 아님.
+- 단 **deployable 롱온리+gate Sharpe 0.49 < buy&hold 0.58** (gate가 상승장 β 업사이드 깎음 + 한국 리테일 숏 제약으로 알파 분리 불가).
+- **다음 결정(미정)**: VolTransformer(IC 0.70 ≫ crude proxy) KOSPI 재학습 시 알파 배가 → 0.58 넘을 가능성 = 3번째 엔진 후보. 단 멀티데이 작업, 기대 페이오프 modest.
+- **결론**: KOSPI 완전 기각 아님. **메커니즘(vol-expansion) 전이 확인 = real 알파.** 풀엔진 베팅 여부만 미결.
 
 ### 4.2 미국 — V3.3 외 전부 기각 (2026-05-27~30 전수 탐색)
 | 접근 | 결과 |
