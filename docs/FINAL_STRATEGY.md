@@ -1,7 +1,7 @@
 # 최종 전략 — 시장별 상세 정리
 
 **작성**: 2026-05-30
-**상태**: NASDAQ(V3.3) LIVE 유지 · KOSDAQ(V4) paper 자동 가동(2026-06-01~)
+**상태**: NASDAQ(V3.3) LIVE 유지 · KOSDAQ(V4) paper 자동 가동(2026-06-01~) · KOSPI 3경로 전부 기각(§4.1)
 **핵심**: 2개 시장 × 2개 독립 엔진. 시장마다 통하는 메커니즘이 다르므로 **같은 전략을 강제하지 않는다.**
 
 ---
@@ -12,7 +12,7 @@
 |------|------|----------|:----:|--------|
 | **NASDAQ** | V3.3 Vol-Expansion Trader | 변동성 팽창 예측 → 확신도 사이징 (방향 무관) | ✅ LIVE (paper) | 미국 밤 (KST 22:00~04:30) |
 | **KOSDAQ** | V4 Momentum Engine | multi-lb ensemble 추세 + regime gate (retail herding) | 🟢 paper 자동 (2026-06-01~) | 한국 낮 (KST 09:00~15:30) |
-| KOSPI (후보) | vol-expansion (V3.3 메커니즘 이식) | 변동성 conviction × 약한 direction (효율적 대형주) | 🟡 검증 중 (알파 real, §4.1) | 한국 낮 |
+| ~~KOSPI~~ | ~~vol-expansion 이식~~ | 알파 real이나 롱온리 구조 천장 < buy&hold (oracle도 0.51<0.58) | ❌ 기각 (§4.1) | — |
 
 **왜 2-엔진인가**:
 - 두 메커니즘이 반대(미국=변동성 크기, 한국=추세 herding) → 상관 낮음 → 결합 분산효과
@@ -162,19 +162,32 @@ v4/execution/   : kis_broker(KIS 국내) + executor(reconcile: target→청산/�
 
 > "수익 올리자 / 새 alpha 시도" 시 **먼저 여기 참조.** 막힌 경로 반복 금지.
 
-### 4.1 KOSPI — 가격/펀더멘털 기각, **vol-expansion은 알파 real (검증 중)**
+### 4.1 KOSPI — 가격/펀더멘털/vol-expansion **3경로 전부 기각 확정** (2026-05-30)
 | 접근 | 결과 | 판정 |
 |------|------|:----:|
 | 가격신호(reversion/low-vol/momentum) | full-cycle Sharpe ~0 (효율적, NASDAQ-100과 동일) | ❌ 기각 |
 | 펀더멘털(value/quality, DART) | clean ROE IC 0.15(약함), 0.5 근처는 survivor-bias mirage | ❌ 기각 |
-| **vol-expansion** (V3.3 메커니즘) | **conviction marginal alpha +2.8%/yr, market-neutral (β0.67)** | 🟡 검증 중 |
+| **vol-expansion** (V3.3 메커니즘) | **알파 real이나 롱온리 구조 천장이 hurdle 아래** | ❌ 기각 |
 
-**핵심 (2026-05-30 발견)**: KOSPI = NASDAQ-100의 구조적 쌍둥이(효율적 대형주) → 올바른 무기는 momentum(KOSDAQ용)이 아니라 **vol-expansion**. 과거 기각은 "KRX 1% 비용" 가정 탓인데 KOSPI 대형주 현실 왕복 ~0.3%(거래세 인하).
-- `kospi_vol_expansion_probe.py` + `_v2.py` (full-cycle 2014-2026, top100 거래대금, 200d gate)
-- **vol-expansion conviction이 진짜 market-neutral 알파 생성** — opp-only α+2.9% → opp×conv α+5.7% (동일 β0.67). 베타틸트 아님.
-- 단 **deployable 롱온리+gate Sharpe 0.49 < buy&hold 0.58** (gate가 상승장 β 업사이드 깎음 + 한국 리테일 숏 제약으로 알파 분리 불가).
-- **다음 결정(미정)**: VolTransformer(IC 0.70 ≫ crude proxy) KOSPI 재학습 시 알파 배가 → 0.58 넘을 가능성 = 3번째 엔진 후보. 단 멀티데이 작업, 기대 페이오프 modest.
-- **결론**: KOSPI 완전 기각 아님. **메커니즘(vol-expansion) 전이 확인 = real 알파.** 풀엔진 베팅 여부만 미결.
+**핵심 (2026-05-30 발견)**: KOSPI = NASDAQ-100의 구조적 쌍둥이(효율적 대형주) → 올바른 무기는 momentum(KOSDAQ용)이 아니라 **vol-expansion**. 과거 기각은 "KRX 1% 비용" 가정 탓인데 KOSPI 대형주 현실 왕복 ~0.3%(거래세 인하)라 재검증할 가치가 있었음.
+
+**vol-expansion 기각 사유 (2단계 검증):**
+
+1. **알파는 real (`kospi_vol_expansion_probe.py` + `_v2.py`)** — full-cycle 2014-2026, top100 거래대금, 200d gate. vol-expansion conviction이 진짜 market-neutral 알파 생성: opp-only α+2.9% → opp×conv α+5.7% (동일 β0.67, **베타틸트 아님, +2.8%/yr marginal**). 메커니즘 전이는 확인됨.
+
+2. **그러나 deployable 구조로 수익화 불가 → 기각.** 롱온리+gate Sharpe **0.49 < buy&hold 0.58**. "VolTransformer(IC 0.70 ≫ crude proxy) 재학습하면 알파 배가 → 0.58 넘는가?"가 남은 질문이었고, **oracle ceiling probe(`kospi_vol_oracle_ceiling.py`)로 GPU 쓰기 전 싸게 결판:**
+
+   | 구조 | proxy conviction | ORACLE (천장, IC=1.0 look-ahead) | buy&hold hurdle |
+   |------|:---:|:---:|:---:|
+   | 롱온리+gate (배포가능) | Sharpe 0.45 | **0.51** | **0.58** |
+   | 롱숏 dollar-neutral (숏제약→배포불가) | -0.22 | -0.41 | — |
+
+   - **막힌 건 conviction *품질*이 아니라 롱온리+gate *구조*.** 미래 vol을 완벽히 아는 oracle(IC=1.0)조차 Sharpe 0.51 < hurdle 0.58. 어떤 VolTransformer로도 못 뚫음 → **재학습 무의미.**
+   - **headroom 거의 없음**: proxy는 이미 forward vol_target을 IC **+0.526**으로 예측(NASDAQ VolTransformer 0.70 근접). proxy 0.45 → oracle 0.51, 완벽한 모델이 더해도 **단 +0.06 Sharpe**이고 그마저 hurdle 미달.
+   - **롱숏은 oracle조차 음수**(-0.41) → 완벽한 vol 예지 + 모멘텀 방향으로도 KOSPI market-neutral 알파 없음. (위 "+2.8%/yr"는 롱온리 selection 한정의 더 약한 주장이었음.)
+   - **왜 롱온리가 천장인가**: ① regime gate가 상승장 β 업사이드를 깎아 buy&hold를 못 이김 ② 한국 리테일 공매도 제약으로 alpha를 short leg로 분리 불가 → market-neutral 알파가 deployable 수익으로 전환 안 됨.
+
+- **결론**: KOSPI는 가격·펀더멘털·vol-expansion **3경로 모두 deployable 엣지 없음 = 효율적 시장.** vol-expansion 알파는 real이지만 한국 롱온리 제약 하에서 수익화 불가. **재학습 안 함(validation_rigor: "0.58 신기루"를 GPU 전 차단). V4 = KOSDAQ momentum 단일 엔진 최종 확정.**
 
 ### 4.2 미국 — V3.3 외 전부 기각 (2026-05-27~30 전수 탐색)
 | 접근 | 결과 |
