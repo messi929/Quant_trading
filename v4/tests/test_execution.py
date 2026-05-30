@@ -12,6 +12,7 @@ import pytest
 
 from v4.execution.kis_broker import KisKoreaBroker
 from v4.execution.executor import rebalance
+from v4.scripts.reset_sandbox_account import reset
 
 
 class FakeBroker:
@@ -142,3 +143,27 @@ class TestBrokerSizing:
         r = b.buy("005930", 700_000)
         assert r["dry_run"] is True and r["qty"] == 10
         assert b.api.placed == []                      # 실주문 없음
+
+
+class TestAccountReset:
+    """reset_sandbox_account.reset — 잔여 전량 청산 로직 (sandbox 가동 전 #2)."""
+    PRICES = {"000087": 13_250.0, "001420": 2_835.0, "001527": 7_400.0}
+
+    def test_sells_all_positions(self):
+        b = FakeBroker(cash=1_000_000,
+                       positions={"000087": 93, "001420": 13532, "001527": 1655},
+                       prices=self.PRICES)
+        reset(b, execute=True)
+        assert sorted(b.orders) == sorted([
+            ("sell", "000087", 93), ("sell", "001420", 13532), ("sell", "001527", 1655)])
+
+    def test_no_positions_is_noop(self):
+        b = FakeBroker(cash=100_000_000, positions={}, prices={})
+        assert reset(b, execute=True) == 0
+        assert b.orders == []
+
+    def test_skips_zero_qty(self):
+        b = FakeBroker(cash=0, positions={"000087": 0, "001420": 100},
+                       prices={"000087": 100.0, "001420": 100.0})
+        reset(b, execute=True)
+        assert b.orders == [("sell", "001420", 100)]
