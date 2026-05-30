@@ -56,6 +56,7 @@ User=root
 WorkingDirectory=/opt/quant
 Environment=PYTHONPATH=/opt/quant
 EnvironmentFile=/opt/quant/.env
+TimeoutStartSec=1800
 ExecStart=/opt/quant/venv_v4/bin/python -u v4/scripts/run_v4_live.py --mode once
 StandardOutput=append:/var/log/quant-v4.log
 StandardError=append:/var/log/quant-v4-error.log
