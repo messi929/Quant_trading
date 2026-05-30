@@ -634,3 +634,84 @@ layer 재활성 선결 조건(1순위)에서 제거됨.
 
 미달 시 단계적 rollback (`docs/V3.3_OPERATIONS.md` §4). 자동 rollback
 (`v33-rollback-check.timer`) 1주 PnL −2% 시 features OFF 안전망 작동.
+
+---
+
+## V4 KOSDAQ 메인 엔진 보강 로드맵 (2026-05-30 ~)
+
+> 사용자 전략 리뷰(2026-05-30): "KOSDAQ을 메인 엔진으로 두되, 알파를 더 찾기보다
+> 체결·노출·섹터·상대강도 필터를 보강하는 단계." 큰 그림 동의. 단 제안된 5개 보강
+> 항목은 **위험 프로파일이 정반대인 두 부류로 갈리며, 섞으면 위험**하다.
+> KOSPI 3경로 기각 확정은 `docs/FINAL_STRATEGY.md` §4.1.
+
+**철칙 (이 프로젝트의 진짜 엣지)**: V4 검증 이력은 lever 추가의 연속 기각이었다 —
+trailing stop 기각(Sharpe 0.41→0.17), 단일 lb 튜닝=신기루, best-fit param=overfit,
+**keeper는 vol-target 하나뿐**. 보강 항목의 합격 바는 "백테스트 숫자 개선"이 아니라
+**a-priori 파라미터 + walk-forward 생존 + param plateau**. 대부분 탈락을 예상한다.
+
+### 부류 분류 — A(전방 검증) vs B(새 fitted lever)
+
+| # | 항목 | 부류 | 판정 |
+|---|------|:----:|------|
+| 1 | 체결품질 측정 | **A** | 최우선·정당. 단 LIVE 데이터로만 측정(백테스트 불가) |
+| 5 | NASDAQ↔KOSDAQ 통합 상관 | **A** | legit 측정. 단 현재 live 히스토리 미겹침(아래) |
+| 2 | KOSDAQ/KOSPI RS 필터 | B | KOSPI 재활용 아이디어 OK. overlay는 a-priori 1회 테스트, prior 낮음 |
+| 4 | 단계 노출 0/50/100 | B | 동기(COVID whipsaw) real, 그러나 **표본 크래시 n=1 과적합 최대 위험** |
+| 3 | sector/liquidity cap | B | 아래 effective-N 데이터로 부분 정당화 (soft cap만) |
+
+- **A부류**: 측정이지 fitting이 아님 → overfit 위험 0, 가치 높음. 단 둘 다 **지금은 데이터가
+  없다.** #1은 6/1+ live 필요. #5는 V3 paper(4/11~, 미국 밤) ↔ V4(6/1~, 한국 낮)
+  히스토리가 안 겹쳐 백테스트 상관은 약한 proxy. 둘 다 paper 누적 후 측정.
+- **B부류**: 같은 2014-26 창에 knob 추가 → 정확히 이 프로젝트가 반복 기각해온 함정.
+  진입 전 paper가 알파의 *체결 생존*을 먼저 증명해야 의미.
+
+### 데이터로 검증한 #3 — "top20 = 사실상 2~3 테마 베팅?"
+
+`v3/research/kosdaq_concentration_probe.py` (production `ensemble_picks` 그대로 호출,
+regime-on 78 바스켓, full-cycle). sector 라벨 없이 픽들의 실현 수익률 동조성으로 실효
+분산 측정:
+
+| 지표 | 값 |
+|------|-----|
+| pairwise 상관 ρ̄ | +0.14 (median 0.13, p90 0.29) |
+| **실효 종목수 N_eff** | **7.1 / 명목 20** (median 5.9, **p10 3.1**) |
+| 바스켓 수익 집중 | top1 18.7%, top3 41.2% (\|기여\|) |
+
+**판정: 명목 20이 실효 ~7개 베팅.** "2~3"은 평균적으론 과장이나 **p10 꼬리(3.1)**에서
+실제 발생 → 우려는 *real but moderate*. 
+- avg case(7.1)는 **hard sector cap 정당화 못 함** (복잡도만 추가).
+- 꼬리(3.1)는 **soft single-name/liquidity weight cap**을 *리스크 통제*로 지지
+  (수익 최적화 아님). a-priori 후보: 단일종목 ≤ 7%, 거래대금 대비 주문금액 상한.
+  "best 비중/섹터한도 찾기"는 B부류 함정 → 금지.
+
+### 시퀀싱 (확정)
+
+```
+[지금~6/1]  모델에 아무것도 추가하지 않는다.
+            역설적이지만 KOSDAQ 최선. 6/1 전 lever를 얹으면 #1(깨끗한 forward
+            체결 검증)을 오염시킨다. 엣지는 알파가 아니라 추가를 거부하는 규율.
+[6/1]       첫 자동 세션 관찰 (journalctl -u quant-v4-korea / quant-v4.log).
+            정상 작동 확인.
+[6/1+]      execution-quality 로거를 v4 live 경로에 보강 (테스트 동반).
+            6/1 한 세션 돌려 logs 확인 후 적용 (가동 직전 live 경로 변경 금지).
+[paper 3~6M] 체결 데이터 수집·측정: 신호종가 대비 체결가(슬리피지) / 09:05 체결률
+            / 미체결 비율 / turnover / 종목별 PnL 기여 / 실전 MDD vs 백테스트.
+            ★ 이게 모든 걸 결정한다. 알파 추가 아님.
+[증명 후]   B부류 진입. 각각 a-priori + walk-forward, 탈락 예상하며 1개씩.
+            soft single-name/liquidity cap(#3 꼬리 근거)만 리스크 통제로 선행 가능.
+[자본 배분 전] #5 통합 상관 — V3·V4 둘 다 live 누적 후. "growth risk 동시 노출"
+            (미 기술주 급락 ↔ 한 성장주 급락) 동반 손실일 비율 측정 필수.
+```
+
+### KOSPI 재활용 (#2 reframe) — 동의
+
+KOSPI는 *독립 알파 엔진*으로 기각(§4.1)이지만 *regime/RS 지표*로 재활용은 다른·더
+싼 용도라 동의. 단 RS overlay도 fitted lever → 120d 표준 a-priori 1회 테스트, walk-forward로만
+판단. 절대 best-fit band 탐색 금지.
+
+### 절대 금지
+
+- 6/1 가동 전 live 경로(`v4/live/`, `v4/execution/`) 변경 — 첫 자동 세션 깨질 위험
+- B부류 lever를 백테스트 숫자 최대화로 채택 (best-fit = mirage, V4 전체 교훈)
+- COVID whipsaw 하나(n=1)에 맞춘 단계 노출 band 튜닝
+- paper 체결 검증 전 "알파 더 찾기" — 현 단계는 alpha가 아니라 execution이 bottleneck
