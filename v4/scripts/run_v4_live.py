@@ -37,7 +37,11 @@ def session(broker, cfg, universe_size: int, execute: bool) -> None:
     if res.rebalanced:
         logger.info(f"세션 완료: regime={'ON' if res.regime_on else 'OFF'} "
                     f"exposure={res.exposure:.2f} picks={res.n_picks} "
-                    f"sells={len(res.plan.sells)} buys={len(res.plan.buys)}")
+                    f"sells={len(res.plan.sells)} buys={len(res.plan.buys)} "
+                    f"fails={len(res.plan.failures)}")
+    elif res.note == "exec_failed":
+        logger.error(f"세션 실패: 전 주문 실행 실패 ({len(res.plan.failures)}건) — "
+                     f"state 미전진, 다음 세션 재시도. 계좌 리셋/예수금 점검 필요.")
     else:
         logger.info("세션 완료: hold (rebalance일 아님)")
 

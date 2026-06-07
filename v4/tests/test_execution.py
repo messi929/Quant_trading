@@ -145,6 +145,77 @@ class TestBrokerSizing:
         assert b.api.placed == []                      # 실주문 없음
 
 
+class FlakyBroker(FakeBroker):
+    """지정 ticker 의 buy/sell 이 None 반환 (KIS 매매불가/자금부족/장외 모사)."""
+
+    def __init__(self, cash, positions, prices, fail=()):
+        super().__init__(cash, positions, prices)
+        self.fail = {self.norm(t) for t in fail}
+
+    def buy_qty(self, ticker, qty, ref_price=0.0):
+        if self.norm(ticker) in self.fail:
+            return None
+        return super().buy_qty(ticker, qty, ref_price)
+
+    def sell(self, ticker, qty, ref_price=None):
+        if self.norm(ticker) in self.fail:
+            return None
+        return super().sell(ticker, qty, ref_price)
+
+
+class TestReconcileFailures:
+    """주문 실패(broker None 반환)가 silent skip 되지 않고 plan.failures 로 surface 되는가.
+
+    2026-06-07 V4 paper 6/1 silent execution failure 회귀: 우선주 매매불가 + 자금부족으로
+    전 주문이 None 반환됐는데 executor 가 조용히 continue → 계좌 무변동인데 성공처럼 보임.
+    """
+    PRICES = {"100000": 10_000.0, "200000": 20_000.0, "400000": 8_000.0}
+
+    def test_failed_exit_sell_recorded_in_failures(self):
+        # 보유 400000 청산 주문이 실패 → sells 아님, failures 에 기록
+        b = FlakyBroker(cash=0, positions={"400000": 100}, prices=self.PRICES,
+                        fail=["400000"])
+        plan = rebalance(b, {"100000": 1.0}, self.PRICES)
+        assert not any(o["ticker"] == "400000" for o in plan.sells)
+        assert any(o["ticker"] == "400000" and o["side"] == "sell" for o in plan.failures)
+
+    def test_failed_buy_recorded_in_failures(self):
+        b = FlakyBroker(cash=10_000_000, positions={}, prices=self.PRICES,
+                        fail=["100000"])
+        plan = rebalance(b, {"100000": 1.0}, self.PRICES)
+        assert not plan.buys
+        assert any(o["ticker"] == "100000" and o["side"] == "buy" for o in plan.failures)
+
+    def test_all_orders_fail_executed_zero(self):
+        # 6/1 시나리오: 청산도 매수도 전부 실패 → 성공 0, 실패 전부
+        b = FlakyBroker(cash=10_000_000, positions={"400000": 100}, prices=self.PRICES,
+                        fail=["400000", "100000"])
+        plan = rebalance(b, {"100000": 1.0}, self.PRICES)
+        assert len(plan.sells) + len(plan.buys) == 0
+        assert len(plan.failures) >= 2
+
+    def test_partial_failure(self):
+        # 청산 성공 + 매수 실패 → 부분
+        b = FlakyBroker(cash=0, positions={"400000": 100}, prices=self.PRICES,
+                        fail=["100000"])
+        plan = rebalance(b, {"100000": 1.0}, self.PRICES)
+        assert any(o["ticker"] == "400000" for o in plan.sells)       # 청산 성공
+        assert any(o["ticker"] == "100000" for o in plan.failures)    # 매수 실패
+
+    def test_success_has_no_failures(self):
+        b = FakeBroker(cash=10_000_000, positions={}, prices=self.PRICES)
+        plan = rebalance(b, {"100000": 1.0}, self.PRICES)
+        assert plan.failures == ()
+
+    def test_plan_only_no_failures(self):
+        # execute=False → broker 미호출 → 실패 없음 (계획만)
+        b = FlakyBroker(cash=10_000_000, positions={}, prices=self.PRICES,
+                        fail=["100000"])
+        plan = rebalance(b, {"100000": 1.0}, self.PRICES, execute=False)
+        assert plan.failures == ()
+        assert len(plan.buys) == 1
+
+
 class TestAccountReset:
     """reset_sandbox_account.reset — 잔여 전량 청산 로직 (sandbox 가동 전 #2)."""
     PRICES = {"000087": 13_250.0, "001420": 2_835.0, "001527": 7_400.0}

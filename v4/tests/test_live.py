@@ -123,3 +123,64 @@ class TestRunSession:
         st = LiveState(basket_history=[0.3, -0.3, 0.3, -0.3, 0.3, -0.3])  # 고변동
         res = run_session(b, close, dvol, up, st, CFG)
         assert 0.0 < res.exposure < 1.0                  # vol-target 축소
+
+
+class _AllFailBroker(FakeBroker):
+    """모든 buy/sell 이 None (6/1 silent failure 모사)."""
+    def buy_qty(self, t, qty, ref_price=0.0):
+        return None
+    def sell(self, t, qty, ref_price=None):
+        return None
+
+
+class _BuyFailBroker(FakeBroker):
+    """매수만 실패, 매도는 성공 (부분 실패)."""
+    def buy_qty(self, t, qty, ref_price=0.0):
+        return None
+
+
+class TestExecFailureInvariant:
+    """2026-06-07 회귀: 주문 전량 실패 시 state 를 rebalance 완료로 기록하지 않는다.
+
+    6/1 paper 가동에서 우선주 매매불가 + 자금부족으로 전 주문 실패했는데 runner 가
+    last_rebalance_date 를 전진 → 다음 20거래일간 빈 거래 방치 + 성공처럼 보임.
+    """
+
+    def test_total_failure_does_not_advance_state(self):
+        close, dvol, up, _ = _panel()
+        b = _AllFailBroker(10_000_000, {}, _prices(close))
+        st = LiveState()                                  # 첫 실행
+        res = run_session(b, close, dvol, up, st, CFG)
+        assert res.rebalanced is False
+        assert res.note == "exec_failed"
+        assert st.last_rebalance_date is None             # 미전진 → 다음 세션 재시도
+        assert st.basket_history == []                    # phantom 측정도 미누적
+
+    def test_total_failure_then_retry_succeeds(self):
+        close, dvol, up, _ = _panel()
+        st = LiveState()
+        run_session(_AllFailBroker(10_000_000, {}, _prices(close)), close, dvol, up, st, CFG)
+        assert st.last_rebalance_date is None             # 실패 → 미전진
+        # 다음 세션 정상 broker → 재시도 성공
+        ok = FakeBroker(10_000_000, {}, _prices(close))
+        res = run_session(ok, close, dvol, up, st, CFG)
+        assert res.rebalanced and st.last_rebalance_date == str(close.index[-1].date())
+
+    def test_partial_failure_advances_state(self):
+        # 보유 비픽 종목 청산 성공 + 신규 매수 실패 → 부분. 계좌가 바뀌었으니 전진.
+        close, dvol, up, _ = _panel()
+        b = _BuyFailBroker(0, {TICKERS[29]: 100}, _prices(close))   # 저모멘텀 보유
+        st = LiveState()
+        res = run_session(b, close, dvol, up, st, CFG)
+        assert ("sell", TICKERS[29], 100) in b.orders               # 청산은 성공
+        assert res.rebalanced is True
+        assert st.last_rebalance_date == str(close.index[-1].date())
+
+    def test_no_orders_needed_is_not_failure(self):
+        # regime OFF + 무보유 → 주문 자체가 없음(실패 아님) → 정상 전진(현금 유지)
+        close, dvol, _, down = _panel()
+        b = _AllFailBroker(10_000_000, {}, _prices(close))          # 어차피 주문 없음
+        st = LiveState()
+        res = run_session(b, close, dvol, down, st, CFG)
+        assert res.rebalanced is True and res.note == "rebalanced"
+        assert st.last_rebalance_date == str(close.index[-1].date())

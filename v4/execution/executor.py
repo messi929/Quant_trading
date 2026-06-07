@@ -24,6 +24,7 @@ class RebalancePlan:
     buys: tuple[dict, ...]
     clamped: bool
     total_eval: float
+    failures: tuple[dict, ...] = ()      # 시도했으나 broker None 반환 (매매불가/자금부족/장외)
 
 
 def rebalance(broker, targets: dict[str, float], prices: dict[str, float], *,
@@ -47,7 +48,7 @@ def rebalance(broker, targets: dict[str, float], prices: dict[str, float], *,
         logger.info(f"target weight {tw:.2f} > {max_total_weight} → no-margin clamp ×{scale:.3f}")
     tgt = {broker.norm(t): w for t, w in targets.items()}
 
-    sells, buys = [], []
+    sells, buys, failures = [], [], []
 
     # 1. target 에 없는 보유 종목 전량 청산 (ref_price=패널 종가, 없으면 broker 조회)
     for tk, qty in current.items():
@@ -56,6 +57,9 @@ def rebalance(broker, targets: dict[str, float], prices: dict[str, float], *,
             if execute:
                 r = broker.sell(tk, qty, ref_price=px_of.get(tk))
                 if r is None:
+                    logger.error(f"order FAILED sell {tk} x{qty} (exit) — broker None "
+                                 f"(매매불가/장외?)")
+                    failures.append(o)
                     continue
                 o.update(r)
             sells.append(o)
@@ -76,6 +80,9 @@ def rebalance(broker, targets: dict[str, float], prices: dict[str, float], *,
             if execute:
                 r = broker.buy_qty(tk, diff, ref_price=px)
                 if r is None:
+                    logger.error(f"order FAILED buy {tk} x{diff} ({o['reason']}) — broker "
+                                 f"None (자금부족/매매불가?)")
+                    failures.append(o)
                     continue
                 o.update(r)
             buys.append(o)
@@ -84,10 +91,15 @@ def rebalance(broker, targets: dict[str, float], prices: dict[str, float], *,
             if execute:
                 r = broker.sell(tk, -diff, ref_price=px)
                 if r is None:
+                    logger.error(f"order FAILED sell {tk} x{-diff} (trim) — broker None")
+                    failures.append(o)
                     continue
                 o.update(r)
             sells.append(o)
 
-    logger.info(f"rebalance: total={total:,.0f} KRW, sells={len(sells)}, buys={len(buys)}"
-                f"{' [clamped]' if clamped else ''}")
-    return RebalancePlan(tuple(sells), tuple(buys), clamped, total)
+    if failures:
+        logger.error(f"rebalance: {len(failures)} order(s) FAILED — "
+                     f"{[f['ticker'] for f in failures][:10]}")
+    logger.info(f"rebalance: total={total:,.0f} KRW, sells={len(sells)}, buys={len(buys)}, "
+                f"fails={len(failures)}{' [clamped]' if clamped else ''}")
+    return RebalancePlan(tuple(sells), tuple(buys), clamped, total, tuple(failures))

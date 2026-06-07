@@ -79,10 +79,8 @@ def run_session(broker, close: pd.DataFrame, dvol: pd.DataFrame, index: pd.Serie
         logger.info(f"hold: rebalance까지 {cfg.hold - elapsed}거래일 남음")
         return SessionResult(False, None, 0.0, False, 0, None, "hold")
 
-    # 1. 직전 phantom 픽 실현 수익 측정 → vol-target history 누적
+    # 1. 직전 phantom 픽 실현 수익 측정 (commit 시점까지 누적 보류 — 실패 시 double-count 방지)
     measured = _measure_pending(state, close, i, cfg)
-    if measured is not None:
-        state.basket_history.append(measured)
 
     # 2. 오늘 신호 (엔진 동일 함수)
     picks = ensemble_picks(close, dvol, i, cfg)        # phantom (gate 무관)
@@ -95,13 +93,29 @@ def run_session(broker, close: pd.DataFrame, dvol: pd.DataFrame, index: pd.Serie
     prices = close.iloc[i].dropna().to_dict()
     plan = rebalance(broker, book, prices, execute=execute)
 
-    # 4. state 갱신 — 오늘 phantom 픽을 pending 으로 (다음 rebalance에 측정)
+    executed = len(plan.sells) + len(plan.buys)
+    failed = len(plan.failures)
+
+    # 3b. 전 주문 실행 실패 → state 미전진 (silent failure 방지, 다음 세션 재시도).
+    #     2026-06-07 회귀: 6/1 우선주 매매불가+자금부족 전량 실패인데 state 전진 → 빈 거래 방치.
+    if failed > 0 and executed == 0:
+        logger.error(f"rebalance {today.date()}: 전 주문 실패 ({failed}건) — state 미전진, "
+                     f"다음 세션 재시도. (계좌 리셋/매매가능/예수금 점검 필요)")
+        return SessionResult(False, plan, exp, on, len(picks.tickers), measured,
+                             "exec_failed")
+
+    # 4. commit — phantom 측정 누적 + pending 갱신 + rebalance 완료 기록
+    if measured is not None:
+        state.basket_history.append(measured)
     state.pending_entries = {t: float(close.iloc[i][t]) for t in picks.tickers}
     state.pending_date = str(today.date())
     state.last_rebalance_date = str(today.date())
 
+    if failed > 0:
+        logger.warning(f"rebalance {today.date()}: 부분 실패 — 성공 {executed}, 실패 {failed}. "
+                       f"계좌 부분 정렬 상태(다음 주기에 재정렬).")
     logger.info(f"rebalance {today.date()}: regime={'ON' if on else 'OFF'} "
                 f"exposure={exp:.2f} picks={len(picks.tickers)} "
-                f"sells={len(plan.sells)} buys={len(plan.buys)}")
+                f"sells={len(plan.sells)} buys={len(plan.buys)} fails={failed}")
     return SessionResult(True, plan, exp, on, len(picks.tickers), measured,
                          "rebalanced")
