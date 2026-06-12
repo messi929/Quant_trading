@@ -5,6 +5,10 @@
 **최종 엔진**: KOSDAQ multi-lb ensemble momentum + 200d SMA gate + vol-target =
 full-cycle Sharpe 0.66 / annual +10.5% / MDD −17% (2014-2026, survivorship-free, robust)
 **다음 세션 시작점**: Phase B 엔진 구현 (또는 modest Sharpe 0.66 수용 여부 결정)
+**paper 가동 (2026-06-12 update)**: ✅ KIS 계좌 교체(50169471→**50192869**, 옛 계좌
+`40910000` 주문차단)로 첫 실거래 준비 완료 — 잔고 1억·양방향 실주문 검증, state 리셋.
+**월 2026-06-15 09:05 타이머가 fresh KOSDAQ 20종목 rebalance 자동 실행 = 실거래 첫 시작.**
+상세 = CHANGELOG "V4 KOSDAQ paper — 주문차단 해소 (2026-06-12)".
 
 > ⚠️ **2026-05-29 업데이트 — 미국 엔진 기각**: EODHD 상폐 포함 데이터(NASDAQ
 > common 6,753종목, survivorship-free)로 재검증한 결과 reversion edge가 **전부
@@ -440,7 +444,9 @@ momentum이 reversion보다 덜 나쁨(승자 매수 = 상폐 함정 회피, 가
   numpy 핀 고정 필요. (한국/미국 엔진 검증과 별개, 기존 V3 운영 영향 가능)
 - **survivor-only 부풀림** — 미국 모든 수치는 EODHD 확정 전까지 낙관적.
 - **표본 한계** — KOSDAQ n=62 rebalance, 미국 76종목. 더 넓은 universe로 보강 여지.
-- **실거래 미검증** — 전부 백테스트. 실제 체결/슬리피지/세금/환율 별도.
+- **실거래 미검증** — 백테스트 기반. 주문 경로는 2026-06-12 KR 장중 실주문(005930
+  1주 매수→매도)으로 검증됨. 단 전체 바스켓 체결/슬리피지/세금은 6/15 첫 rebalance
+  부터 forward 관찰 필요. **6/15 점검: picks=20 전량 체결 확인(`/var/log/quant-v4.log`).**
 - **목표 재설정** — "연 20% 신화" 버리고 "무위험+α + 내 시스템". 한국 +20%(raw),
   risk 제어 후 Sharpe 1.0+면 목표 달성.
 

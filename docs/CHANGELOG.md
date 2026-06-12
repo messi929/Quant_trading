@@ -1863,3 +1863,53 @@ KOSDAQ / multi-lb ensemble momentum / PIT 거래대금 top100 / hold20·N20·lon
   `korea_gate_robustness`, `korea_long_history`, `korea_risk_levers`,
   `korea_lever_sweep`, `korea_ensemble`, `korea_kospi_edge`, `dart_fetch`,
   `kospi_fundamental_factor` (v3/research/).
+
+---
+
+## V4 KOSDAQ paper — 주문차단 해소 + 첫 실거래 준비 (2026-06-12)
+
+V4 KOSDAQ가 6/1 자동 가동됐으나 6/1~6/12 **실거래 0건**이었던 문제를 진단·해소.
+순수 운영 변경(KIS 계좌 교체 + state 리셋), 코드 변경 없음.
+
+### 근본 원인 — 계좌 레벨 주문 차단 (이전 가설 정정)
+
+6/7 진단에서는 "레거시 우선주 매매불가 / 자금부족" 가설이었으나 **오진**. 6/12
+장중 리셋 `--execute` 재시도 결과 6종목 전량 매도 실패, 5/6이 동일 에러
+**`모의투자 주문이 불가한 계좌입니다 (code=40910000)`**. 즉 종목·자금 문제가
+아니라 **옛 sandbox 국내계좌(CANO 50169471) 자체가 모의투자 주문 차단** 상태
+(KIS 모의투자 참가기간 만료 추정). 6/1 silent-fail의 진짜 원인 = 이 차단.
+
+### 조치 — 새 계좌 + 자격증명 교체
+
+- 사용자가 새 모의투자 계좌 **50192869 + 새 APP_KEY(`PSgtqUf...`, 옛 `PSU44RMD...`
+  와 다름)/SECRET** 발급 → `API_KEYS.txt[1]/[2]` 갱신.
+- 서버 `/opt/quant/.env` + 로컬 `.env` 도메스틱·해외 자격증명 전부 새 값으로 교체
+  (`.env.bak*` 백업 보존). `KIS_MODE=sandbox` 유지.
+
+### 검증 (KR 장중 6/12 실주문)
+
+- 잔고: **현금 1억 / 보유 0종목** — 깨끗한 시작점 (레거시 −11M 소멸, 그건 V4
+  성과 아니었음).
+- 실주문: 005930 1주 **매수 체결(주문번호 0000029157) → 매도 원복(0000029838)**.
+  **양방향 주문 경로 정상** — `40910000` / `INVALID_CHECK_ACNO` 모두 해소.
+  (시세 9443 포트 500은 기존 문제, 시장가 ref_price 경로라 무관.)
+
+### state 리셋 — fresh 가동
+
+`v4_live_state.json`이 6/1 phantom 픽 20종목을 "보유 중"으로 잘못 기록(실제 미체결)
+→ 사용자 결정 "리셋 → 월요일 fresh". 파일 archive(`.stale_6_1_*`),
+`LiveState.load()`가 파일 없으면 `last_rebalance_date=None`(=`is_rebalance_day`
+TRUE) 반환 → **월 2026-06-15 09:05 타이머가 fresh 20종목 KOSDAQ rebalance 자동
+실행 = V4 실거래 첫 시작**.
+
+### 금주(6/8~6/12) 트레이딩 결과
+
+- **V4 KOSDAQ**: 실거래 0. 6/8·6/9 크래시(FDR HTTP 404), 6/10~6/12 정상실행이나
+  전부 hold(다음 rebalance 미도래). 위 조치로 6/15부터 실가동.
+- **V3.3 NASDAQ (정상)**: 총 102.4M(+2.4%, 4/11~). 금주 KLAC +5.68%, MELI −0.19%,
+  AAPL 보유 중. 게이트·regime·사이징 정상.
+
+### 잔여 / 점검 필요
+
+- **6/15 첫 실거래 점검** — picks=20 전량 체결 확인(`/var/log/quant-v4.log`).
+- loguru가 journalctl엔 안 남지만 `/var/log/quant-v4.log`엔 정상 기록 → 실질 무해.

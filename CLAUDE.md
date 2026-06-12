@@ -8,8 +8,10 @@
 > 의 신규 엔진 `v4/` 패키지가 추가됨. KOSDAQ multi-lb ensemble momentum + 200d SMA
 > regime gate + vol-targeting — full-cycle(2014-2026) survivorship-free 검증 Sharpe
 > 0.66/+10.5%/MDD-17%. 코드 완성·실행정확·테스트 38개 통과(backtest=live 단일 경로,
-> KIS 국내 paper 연동). **아직 paper 미가동** — 가동 전 (1)sandbox 계좌 리셋 (2)KR 장중
-> 실주문 smoke (3)systemd timer 배포 필요(전부 장중/배포 액션). 미국·KOSPI는 효율적
+> KIS 국내 paper 연동). **paper 가동 준비 완료 (2026-06-12)** — KIS 계좌 교체
+> (50169471→50192869, 옛 계좌 `40910000` 주문차단)로 잔고 1억·양방향 실주문 검증·state
+> 리셋 완료. **월 2026-06-15 09:05 타이머가 fresh KOSDAQ 20종목 rebalance 자동 실행 =
+> 실거래 첫 시작** (6/15 picks=20 체결 점검 필요). 미국·KOSPI는 효율적
 > 시장이라 가격·펀더멘털 엣지 없음 확인(기각). 설계/검증 상세 = `docs/V4_DUAL_ENGINE_DESIGN.md`.
 > V3.3은 그대로 live 유지(V4와 독립).
 
