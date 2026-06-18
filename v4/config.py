@@ -29,6 +29,10 @@ class KoreaConfig:
     vol_win: int = 6                       # trailing rebalance 수 (~6개월)
     vol_cap: float = 1.5                   # 노출 상한 (평시 레버리지 허용 한도)
 
+    # 트렌치 분할 — window luck 거세 (v4/tranche.py 검증, 2026-06-19)
+    n_tranches: int = 5                    # 자본 N등분 시차 운용 (N=5: Sharpe 0.56/MDD−20%
+                                           # vs 단일 phase 0.47/−35%). hold/N=4거래일 주기.
+
     # 비용 가정 (한국)
     cost: float = 0.004                    # 왕복 (거래세+수수료+슬리피지, 보수적 full-turnover)
     delist_pen: float = 0.5                # 상폐 정리매매 추가 손실 (last-valid 위)
