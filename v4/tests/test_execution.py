@@ -145,6 +145,68 @@ class TestBrokerSizing:
         assert b.api.placed == []                      # 실주문 없음
 
 
+class TestOrderRetry:
+    """일시적 KIS 에러(500/Connection aborted) 시 _order 재시도.
+
+    2026-06-15 V4 첫 실거래 회귀: 20 picks 중 3종목(031330/089970/010170)이
+    HTTP 500 / RemoteDisconnected(전부 일시적 통신 에러)로 거부됐는데 _order 가
+    재시도 없이 즉시 None 반환 → 17/20만 체결. 6/17 프로브로 셋 다 정상 매매가능
+    확인됨(=일시적, universe 문제 아님). 비일시적 에러(계좌차단 40910000)는 즉시
+    실패 유지(6/1 동작 보존).
+    """
+
+    class FlakyKISApi:
+        """fail_times 번 transient 예외 raise 후 성공. raise_msg 로 에러 종류 지정."""
+        def __init__(self, fail_times: int, raise_msg: str = "500 Server Error: Internal Server Error"):
+            self.fail_times = fail_times
+            self.raise_msg = raise_msg
+            self.calls = 0
+            self.placed: list[tuple] = []
+
+        def order_domestic(self, t, side, qty, order_type="01"):
+            self.calls += 1
+            if self.calls <= self.fail_times:
+                raise Exception(self.raise_msg)
+            self.placed.append((side, t, qty))
+            return {"order_no": "OK", "ticker": t, "side": side, "qty": qty}
+
+    def _broker(self, tmp_path, api):
+        b = KisKoreaBroker.__new__(KisKoreaBroker)
+        b.api = api
+        b.dry_run = False
+        b.log_path = Path(tmp_path) / "trades.jsonl"
+        b.RETRY_WAIT_S = 0.0          # 테스트 가속 (sleep 제거)
+        return b
+
+    def test_transient_500_retries_then_succeeds(self, tmp_path):
+        api = self.FlakyKISApi(fail_times=2)               # 2번 실패 후 성공
+        b = self._broker(tmp_path, api)
+        r = b.buy_qty("031330", 100, ref_price=15_000)
+        assert r is not None and r["order_no"] == "OK"
+        assert api.calls == 3                              # 2 재시도 + 1 성공
+        assert len(api.placed) == 1                        # 단 1회 체결 (중복 없음)
+
+    def test_connection_aborted_retries(self, tmp_path):
+        api = self.FlakyKISApi(fail_times=1, raise_msg="('Connection aborted.', RemoteDisconnected())")
+        b = self._broker(tmp_path, api)
+        assert b.buy_qty("089970", 50, ref_price=90_000) is not None
+        assert api.calls == 2
+
+    def test_persistent_transient_exhausts_and_fails(self, tmp_path):
+        api = self.FlakyKISApi(fail_times=99)              # 계속 실패
+        b = self._broker(tmp_path, api)
+        assert b.buy_qty("010170", 200, ref_price=18_000) is None
+        assert api.calls == KisKoreaBroker.MAX_ORDER_RETRIES   # 정해진 횟수만큼 시도 후 포기
+
+    def test_non_transient_fails_fast_no_retry(self, tmp_path):
+        # 계좌차단(40910000) = 비일시적 → 재시도 금지, 즉시 None (6/1 동작 보존)
+        api = self.FlakyKISApi(fail_times=99,
+                               raise_msg="모의투자 주문이 불가한 계좌입니다. (code=40910000)")
+        b = self._broker(tmp_path, api)
+        assert b.buy_qty("000087", 93, ref_price=13_000) is None
+        assert api.calls == 1                              # 재시도 없음
+
+
 class FlakyBroker(FakeBroker):
     """지정 ticker 의 buy/sell 이 None 반환 (KIS 매매불가/자금부족/장외 모사)."""
 

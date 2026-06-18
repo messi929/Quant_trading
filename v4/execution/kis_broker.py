@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -19,9 +20,29 @@ from loguru import logger
 
 from broker.kis_api import KISApi
 
+# KIS sandbox 가 빈번히 던지는 일시적(transient) 에러 — 재시도하면 대개 성공.
+# 비일시적(계좌차단 40910000, 매매불가 종목 등)은 여기 없으므로 즉시 실패한다.
+_TRANSIENT_MARKERS = (
+    "500 Server Error",
+    "502 ", "503 ", "504 ",
+    "Connection aborted",
+    "RemoteDisconnected",
+    "Read timed out",
+    "Max retries exceeded",
+    "Temporarily",
+)
+
+
+def _is_transient(err: Exception) -> bool:
+    msg = str(err)
+    return any(m in msg for m in _TRANSIENT_MARKERS)
+
 
 class KisKoreaBroker:
     """KISApi 국내 얇은 래퍼. price_krw / buy(amount) / sell(qty) / balance."""
+
+    MAX_ORDER_RETRIES = 3      # 일시적 에러 시 총 시도 횟수
+    RETRY_WAIT_S = 1.0         # 재시도 간 대기(초), attempt 비례 backoff
 
     def __init__(self, mode: str = "sandbox", dry_run: bool = False, log_dir: str = "v4/logs"):
         self.api = KISApi(mode=mode, market_type="domestic")
@@ -87,16 +108,38 @@ class KisKoreaBroker:
             res = {"order_no": "DRYRUN", "ticker": ticker, "side": side, "qty": qty,
                    "price": px, "dry_run": True}
         else:
-            try:
-                res = self.api.order_domestic(ticker, side, qty, order_type="01")  # 시장가
-                res["price"] = px
-            except Exception as e:
-                logger.error(f"{side.upper()} 주문 실패 {ticker} x{qty}: {e}")
+            res = self._order_with_retry(ticker, side, qty, px)
+            if res is None:
                 return None
         self._log({**res, "amount_krw": amount, "time": datetime.now().isoformat(timespec="seconds")})
         logger.info(f"{'(dry) ' if self.dry_run else ''}{side.upper()} {ticker} x{qty} "
                     f"@~{px:,.0f} = {amount:,.0f} KRW")
         return res
+
+    def _order_with_retry(self, ticker: str, side: str, qty: int, px: float) -> dict | None:
+        """시장가 주문 1건. 일시적 에러는 MAX_ORDER_RETRIES 까지 재시도, 비일시적은 즉시 실패.
+
+        2026-06-15 회귀: KIS sandbox 500/RemoteDisconnected 로 3종목 거부 → 재시도 없이
+        누락. 500/연결끊김은 주문 미접수가 거의 확실(KIS가 접수 전 에러) → 재시도 안전.
+        """
+        for attempt in range(1, self.MAX_ORDER_RETRIES + 1):
+            try:
+                res = self.api.order_domestic(ticker, side, qty, order_type="01")  # 시장가
+                res["price"] = px
+                if attempt > 1:
+                    logger.info(f"{side.upper()} {ticker} x{qty} 재시도 {attempt}회차 성공")
+                return res
+            except Exception as e:
+                if _is_transient(e) and attempt < self.MAX_ORDER_RETRIES:
+                    logger.warning(f"{side.upper()} {ticker} x{qty} 일시 실패 "
+                                   f"(attempt {attempt}/{self.MAX_ORDER_RETRIES}): {e} — 재시도")
+                    if self.RETRY_WAIT_S:
+                        time.sleep(self.RETRY_WAIT_S * attempt)
+                    continue
+                logger.error(f"{side.upper()} 주문 실패 {ticker} x{qty} "
+                             f"(attempt {attempt}, transient={_is_transient(e)}): {e}")
+                return None
+        return None
 
     def _log(self, rec: dict) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)

@@ -54,6 +54,14 @@ def main() -> int:
     ap.add_argument("--universe-size", type=int, default=400)
     args = ap.parse_args()
 
+    # loguru 기본 sink 는 stderr → systemd StandardError(quant-v4-error.log)로만 가고
+    # 문서상 모니터링 파일 StandardOutput(quant-v4.log)은 빈 채였다(6/1~ 가시성 공백).
+    # stdout 으로 보내 quant-v4.log 에 세션 로그가 남게 한다.
+    logger.remove()
+    logger.add(sys.stdout, level="INFO",
+               format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | "
+                      "{name}:{function}:{line} - {message}")
+
     cfg = KoreaConfig()
     broker = KisKoreaBroker(mode="sandbox", dry_run=args.dry_run)
     execute = not args.no_execute
