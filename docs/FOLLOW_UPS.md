@@ -715,3 +715,55 @@ KOSPI는 *독립 알파 엔진*으로 기각(§4.1)이지만 *regime/RS 지표*�
 - B부류 lever를 백테스트 숫자 최대화로 채택 (best-fit = mirage, V4 전체 교훈)
 - COVID whipsaw 하나(n=1)에 맞춘 단계 노출 band 튜닝
 - paper 체결 검증 전 "알파 더 찾기" — 현 단계는 alpha가 아니라 execution이 bottleneck
+
+---
+
+## V4 트렌치 분할 전환 + 후속 (2026-06-19)
+
+### 배경 — window luck 보정 (헤드라인 SPEC 정직화)
+
+V4 백테스트(korea_ensemble)는 rebalance offset=0 **단일 phase 1개**만 측정. 20 phase
+offset 전부 측정(`v3/research/korea_tranche.py`, `v4/tranche.py`) → **Sharpe min+0.09/
+mean+0.47/max+0.69(스프레드 0.60), MDD best−18.9%/mean−35.6%/worst−48.5%.** 보고돼온
+offset=0(Sharpe0.66/MDD−17%)은 phase 최상위 = luck. **정직한 기대 = 0.47/−35%.**
+트렌치 N=5 시차 블렌드가 robust **0.56/−20%** 복원(MDD 반감, Sharpe>phase평균).
+→ 라이브 서킷브레이커·심리 기준을 −17%가 아니라 트렌치 기준 −20%로 잡을 것.
+
+### 완료 (2026-06-19)
+
+- **증분 1** (commit 4e50777): `v4/tranche.py` production 트렌치 백테스트 — engine 동일
+  함수 위 일일-MTM N-phase 블렌드, research 재현. 회귀 11(`test_tranche.py`).
+- **증분 2** (commit 56afba4): `v4/live/tranche_runner.py` + `TrancheLiveState`
+  (별도 `v4_tranche_state.json`). anchor 시차 부트스트랩(트렌치 t는 t·4거래일 후
+  첫진입, 16거래일 ramp 1/N→full) + 각 트렌치 20일주기, 결합 book=Σ트렌치→executor.
+  회귀 10(`test_tranche_live.py`). config.n_tranches=5. v4 로컬 76/서버 68+8skip.
+- 서버 surgical checkout 완료. 컷오버 no-execute 프리뷰 OK(트렌치0 노출0.20).
+  **2026-06-19 09:05 타이머가 자동 컷오버 실행** — 현 6/15 바스켓 매도+트렌치0 배치.
+
+### 기각된 제안 (측정 후, 기록용)
+
+- **히스테리시스 ±1% 게이트** (`korea_gate_hysteresis.py`): 기각. 게이트 플립 145중
+  20회(14%, 월 1회 평가라 드묾), ±1% 대칭버퍼 −0.08 Sharpe·재진입 지연. 일간 리밸런싱
+  이면 맞는 직관이나 20일 보유 엔진엔 플립 한계비용 ≈0.
+- **절대 유동성 floor** (`korea_liquidity_floor.py`): 라이브 기각. 6/15 바스켓 최저
+  거래대금 104억(참여율 0.05%)로 현 규모 문제 없음. 고floor는 MDD 악화. **스케일업
+  가드레일로만 보류**(자본 ~100배 시 재고).
+
+### 투두 (우선순위)
+
+```
+[진행]   09:05 직후  컷오버 체결 점검 — 실제 sells/buys 체결·트렌치0 노출0.20·fails=0,
+                     현 6/15 바스켓 청산 확인. 첫 실거래 컷오버라 eyes-on.
+[다음]   미정        제안 #3 동적 슬리피지 — square-root impact(k≈1, 무 자유파라미터)로
+                     v4/v3 비용함수 교체 → full-cycle + 크래시창 재측정(게이트 크래시방어
+                     과대평가 정직화) + 유동성 floor 임계치 도출. research 단부터.
+[하드닝] 미정        트렌치 full-curve 수치 parity 테스트(live 일별 시뮬 == run_tranche_
+                     backtest) 추가. 현재는 구조적 parity만 테스트됨.
+                     + 첫 ramp 라이브 실측: 결합 book 고유종목수(~40-70)·dust·주문수.
+[저우선] 미정        제안 #2 하드 스파시티(V3.3 alpha floor 제거+p<0.05 zero) OOS probe.
+                     prior 낮음(NASDAQ 방향엣지 ~0이 Edge 실패 근본, floor 희석 아님).
+[후순위] 미정        브랜치 docs/v4-account-fix-20260612 → main 머지.
+```
+
+**철칙 유지**: 한 번에 한 가지. #3는 컷오버가 안정(최소 첫 ramp 완료 ~16거래일) 후
+research부터. 라이브 트렌치 경로(`v4/live/tranche_runner.py`)는 검증 없이 재변경 금지.
