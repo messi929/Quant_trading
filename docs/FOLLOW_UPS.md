@@ -764,8 +764,14 @@ offset=0(Sharpe0.66/MDD−17%)은 phase 최상위 = luck. **정직한 기대 = 0
 [하드닝] 미정        트렌치 full-curve 수치 parity 테스트(live 일별 시뮬 == run_tranche_
                      backtest) 추가. 현재는 구조적 parity만 테스트됨.
                      + 첫 ramp 라이브 실측: 결합 book 고유종목수(~40-70)·dust·주문수.
-[저우선] 미정        제안 #2 하드 스파시티(V3.3 alpha floor 제거+p<0.05 zero) OOS probe.
-                     prior 낮음(NASDAQ 방향엣지 ~0이 Edge 실패 근본, floor 희석 아님).
+[완료]   06-19      제안 #2 하드 스파시티(`nasdaq_sparsity_probe.py`) — 기각. 무조건부
+                     walk-forward OOS(99 NASDAQ 2021-26, 47 folds). vanilla IC 4개 전부
+                     0.02 미달(trend0.000/rev0.001/volsurp0.018/breakfade−0.003=방향엣지~0).
+                     OOS direction IC: floored +0.0082 vs sparsity −0.0150(현금 24/47),
+                     turnover floored0.256<sparsity0.329(더 불안정). 엣지 약할 때 하드컷=
+                     in-sample 노이즈 winner OOS 베팅→음수, floor(≈equal-weight)가 robust.
+                     제안 전제(죽은알파 희석) 오류=살아있는 알파 없음. Edge 실패 근본=방향
+                     엣지 부재 재확인. floor 유지.
 [후순위] 미정        브랜치 docs/v4-account-fix-20260612 → main 머지.
 ```
 
