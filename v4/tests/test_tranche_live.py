@@ -6,15 +6,21 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
 
 from v4.config import KoreaConfig
+from v4.engine import ensemble_picks, regime_on
 from v4.live.state import TrancheLiveState, TrancheSlot
 from v4.live.tranche_runner import run_tranche_session
 from v4.tests.test_v4 import _synthetic_panel
 from v4.tests.test_execution import FakeBroker, FlakyBroker
+
+CACHE = Path("v3/research/reports/korea_kosdaq_long_cache.parquet")
+KQ11_FIXTURE = Path("v4/tests/fixtures/kq11_index.parquet")
 
 # 합성 cfg: SMALL 과 동일하되 N=5 step=4 (hold20//5)
 CFG = KoreaConfig(min_candidates=3, liq_top=10, n_pos=3, lookbacks=(5, 10),
@@ -148,3 +154,75 @@ class TestStatePersistence:
                      encoding="utf-8")
         st = TrancheLiveState.load(p, n_tranches=N)
         assert st.anchor_date is None and len(st.tranches) == N
+
+
+@pytest.mark.skipif(not (CACHE.exists() and KQ11_FIXTURE.exists()),
+                    reason="survivorship-free 캐시(gitignore) 또는 KQ11 fixture 없음")
+class TestLiveBacktestParity:
+    """라이브 runner 를 실 캐시 위로 일별 replay → 각 트렌치 book 이 engine ensemble_picks
+    와 일치(orchestration == 검증된 엔진). 곡선 단위가 아닌 book(종목) 단위 parity —
+    정수/현금/dust 같은 체결 마찰을 배제하고 *로직* parity 를 증명. cfg 는 실 SPEC(N=5).
+    """
+    CFG = KoreaConfig()        # 실 SPEC: N=5, n_pos=20, lookbacks 40-120, sma200
+
+    @staticmethod
+    def _load():
+        from v4.data import load_panel
+        close, dvol = load_panel(CACHE)
+        idx = pd.read_parquet(KQ11_FIXTURE)["Close"]
+        idx.index = pd.to_datetime(idx.index).normalize()
+        return close, dvol, idx
+
+    def _replay(self, close, dvol, idx, n_sessions=45):
+        """마지막 n_sessions 거래일을 일별 replay (부트스트랩 16일 + 재순환 포함)."""
+        st = TrancheLiveState(n_tranches=self.CFG.n_tranches)
+        start = len(close) - n_sessions
+        for i in range(start, len(close)):
+            c, d = close.iloc[:i + 1], dvol.iloc[:i + 1]
+            prices = {t: float(close.iloc[i][t]) for t in close.columns
+                      if pd.notna(close.iloc[i][t])}
+            run_tranche_session(FakeBroker(1e8, {}, prices), c, d, idx, st, self.CFG,
+                                execute=False)
+        return st
+
+    def test_all_tranches_active_after_replay(self):
+        close, dvol, idx = self._load()
+        st = self._replay(close, dvol, idx)
+        assert all(s.last_rebalance_date is not None for s in st.tranches)
+
+    def test_each_tranche_book_matches_engine_picks(self):
+        # 핵심 parity: 각 트렌치 book 종목 == 그 트렌치 rebalance 시점 ensemble_picks
+        close, dvol, idx = self._load()
+        st = self._replay(close, dvol, idx)
+        checked = 0
+        for slot in st.tranches:
+            i_t = close.index.get_loc(pd.Timestamp(slot.last_rebalance_date))
+            picks = ensemble_picks(close.iloc[:i_t + 1], dvol.iloc[:i_t + 1], i_t, self.CFG)
+            on = regime_on(idx, close.index[i_t], self.CFG)
+            if on and picks.tickers:
+                assert set(slot.target_weights) == set(picks.tickers), \
+                    f"트렌치 book {set(slot.target_weights)} != picks {set(picks.tickers)}"
+                checked += 1
+            else:
+                assert slot.target_weights == {}      # gate off → 빈 book
+        assert checked >= 1, "gate-on 트렌치가 하나도 없음 — parity 검증 불가"
+
+    def test_each_tranche_equal_weight_capped(self):
+        close, dvol, idx = self._load()
+        st = self._replay(close, dvol, idx)
+        for slot in st.tranches:
+            w = list(slot.target_weights.values())
+            if not w:
+                continue
+            assert len(set(round(x, 12) for x in w)) == 1            # equal-weight
+            assert sum(w) <= self.CFG.vol_cap / self.CFG.n_tranches + 1e-9  # ≤ cap/N
+
+    def test_combined_gross_within_cap(self):
+        close, dvol, idx = self._load()
+        st = self._replay(close, dvol, idx)
+        combined: dict[str, float] = {}
+        for slot in st.tranches:
+            for tk, wv in slot.target_weights.items():
+                combined[tk] = combined.get(tk, 0.0) + wv
+        gross = sum(combined.values())
+        assert 0.0 < gross <= self.CFG.vol_cap + 1e-9     # 결합 노출 (executor 가 ≤1 clamp)
