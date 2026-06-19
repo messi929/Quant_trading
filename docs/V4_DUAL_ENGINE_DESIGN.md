@@ -459,3 +459,46 @@ momentum이 reversion보다 덜 나쁨(승자 매수 = 상폐 함정 회피, 가
 - `nasdaq_reversion.json`, `nasdaq_engine.json` — 미국 reversion + VIX
 - `momentum_by_marketcap.json` — 시총별 비교
 - 데이터 캐시 parquet은 .gitignore (재생성 가능)
+
+---
+
+## 7. 트렌치 분할 전환 + window luck 보정 (2026-06-19)
+
+### 7.1 window luck — 헤드라인 SPEC은 phase-lucky였음
+
+§1.9 SPEC(Sharpe 0.66/MDD−17%)는 백테스트 rebalance **offset=0 단일 phase 1개**만
+측정한 값. 20 phase offset 전부 측정(`v3/research/korea_tranche.py`, `v4/tranche.py`):
+
+| | min | **mean** | max | offset=0 (구 SPEC) |
+|---|---|---|---|---|
+| Sharpe | +0.09 | **+0.47** | +0.69 | +0.66 |
+| MDD | −48.5% | **−35.6%** | −18.9% | −17.2% |
+
+offset=0 은 20개 중 최상위(MDD 최선) = luck. **정직한 기대 = Sharpe 0.47 / MDD −35%.**
+
+### 7.2 트렌치 N=5 — robust 복원 (채택, 라이브 반영)
+
+자본 N=5 등분, hold/N=4거래일마다 1 트렌치 시차 리밸런스(overlapping portfolios).
+일일-MTM 블렌드 → **Sharpe +0.56 / annual +7.2% / MDD −20.2%** (phase 평균 상회 +
+MDD 반감, 운에 의존하지 않음). 알파/게이트 무수정, 총 회전율 동일(추가비용 0).
+
+- 코드: `v4/tranche.py`(백테스트), `v4/live/tranche_runner.py` + `TrancheLiveState`
+  (라이브, 별도 `v4_tranche_state.json`), `config.n_tranches=5`. 각 트렌치가 engine
+  동일 함수 호출 → backtest-live 단일 경로. book-level parity 테스트(캐시 replay).
+- 라이브 전환: **2026-06-19 09:16 컷오버** — anchor 시차 부트스트랩(트렌치 t는 t·4거래일
+  후 첫 진입, ~16거래일 1/N→full ramp). T+2 결제는 `total_eval`이 미정산 포함 → 사이징 정상.
+
+### 7.3 검증 후 기각/보류된 제안 (mirage 차단)
+
+| 제안 | 판정 | 근거 (스크립트) |
+|---|:-:|---|
+| 히스테리시스 ±1% 게이트 | 기각 | 플립 14%(월1회 평가)·hyst −0.08 Sharpe (`korea_gate_hysteresis.py`) |
+| 절대 유동성 floor | 보류 | 현 1억 미발동(최저 104억)·고floor MDD 악화. 스케일업 가드레일 (`korea_liquidity_floor.py`) |
+| 동적 슬리피지 | 무변경 | 1억 무차이 / 크래시 팽창 반증 / **capacity 한계 발견** (`korea_slippage.py`) |
+| 하드 스파시티(V3.3) | 기각 | OOS sparsity −0.015 < floored +0.008, 노이즈 과적합 (`nasdaq_sparsity_probe.py`) |
+
+### 7.4 capacity 한계 — 자본 스케일 제약
+
+square-root impact 슬리피지로 측정: **Sharpe 1억 0.66 / 10억 0.55 / 50억 0.36.**
+~1-2억에서만 SPEC 유효, 그 이상은 슬리피지가 엣지 잠식. "무위험+α"는 선형확장 불가.
+유동성 floor 공식 `ADV_floor=(자본/20)/(0.3%/kσ)²` → 1억:3억/10억:27억/50억:136억.

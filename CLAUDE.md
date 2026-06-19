@@ -4,16 +4,23 @@
 + 개발 워크플로우만 다룬다. Phase별 이력은 `docs/CHANGELOG.md`, 후속 과제
 추적은 `docs/FOLLOW_UPS.md` 참조.
 
-> 📌 **V4 KOSDAQ 엔진 (신규 트랙, 2026-05-30)**: V3.3(NASDAQ vol-expansion)과 **별개**
-> 의 신규 엔진 `v4/` 패키지가 추가됨. KOSDAQ multi-lb ensemble momentum + 200d SMA
-> regime gate + vol-targeting — full-cycle(2014-2026) survivorship-free 검증 Sharpe
-> 0.66/+10.5%/MDD-17%. 코드 완성·실행정확·테스트 38개 통과(backtest=live 단일 경로,
-> KIS 국내 paper 연동). **paper 가동 준비 완료 (2026-06-12)** — KIS 계좌 교체
-> (50169471→50192869, 옛 계좌 `40910000` 주문차단)로 잔고 1억·양방향 실주문 검증·state
-> 리셋 완료. **월 2026-06-15 09:05 타이머가 fresh KOSDAQ 20종목 rebalance 자동 실행 =
-> 실거래 첫 시작** (6/15 picks=20 체결 점검 필요). 미국·KOSPI는 효율적
-> 시장이라 가격·펀더멘털 엣지 없음 확인(기각). 설계/검증 상세 = `docs/V4_DUAL_ENGINE_DESIGN.md`.
-> V3.3은 그대로 live 유지(V4와 독립).
+> 📌 **V4 KOSDAQ 엔진 (신규 트랙, 2026-05-30 / 트렌치 전환 2026-06-19)**: V3.3(NASDAQ
+> vol-expansion)과 **별개**의 신규 엔진 `v4/` 패키지. KOSDAQ multi-lb ensemble momentum
+> + 200d SMA regime gate + vol-targeting, **+ N=5 트렌치 시차 운용**(window luck 거세).
+> backtest=live 단일 코드 경로, KIS 국내 paper 연동, 테스트 80개 통과.
+>
+> ⚠️ **정직한 SPEC (2026-06-19 window luck 보정)**: 단일 phase 백테스트 0.66/+10.5%/
+> MDD−17%는 **phase-lucky**(20 phase 중 최상위). 정직한 phase 평균 ≈ 0.47/−35%. **N=5
+> 트렌치가 robust 0.56/+7%/MDD−20%로 복원** = 운영 기대치. 라이브 서킷브레이커·심리
+> 기준은 −20%(트렌치)로. **capacity 한계 ~1-2억** — 자본 키우면 슬리피지가 엣지 잠식
+> (Sharpe 10억 0.55/50억 0.36, `korea_slippage.py`).
+>
+> **실거래**: 6/15 첫 단일포트 거래(17/20 체결) → **6/19 09:16 트렌치 N=5 컷오버**(계좌
+> 50192869, 트렌치0 노출 0.20 배치, 현 바스켓 청산, fails 0). 트렌치1~4는 ~4거래일마다
+> 시차 진입 → ~7/13 100% ramp 완료. KIS 계좌는 6/12 교체(50169471→50192869, 옛 계좌
+> `40910000` 주문차단 해소). 미국·KOSPI는 효율적 시장이라 가격·펀더멘털 엣지 없음(기각).
+> 설계/검증 = `docs/V4_DUAL_ENGINE_DESIGN.md`, 후속·검증이력 = `docs/FOLLOW_UPS.md`
+> "V4 트렌치 분할 전환". V3.3은 그대로 live 유지(V4와 독립).
 
 > ⚠️ 2026-05-10 → 2026-05-13 변천:
 >
